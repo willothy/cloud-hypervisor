@@ -22,7 +22,10 @@ use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 use vmm_sys_util::eventfd::EventFd;
 
-use super::super::{ActivateResult, VirtioCommon, VirtioDevice, VirtioDeviceType};
+use super::super::{
+    ActivateResult, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
+    VirtioInterruptType,
+};
 use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
@@ -34,13 +37,88 @@ const DEFAULT_QUEUE_NUMBER: usize = 1;
 
 pub type State = VhostUserState<VirtioBlockConfig>;
 
-struct BackendReqHandler {}
-impl VhostUserFrontendReqHandler for BackendReqHandler {}
+/// The guest-visible block config, shared between the device and the
+/// backend-request handler that refreshes it on a config-change.
+///
+/// `lock` recovers a poisoned guard instead of panicking: the config is plain
+/// data with no invariant a panic could break, and a device worker must not
+/// abort the VM because an unrelated thread panicked. (The lock is only ever
+/// held across infallible field copies, so poisoning is not expected at all.)
+#[derive(Clone)]
+struct SharedConfig(Arc<Mutex<VirtioBlockConfig>>);
+
+impl SharedConfig {
+    fn new(config: VirtioBlockConfig) -> Self {
+        Self(Arc::new(Mutex::new(config)))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, VirtioBlockConfig> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Handles backend-initiated requests on the vhost-user backend channel.
+///
+/// The only request acted on is a configuration change: when the backend's
+/// device config changes at runtime — for a block device, its capacity
+/// growing online — it sends `VHOST_USER_BACKEND_CONFIG_CHANGE_MSG`. We
+/// re-read the device config space, refresh the cached config so the guest
+/// observes the new capacity, and raise a configuration-change interrupt.
+struct BackendReqHandler {
+    vu: Arc<Mutex<VhostUserHandle>>,
+    config: SharedConfig,
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+}
+
+impl VhostUserFrontendReqHandler for BackendReqHandler {
+    fn handle_config_change(&self) -> std::io::Result<u64> {
+        // Re-read the backend's config space. The guest reads its block
+        // config from our cached copy, so it must be refreshed before the
+        // interrupt or the guest would re-read a stale capacity.
+        let config_len = size_of::<VirtioBlockConfig>();
+        let buf = vec![0u8; config_len];
+        let mut vu = self
+            .vu
+            .lock()
+            .map_err(|_| std::io::Error::other("vhost-user handle lock poisoned"))?;
+        let (_, config_space) = vu
+            .socket_handle()
+            .get_config(
+                0,
+                config_len as u32,
+                VhostUserConfigFlags::WRITABLE,
+                buf.as_slice(),
+            )
+            .map_err(|e| std::io::Error::other(format!("vhost-user get_config failed: {e:?}")))?;
+        // Release the vu handle before taking the config lock: write_config
+        // takes config then vu, so holding vu across config here would invert
+        // that order.
+        drop(vu);
+        if let Some(new_config) = VirtioBlockConfig::from_slice(config_space.as_slice()) {
+            let mut config = self.config.lock();
+            // The queue count is chosen by the frontend, not the backend; keep
+            // it across the refresh. Every other field is backend-owned.
+            let num_queues = config.num_queues;
+            *config = *new_config;
+            config.num_queues = num_queues;
+        }
+
+        self.interrupt_cb
+            .trigger(VirtioInterruptType::Config)
+            .map_err(|e| {
+                error!("Failed to signal block config change: {e:?}");
+                std::io::Error::other(e)
+            })?;
+        Ok(0)
+    }
+}
 
 pub struct Blk {
     vu_common: VhostUserCommon,
     id: String,
-    config: VirtioBlockConfig,
+    config: SharedConfig,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     access_platform_enabled: bool,
@@ -117,7 +195,11 @@ impl Blk {
                 | VhostUserProtocolFeatures::REPLY_ACK
                 | VhostUserProtocolFeatures::INFLIGHT_SHMFD
                 | VhostUserProtocolFeatures::LOG_SHMFD
-                | VhostUserProtocolFeatures::DEVICE_STATE;
+                | VhostUserProtocolFeatures::DEVICE_STATE
+                // The backend-request channel carries the backend's
+                // configuration-change notifications (e.g. a drive growing
+                // online), handled by `BackendReqHandler`.
+                | VhostUserProtocolFeatures::BACKEND_REQ;
 
             let (acked_features, acked_protocol_features) =
                 vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
@@ -190,7 +272,7 @@ impl Blk {
                 ..Default::default()
             },
             id,
-            config,
+            config: SharedConfig::new(config),
             seccomp_action,
             exit_evt,
             access_platform_enabled,
@@ -198,7 +280,7 @@ impl Blk {
     }
 
     fn state(&self) -> result::Result<State, MigratableError> {
-        self.vu_common.state(self.config)
+        self.vu_common.state(*self.config.lock())
     }
 }
 
@@ -230,23 +312,30 @@ impl VirtioDevice for Blk {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        self.read_config_from_slice(self.config.as_slice(), offset, data);
+        let config = self.config.lock();
+        self.read_config_from_slice(config.as_slice(), offset, data);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
-        // The "writeback" field is the only mutable field
-        let writeback_offset =
-            (&raw const self.config.writeback as u64) - (&raw const self.config as u64);
-        if offset != writeback_offset || data.len() != size_of_val(&self.config.writeback) {
-            error!(
-                "Attempt to write to read-only field: offset {:x} length {}",
-                offset,
-                data.len()
-            );
-            return;
+        // The "writeback" field is the only mutable field. Validate and apply
+        // it under the config lock, then drop the lock before the vhost-user
+        // `set_config` call: the backend-request handler locks the vu handle
+        // and then the config, so holding the config across a vu lock here
+        // would invert that order and risk deadlock.
+        {
+            let mut config = self.config.lock();
+            let writeback_offset =
+                (&raw const config.writeback as u64) - (&raw const *config as u64);
+            if offset != writeback_offset || data.len() != size_of_val(&config.writeback) {
+                error!(
+                    "Attempt to write to read-only field: offset {:x} length {}",
+                    offset,
+                    data.len()
+                );
+                return;
+            }
+            config.writeback = data[0];
         }
-
-        self.config.writeback = data[0];
         if let Some(vu) = &self.vu_common.vu
             && let Err(e) = vu
                 .lock()
@@ -274,7 +363,42 @@ impl VirtioDevice for Blk {
             .virtio_common
             .activate(&queues, interrupt_cb.clone())?;
 
-        let backend_req_handler: Option<FrontendReqHandler<BackendReqHandler>> = None;
+        // When the backend-request channel was negotiated, listen on it so the
+        // backend can notify us of configuration changes (e.g. the drive
+        // growing online) and we can refresh the config and interrupt the
+        // guest.
+        let has_backend_req = self.vu_common.acked_protocol_features
+            & VhostUserProtocolFeatures::BACKEND_REQ.bits()
+            != 0;
+
+        let backend_req_handler = has_backend_req
+            .then(|| {
+                let vu = self
+                    .vu_common
+                    .vu
+                    .as_ref()
+                    .ok_or(crate::ActivateError::BadActivate)?
+                    .clone();
+                let mut handler = FrontendReqHandler::new(Arc::new(BackendReqHandler {
+                    vu,
+                    config: self.config.clone(),
+                    interrupt_cb: interrupt_cb.clone(),
+                }))
+                .map_err(|e| {
+                    crate::ActivateError::VhostUserSetup(Error::FrontendReqHandlerCreation(e))
+                })?;
+
+                if self.vu_common.acked_protocol_features
+                    & VhostUserProtocolFeatures::REPLY_ACK.bits()
+                    != 0
+                {
+                    handler.set_reply_ack_flag(true);
+                }
+
+                Ok(handler)
+            })
+            // Return inner Err early, keep Option of `Ok` value.
+            .transpose()?;
 
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
