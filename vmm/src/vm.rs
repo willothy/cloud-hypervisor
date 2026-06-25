@@ -3009,8 +3009,41 @@ impl Vm {
         &mut self,
         destination_url: &str,
     ) -> std::result::Result<(), MigratableError> {
-        // Brief pause: capture config + CPU/device state at a consistent point.
+        // Brief pause to capture config + CPU/device state and arm write-protect
+        // at a consistent point. If any of the paused-phase work fails, resume
+        // before returning so a failed checkpoint never leaves the VM paused —
+        // the operation stays cleanly retryable.
         self.pause()?;
+        let (uffd_fd, ranges) = match self.checkpoint_paused_phase(destination_url) {
+            Ok(armed) => armed,
+            Err(e) => {
+                if let Err(resume_err) = self.resume() {
+                    error!("failed to resume VM after a failed live checkpoint: {resume_err}");
+                }
+                return Err(e);
+            }
+        };
+
+        // Resume immediately, then copy the (write-protected) pages out live.
+        self.resume()?;
+
+        let mut memory_path = url_to_path(destination_url)?;
+        // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
+        memory_path.push("memory-ranges");
+        MemoryManager::run_wp_capture(&uffd_fd, &ranges, &memory_path)
+    }
+
+    /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
+    /// CPU/device state into `destination_url` and arm UFFD write-protect over
+    /// all guest RAM. The VM must be paused; the caller resumes it whether this
+    /// succeeds or fails. The snapshot state's `memory_ranges` and the armed
+    /// capture cover the same regions, so the resulting directory restores
+    /// directly.
+    fn checkpoint_paused_phase(
+        &mut self,
+        destination_url: &str,
+    ) -> std::result::Result<(std::os::fd::OwnedFd, Vec<crate::uffd::CaptureRange>), MigratableError>
+    {
         let snapshot = self.snapshot()?;
 
         let mut config_path = url_to_path(destination_url)?;
@@ -3026,17 +3059,8 @@ impl Vm {
             serde_json::to_vec(&snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
         std::fs::write(&state_path, &vm_state).map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
-        // Arm write-protect over all guest RAM while still paused; the snapshot
-        // state's memory_ranges and this capture cover the same regions, so the
-        // directory is directly restorable.
         let (uffd_fd, ranges, _table) = self.memory_manager.lock().unwrap().arm_full_capture()?;
-        // Resume immediately, then copy the (write-protected) pages out live.
-        self.resume()?;
-
-        let mut memory_path = url_to_path(destination_url)?;
-        // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
-        memory_path.push("memory-ranges");
-        MemoryManager::run_wp_capture(&uffd_fd, &ranges, &memory_path)
+        Ok((uffd_fd, ranges))
     }
 
     pub fn restore(&mut self) -> Result<()> {
