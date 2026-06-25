@@ -243,6 +243,12 @@ pub enum Error {
     #[error("Cannot send VM snapshot")]
     SnapshotSend(#[source] MigratableError),
 
+    #[error("Cannot start guest-memory dirty logging")]
+    StartDirtyLog(#[source] MigratableError),
+
+    #[error("Cannot capture dirty guest memory")]
+    CaptureDirtyMemory(#[source] MigratableError),
+
     #[error("Invalid restore source URL")]
     InvalidRestoreSourceUrl,
 
@@ -2954,7 +2960,33 @@ impl Vm {
             .start_boot_vcpus(new_state == VmState::BreakPoint)
             .map_err(Error::CpuManager)?;
 
+        // Track dirtied guest pages from boot so live memory checkpoints can
+        // capture only what changed since the last one, with no early writes
+        // missed before tracking begins.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log()
+            .map_err(Error::StartDirtyLog)?;
+
         self.state = new_state;
+        Ok(())
+    }
+
+    /// Capture the pages dirtied since the last checkpoint into `out_path`,
+    /// consistently and without pausing the VM, writing the captured range
+    /// table to a `<out_path>.ranges` sidecar so a caller can map the captured
+    /// bytes back to guest-physical addresses.
+    pub fn capture_dirty_memory(&mut self, out_path: &str) -> std::result::Result<(), MigratableError> {
+        let table = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .capture_dirty_background(std::path::Path::new(out_path))?;
+        let json = serde_json::to_vec(&table)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("serializing range table: {e}")))?;
+        std::fs::write(format!("{out_path}.ranges"), json)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("writing range table: {e}")))?;
         Ok(())
     }
 

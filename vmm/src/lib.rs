@@ -2345,6 +2345,16 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_capture_dirty_memory(&mut self, out_path: &str) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => vm
+                .capture_dirty_memory(out_path)
+                .map_err(VmError::CaptureDirtyMemory),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
