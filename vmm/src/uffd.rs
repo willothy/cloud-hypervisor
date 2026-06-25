@@ -538,9 +538,8 @@ where
     };
     let flat_of = |addr: u64| -> Option<usize> {
         ranges.iter().enumerate().find_map(|(ri, r)| {
-            (addr >= r.host_addr && addr < r.host_addr + r.length).then(|| {
-                (starts[ri] + (addr - r.host_addr) / r.page_size) as usize
-            })
+            (addr >= r.host_addr && addr < r.host_addr + r.length)
+                .then(|| (starts[ri] + (addr - r.host_addr) / r.page_size) as usize)
         })
     };
 
