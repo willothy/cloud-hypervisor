@@ -132,12 +132,14 @@ pub(crate) fn create(required_features: u64) -> Result<OwnedFd, Error> {
     Ok(fd)
 }
 
-/// Register a memory range for missing-page fault handling.
-pub(crate) fn register(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<u64, Error> {
+/// Register a memory range for fault handling in the given mode
+/// (`UFFDIO_REGISTER_MODE_MISSING` for demand paging,
+/// `UFFDIO_REGISTER_MODE_WP` for write tracking, or their union).
+pub(crate) fn register(fd: BorrowedFd<'_>, addr: u64, len: u64, mode: u64) -> Result<u64, Error> {
     let mut reg = UffdioRegister {
         range_start: addr,
         range_len: len,
-        mode: userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+        mode,
         ioctls: 0,
     };
     // SAFETY: `reg` is a valid, correctly-sized struct for this ioctl.
@@ -181,6 +183,12 @@ pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Re
 struct UffdioRange {
     start: u64,
     len: u64,
+}
+
+#[repr(C)]
+struct UffdioWriteprotect {
+    range: UffdioRange,
+    mode: u64,
 }
 
 /// A guest memory range registered with userfaultfd, plus where its bytes
@@ -374,6 +382,46 @@ fn io_other<E: fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Arm or release write-protection on a registered range.
+///
+/// With `protect` set, each page in the range delivers a write-protect fault
+/// (`UFFD_PAGEFAULT_FLAG_WP`) on the next write instead of completing it, so a
+/// handler can copy the pre-write contents out first; clearing `protect`
+/// releases the protection and, unless `dont_wake`, wakes any threads blocked
+/// on a write fault in the range. The range must have been registered with
+/// `UFFDIO_REGISTER_MODE_WP`.
+pub(crate) fn write_protect(
+    fd: BorrowedFd<'_>,
+    addr: u64,
+    len: u64,
+    protect: bool,
+    dont_wake: bool,
+) -> Result<(), Error> {
+    let mut mode = 0u64;
+    if protect {
+        mode |= userfaultfd::UFFDIO_WRITEPROTECT_MODE_WP;
+    }
+    if dont_wake {
+        mode |= userfaultfd::UFFDIO_WRITEPROTECT_MODE_DONTWAKE;
+    }
+    let mut wp = UffdioWriteprotect {
+        range: UffdioRange { start: addr, len },
+        mode,
+    };
+    // SAFETY: `wp` is a valid, correctly-sized struct for this ioctl.
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            userfaultfd::UFFDIO_WRITEPROTECT as libc::Ioctl,
+            &mut wp,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Wake threads waiting on a fault in the given range without copying data.
 ///
 /// Needed after UFFDIO_COPY returns EEXIST: the page was already resolved
@@ -393,4 +441,120 @@ pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error>
         return Err(Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+
+    use super::{UffdMsg, create, register, write_protect};
+    use crate::userfaultfd::{
+        UFFD_EVENT_PAGEFAULT, UFFD_FEATURE_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WP,
+        UFFDIO_REGISTER_MODE_WP,
+    };
+
+    const PAGE: usize = 4096;
+
+    /// A present, write-protected page delivers a write-protect fault on the
+    /// next write — carrying the faulting address and the WP flag — and the
+    /// blocked write proceeds once protection is released. This exercises the
+    /// whole WP path (register MODE_WP, arm, fault, release) against the kernel.
+    #[test]
+    fn write_protect_fault_roundtrip() {
+        let len = 2 * PAGE;
+        // SAFETY: anonymous private mapping; checked for MAP_FAILED below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mmap failed");
+        let base_addr = base as u64;
+        // Populate both pages so they are present (WP tracks present pages).
+        // SAFETY: `base` is a valid, writable `len`-byte mapping.
+        unsafe { std::ptr::write_bytes(base.cast::<u8>(), 0xAB, len) };
+
+        let uffd = create(UFFD_FEATURE_PAGEFAULT_FLAG_WP).expect("create uffd");
+        register(uffd.as_fd(), base_addr, len as u64, UFFDIO_REGISTER_MODE_WP)
+            .expect("register WP");
+        write_protect(uffd.as_fd(), base_addr, len as u64, true, false).expect("arm WP");
+
+        // Write to the second page from another thread; the store faults and
+        // parks until protection is released.
+        let page1 = base_addr + PAGE as u64;
+        let writer = std::thread::spawn(move || {
+            // SAFETY: `page1` is in the mapping; the store parks on the WP fault.
+            unsafe { std::ptr::write_volatile(page1 as *mut u8, 0xCD) };
+        });
+
+        let fault_addr = poll_one_wp_fault(uffd.as_fd());
+        assert_eq!(
+            fault_addr & !(PAGE as u64 - 1),
+            page1,
+            "fault address is in the written page"
+        );
+
+        write_protect(uffd.as_fd(), page1, PAGE as u64, false, false).expect("release WP");
+        writer.join().expect("writer joined");
+
+        // SAFETY: `page1` is still mapped; read back the writer's byte.
+        let written = unsafe { std::ptr::read_volatile(page1 as *const u8) };
+        assert_eq!(written, 0xCD, "the writer's store landed after release");
+
+        // SAFETY: unmap the region this test mapped.
+        unsafe { libc::munmap(base, len) };
+    }
+
+    /// Read one `UFFD_EVENT_PAGEFAULT` carrying the WP flag, returning its
+    /// address. The fd is non-blocking, so poll until a message arrives.
+    fn poll_one_wp_fault(fd: std::os::fd::BorrowedFd<'_>) -> u64 {
+        use std::os::fd::AsRawFd;
+        loop {
+            let mut pfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: a single valid pollfd with a 1s timeout.
+            let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
+            assert!(n >= 0, "poll failed: {}", std::io::Error::last_os_error());
+            assert_ne!(n, 0, "timed out waiting for a write-protect fault");
+
+            let mut msg = std::mem::MaybeUninit::<UffdMsg>::uninit();
+            // SAFETY: read up to one `UffdMsg`-sized record from the uffd.
+            let r = unsafe {
+                libc::read(
+                    fd.as_raw_fd(),
+                    msg.as_mut_ptr().cast(),
+                    std::mem::size_of::<UffdMsg>(),
+                )
+            };
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EAGAIN) {
+                    continue;
+                }
+                panic!("read uffd: {e}");
+            }
+            assert_eq!(
+                r as usize,
+                std::mem::size_of::<UffdMsg>(),
+                "short uffd read"
+            );
+            // SAFETY: a full `UffdMsg` was read above.
+            let msg = unsafe { msg.assume_init() };
+            assert_eq!(msg.event, UFFD_EVENT_PAGEFAULT, "event is a pagefault");
+            assert_ne!(
+                msg.pf_flags & UFFD_PAGEFAULT_FLAG_WP,
+                0,
+                "fault carries the write-protect flag"
+            );
+            return msg.pf_address;
+        }
+    }
 }
