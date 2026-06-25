@@ -57,8 +57,6 @@ pub(crate) const UFFD_FEATURE_MINOR_SHMEM: u64 = 1 << 10;
 // the pre-write contents out before releasing the protection.
 pub(crate) const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
 pub(crate) const UFFD_FEATURE_PAGEFAULT_FLAG_WP: u64 = 1 << 0;
-/// Set in `uffd_msg`'s pagefault flags when the fault is a write-protect fault.
-pub(crate) const UFFD_PAGEFAULT_FLAG_WP: u64 = 1 << 1;
 /// `uffdio_writeprotect.mode`: set to arm protection, cleared to release it.
 pub(crate) const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1 << 0;
 /// `uffdio_writeprotect.mode`: do not wake threads blocked on the range.

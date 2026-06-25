@@ -30,7 +30,7 @@ use virtio_devices::vdpa::VHOST_VDPA_RESUME;
 
 use crate::userfaultfd::{
     UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_POISON, UFFDIO_REGISTER, UFFDIO_WAKE,
-    USERFAULTFD_IOC_NEW,
+    UFFDIO_WRITEPROTECT, USERFAULTFD_IOC_NEW,
 };
 
 #[derive(Copy, Clone)]
@@ -116,6 +116,7 @@ mod kvm {
     pub(super) const KVM_GET_MP_STATE: u64 = 0x8004_ae98;
     pub(super) const KVM_GET_DEVICE_ATTR: u64 = 0x4018_aee2;
     pub(super) const KVM_GET_DIRTY_LOG: u64 = 0x4010_ae42;
+    pub(super) const KVM_CLEAR_DIRTY_LOG: u64 = 0xc018_aec0;
     pub(super) const KVM_GET_VCPU_EVENTS: u64 = 0x8040_ae9f;
     pub(super) const KVM_GET_ONE_REG: u64 = 0x4010_aeab;
     pub(super) const KVM_GET_REGS: u64 = 0x8090_ae81;
@@ -259,6 +260,7 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_IRQCHIP,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_VCPU)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_VM)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CLEAR_DIRTY_LOG)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_ENABLE_CAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_API_VERSION,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_DEVICE_ATTR,)?],
@@ -457,6 +459,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_CONTINUE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_POISON)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WRITEPROTECT)?],
         and![Cond::new(1, ArgLen::Dword, Eq, USERFAULTFD_IOC_NEW)?],
     ];
 

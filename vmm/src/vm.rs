@@ -228,6 +228,18 @@ pub enum Error {
     #[error("Cannot send VM snapshot")]
     SnapshotSend(#[source] MigratableError),
 
+    #[error("Cannot start guest-memory dirty logging")]
+    StartDirtyLog(#[source] MigratableError),
+
+    #[error("Cannot capture dirty guest memory")]
+    CaptureDirtyMemory(#[source] MigratableError),
+
+    #[error("Cannot count dirty guest pages")]
+    DirtyPageCount(#[source] MigratableError),
+
+    #[error("Cannot take a live checkpoint")]
+    LiveCheckpoint(#[source] MigratableError),
+
     #[error("Invalid restore source URL")]
     InvalidRestoreSourceUrl,
 
@@ -1364,6 +1376,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        restore_fault_socket: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1429,6 +1442,7 @@ impl Vm {
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode,
+                    restore_fault_socket.as_deref(),
                     phys_bits,
                     &exit_evt,
                 )
@@ -3000,8 +3014,165 @@ impl Vm {
             .start_boot_vcpus(new_state == VmState::BreakPoint)
             .map_err(Error::CpuManager)?;
 
+        // Track dirtied guest pages from boot so live memory checkpoints can
+        // capture only what changed since the last one, with no early writes
+        // missed before tracking begins.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log()
+            .map_err(Error::StartDirtyLog)?;
+
+        // One uffd owns guest RAM from the start — write-protect-only here (a
+        // booted VM never sees a missing fault) — handed to the external
+        // fault handler on the configured socket, so a live checkpoint always
+        // arms protection on it and delegates the copy-out the same way a
+        // demand-paged restore's session does. Inert until a checkpoint arms
+        // it; without a configured socket, live checkpoints are refused.
+        let fault_socket = self.config.lock().unwrap().memory.fault_socket.clone();
+        if let Some(socket) = fault_socket {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .register_capture_uffd(&socket)
+                .map_err(Error::MemoryManager)?;
+        }
+
         self.state = new_state;
         Ok(())
+    }
+
+    /// The number of guest pages dirtied since the last checkpoint, read
+    /// without consuming the dirty set so checkpoint cadence can poll it
+    /// between checkpoints.
+    pub fn dirty_page_count(&self) -> std::result::Result<u64, MigratableError> {
+        self.memory_manager
+            .lock()
+            .map_err(|e| {
+                MigratableError::MigrateSend(anyhow!("memory manager lock poisoned: {e}"))
+            })?
+            .dirty_page_count()
+    }
+
+    /// Capture the pages dirtied since the last checkpoint into `out_path`,
+    /// consistently and without pausing the VM, writing the captured range
+    /// table to a `<out_path>.ranges` sidecar so a caller can map the captured
+    /// bytes back to guest-physical addresses.
+    pub fn capture_dirty_memory(
+        &mut self,
+        out_path: &str,
+    ) -> std::result::Result<(), MigratableError> {
+        let table = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .capture_dirty_background(std::path::Path::new(out_path))?;
+        let json = serde_json::to_vec(&table)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("serializing range table: {e}")))?;
+        std::fs::write(format!("{out_path}.ranges"), json)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("writing range table: {e}")))?;
+        Ok(())
+    }
+
+    /// Capture a restorable checkpoint of the running VM **without pausing it
+    /// for the memory copy**.
+    ///
+    /// Config and CPU/device state are captured during a brief pause (they
+    /// cannot be captured live); guest memory is then captured via UFFD
+    /// write-protect copy-on-write while the VM runs, so the memory image is
+    /// the exact paused point-in-time. Writes `config.json`, `state.json`, and
+    /// the dense `memory-ranges` file into `destination_url` — a directory the
+    /// existing on-demand restore path loads directly.
+    pub fn live_checkpoint(
+        &mut self,
+        destination_url: &str,
+        full: bool,
+    ) -> std::result::Result<(), MigratableError> {
+        // Brief pause to capture config + CPU/device state and arm write-protect
+        // at a consistent point. If any of the paused-phase work fails, resume
+        // before returning so a failed checkpoint never leaves the VM paused —
+        // the operation stays cleanly retryable.
+        self.pause()?;
+        let done = match self.checkpoint_paused_phase(destination_url, full) {
+            Ok(sent) => sent,
+            Err(e) => {
+                if let Err(resume_err) = self.resume() {
+                    error!("failed to resume VM after a failed live checkpoint: {resume_err}");
+                }
+                return Err(e);
+            }
+        };
+
+        // Resume immediately; the fault handler (whose capture message is
+        // already buffered on its connection) copies the write-protected
+        // pages out while the guest runs.
+        self.resume()?;
+
+        match done {
+            Some(stream) => MemoryManager::wait_session_capture(&stream),
+            // Nothing was dirty; there is no capture to wait for.
+            None => Ok(()),
+        }
+    }
+
+    /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
+    /// CPU/device state into `destination_url` and arm UFFD write-protect at a
+    /// consistent point, on the one uffd that owns guest RAM. The VM must be
+    /// paused; the caller resumes it whether this succeeds or fails.
+    ///
+    /// With `full`, all of guest RAM is armed and captured (the caller has no
+    /// previous manifest to diff an incremental against); otherwise only the
+    /// dirty pages are, and the caller's incremental re-chunk reads exactly
+    /// the sidecar's offsets. The copy-out is sent to the external fault
+    /// handler before returning — while the VM is still paused — so its
+    /// message is buffered ahead of the first post-resume write fault; the
+    /// caller waits for the done message on the returned connection after
+    /// resuming (`None` when nothing was dirty).
+    fn checkpoint_paused_phase(
+        &mut self,
+        destination_url: &str,
+        full: bool,
+    ) -> std::result::Result<Option<std::os::unix::net::UnixStream>, MigratableError> {
+        let snapshot = self.snapshot()?;
+
+        let mut config_path = url_to_path(destination_url)?;
+        config_path.push(SNAPSHOT_CONFIG_FILE);
+        let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        std::fs::write(&config_path, vm_config.as_bytes())
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        let mut state_path = url_to_path(destination_url)?;
+        state_path.push(SNAPSHOT_STATE_FILE);
+        let vm_state =
+            serde_json::to_vec(&snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        std::fs::write(&state_path, &vm_state)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        // Arm the capture and record which bytes of the dense memory image
+        // changed since the last checkpoint (as offsets into the memory-ranges
+        // file) so the caller can re-chunk only those incrementally, reusing
+        // the prior checkpoint's manifest for the rest. Resets the dirty
+        // bitmap for the next interval.
+        let (dirty, ranges) = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .arm_session_capture(full)?;
+        let mut dirty_path = url_to_path(destination_url)?;
+        dirty_path.push("memory-dirty.ranges");
+        let dirty_json =
+            serde_json::to_vec(&dirty).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        std::fs::write(&dirty_path, &dirty_json)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
+        let mut memory_path = url_to_path(destination_url)?;
+        // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
+        memory_path.push("memory-ranges");
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .send_session_capture(ranges, &memory_path)
     }
 
     pub fn restore(&mut self) -> Result<()> {
@@ -3013,6 +3184,30 @@ impl Vm {
             .unwrap()
             .try_lock_disks()
             .map_err(Error::LockingError)?;
+
+        // Track dirtied guest pages before any vCPU runs: the next live
+        // memory checkpoint captures incrementally against the checkpoint
+        // this VM was restored from, so a write missed here would let it
+        // reuse a stale chunk for a changed page.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log()
+            .map_err(Error::StartDirtyLog)?;
+
+        // One uffd owns guest RAM: a demand-paged restore's handoff already
+        // established the fault session (this is a no-op then); a restore
+        // mode that loaded memory eagerly registers write-protect-only and
+        // hands it to the fault handler on the configured socket, so a live
+        // checkpoint always arms and delegates the same way.
+        let fault_socket = self.config.lock().unwrap().memory.fault_socket.clone();
+        if let Some(socket) = fault_socket {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .register_capture_uffd(&socket)
+                .map_err(Error::MemoryManager)?;
+        }
 
         // Any restore may be a fork, so reseed before the guest runs.
         #[cfg(not(target_arch = "riscv64"))]

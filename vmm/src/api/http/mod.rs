@@ -30,10 +30,10 @@ use self::http_endpoint::{
 use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
-    VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration, VmCounters,
-    VmDelete, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice,
-    VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown,
-    VmSnapshot,
+    VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration,
+    VmCaptureDirtyMemory, VmCounters, VmDelete, VmDirtyPageCount, VmLiveCheckpoint, VmNmi, VmPause,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
+    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
@@ -276,6 +276,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
         endpoint!("/vm.counters"),
         Box::new(VmActionHandler::new(&VmCounters)),
     );
+    r.routes.insert(
+        endpoint!("/vm.dirty-page-count"),
+        Box::new(VmActionHandler::new(&VmDirtyPageCount)),
+    );
     r.routes
         .insert(endpoint!("/vm.create"), Box::new(VmCreate {}));
     r.routes.insert(
@@ -338,6 +342,14 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(&VmSnapshot)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.capture-dirty-memory"),
+        Box::new(VmActionHandler::new(&VmCaptureDirtyMemory)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.live-checkpoint"),
+        Box::new(VmActionHandler::new(&VmLiveCheckpoint)),
     );
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     r.routes.insert(

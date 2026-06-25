@@ -126,6 +126,18 @@ pub enum ApiError {
     #[error("The VM could not be snapshotted")]
     VmSnapshot(#[source] VmError),
 
+    /// The VM could not capture its dirty memory.
+    #[error("The VM could not capture its dirty memory")]
+    VmCaptureDirtyMemory(#[source] VmError),
+
+    /// The VM could not report its dirty-page count.
+    #[error("The VM could not report its dirty-page count")]
+    VmDirtyPageCount(#[source] VmError),
+
+    /// The VM could not take a live checkpoint.
+    #[error("The VM could not take a live checkpoint")]
+    VmLiveCheckpoint(#[source] VmError),
+
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
     VmRestore(#[source] VmError),
@@ -269,6 +281,24 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmCaptureDirtyMemoryConfig {
+    /// Destination file for the captured dirty pages; the captured range
+    /// table is written to `<out_path>.ranges`.
+    pub out_path: String,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmLiveCheckpointConfig {
+    /// The checkpoint destination directory URL.
+    pub destination_url: String,
+    /// Capture all of guest RAM rather than just the pages dirtied since the
+    /// last capture. The caller decides — it knows whether a previous
+    /// checkpoint exists to diff an incremental against — and a full capture
+    /// of a demand-paged VM is refused (it would fault the entire lazy tail).
+    pub full: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -894,6 +924,12 @@ pub trait RequestHandler {
 
     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
 
+    fn vm_capture_dirty_memory(&mut self, out_path: &str) -> Result<(), VmError>;
+
+    fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+
+    fn vm_live_checkpoint(&mut self, destination_url: &str, full: bool) -> Result<(), VmError>;
+
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -1507,6 +1543,39 @@ impl ApiAction for VmBalloonStats {
     }
 }
 
+pub struct VmDirtyPageCount;
+
+impl ApiAction for VmDirtyPageCount {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDirtyPageCount");
+
+            let response = vmm
+                .vm_dirty_page_count()
+                .map_err(ApiError::VmDirtyPageCount)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
 pub struct VmCreate;
 
 impl ApiAction for VmCreate {
@@ -2089,6 +2158,80 @@ impl ApiAction for VmSnapshot {
             let response = vmm
                 .vm_snapshot(&config.destination_url)
                 .map_err(ApiError::VmSnapshot)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmCaptureDirtyMemory;
+
+impl ApiAction for VmCaptureDirtyMemory {
+    type RequestBody = VmCaptureDirtyMemoryConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmCaptureDirtyMemory {config:?}");
+
+            let response = vmm
+                .vm_capture_dirty_memory(&config.out_path)
+                .map_err(ApiError::VmCaptureDirtyMemory)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmLiveCheckpoint;
+
+impl ApiAction for VmLiveCheckpoint {
+    type RequestBody = VmLiveCheckpointConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmLiveCheckpoint {config:?}");
+
+            let response = vmm
+                .vm_live_checkpoint(&config.destination_url, config.full)
+                .map_err(ApiError::VmLiveCheckpoint)
                 .map(|_| ApiResponsePayload::Empty);
 
             response_sender

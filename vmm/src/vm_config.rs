@@ -324,6 +324,13 @@ pub struct MemoryConfig {
     pub zones: Option<Vec<MemoryZoneConfig>>,
     #[serde(default = "default_memoryconfig_thp")]
     pub thp: bool,
+    /// Unix socket of an external fault handler to hand the VM's userfaultfd
+    /// to at startup (see the `handoff` module), so live checkpoints can arm
+    /// write-protection and delegate their copy-out. Without it a booted VM
+    /// has no userfaultfd and live checkpoints are refused. A demand-paged
+    /// restore's fault socket takes this role for restored VMs.
+    #[serde(default)]
+    pub fault_socket: Option<PathBuf>,
 }
 
 pub const DEFAULT_MEMORY_MB: u64 = 512;
@@ -343,6 +350,7 @@ impl Default for MemoryConfig {
             reserve: None,
             zones: None,
             thp: true,
+            fault_socket: None,
         }
     }
 }

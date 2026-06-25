@@ -1137,7 +1137,8 @@ impl MemoryConfig {
             .add("hugepage_size")
             .add("prefault")
             .add("reserve")
-            .add("thp");
+            .add("thp")
+            .add("fault_socket");
         parser.parse(memory).map_err(Error::ParseMemory)?;
 
         let size = parser
@@ -1190,6 +1191,7 @@ impl MemoryConfig {
             .map_err(Error::ParseMemory)?
             .unwrap_or(Toggle(true))
             .0;
+        let fault_socket = parser.get("fault_socket").map(PathBuf::from);
 
         let zones: Option<Vec<MemoryZoneConfig>> = if let Some(memory_zones) = &memory_zones {
             let mut zones = Vec::new();
@@ -1291,6 +1293,7 @@ impl MemoryConfig {
             reserve,
             zones,
             thp,
+            fault_socket,
         })
     }
 
@@ -2998,6 +3001,12 @@ pub struct RestoreConfig {
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// Unix socket to fault guest-memory pages in from during on-demand
+    /// restore, instead of reading them from the snapshot file. The peer
+    /// serves pages identified by their byte offset into the snapshot memory
+    /// image. Only meaningful with `memory_restore_mode=ondemand`.
+    #[serde(default)]
+    pub restore_fault_socket: Option<PathBuf>,
     #[serde(default)]
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
@@ -3012,12 +3021,13 @@ pub struct RestoreConfig {
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>,\
+        memory_fault_socket=<path>,net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
         zone_updates=<list_of_updates>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
+        \n`memory_fault_socket` is a Unix socket to fault guest-memory pages in from during on-demand restore, instead of the snapshot file \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
@@ -3034,6 +3044,7 @@ impl RestoreConfig {
             .add("source_url")
             .add("prefault")
             .add("memory_restore_mode")
+            .add("memory_fault_socket")
             .add("net_fds")
             .add("vfio_fds")
             .add("iommufd_fd")
@@ -3054,6 +3065,7 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
+        let restore_fault_socket = parser.get("memory_fault_socket").map(PathBuf::from);
         let net_fds = parser
             .convert::<TupleList<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -3102,6 +3114,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
+            restore_fault_socket,
             net_fds,
             vfio_fds,
             iommufd_fd,
@@ -5510,6 +5523,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot")?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5525,6 +5539,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
             )?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5549,6 +5564,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
@@ -5562,6 +5578,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]")?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5580,6 +5597,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
             )?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5604,6 +5622,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
             )?,
             RestoreConfig {
+                restore_fault_socket: None,
                 source_url: PathBuf::from("/path/to/snapshot"),
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5769,6 +5788,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         let valid_config = RestoreConfig {
+            restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5848,6 +5868,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let another_valid_config = RestoreConfig {
+            restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -5868,6 +5889,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         another_valid_config.validate(&snapshot_vm_config).unwrap();
 
         let invalid_restore_mode = RestoreConfig {
+            restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
@@ -5911,6 +5933,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         let invalid_cow_prefault = RestoreConfig {
+            restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::CopyOnWrite,
@@ -5983,6 +6006,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
 
         let valid_config = RestoreConfig {
+            restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
@@ -6113,6 +6137,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 reserve: None,
                 zones: None,
                 thp: true,
+                fault_socket: None,
             },
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from("/path/to/kernel")),

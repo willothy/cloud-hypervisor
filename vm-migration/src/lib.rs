@@ -50,6 +50,9 @@ pub enum UffdError {
     #[error("Failed to configure socket")]
     SetSocket(#[source] io::Error),
 
+    #[error("Failed to connect to the page-fault socket")]
+    ConnectFaultSocket(#[source] io::Error),
+
     #[error("Failed to spawn handler thread")]
     SpawnThread(#[source] io::Error),
 

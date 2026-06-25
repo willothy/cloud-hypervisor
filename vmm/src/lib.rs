@@ -88,6 +88,7 @@ pub mod device_manager;
 pub mod device_tree;
 #[cfg(feature = "guest_debug")]
 mod gdb;
+mod handoff;
 #[cfg(feature = "igvm")]
 mod igvm;
 pub mod interrupt;
@@ -2084,6 +2085,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        restore_fault_socket: Option<std::path::PathBuf>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2136,6 +2138,7 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    restore_fault_socket,
                 )?;
 
                 if self
@@ -2573,6 +2576,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2635,6 +2639,45 @@ impl RequestHandler for Vmm {
                             .map_err(VmError::SnapshotSend)
                     })
             }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_capture_dirty_memory(&mut self, out_path: &str) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => vm
+                .capture_dirty_memory(out_path)
+                .map_err(VmError::CaptureDirtyMemory),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_dirty_page_count(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => {
+                let count = vm.dirty_page_count().map_err(VmError::DirtyPageCount)?;
+                serde_json::to_vec(&count)
+                    .map(Some)
+                    .map_err(VmError::SerializeJson)
+            }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_live_checkpoint(
+        &mut self,
+        destination_url: &str,
+        full: bool,
+    ) -> result::Result<(), VmError> {
+        match self.vm {
+            // The VM keeps running through a live checkpoint, so its console
+            // FDs must stay intact (unlike vm_snapshot, which drains them).
+            VmOwnership::Owned(ref mut vm) => vm
+                .live_checkpoint(destination_url, full)
+                .map_err(VmError::LiveCheckpoint),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
         }
@@ -2715,6 +2758,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.restore_fault_socket,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2816,6 +2860,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,
@@ -3676,6 +3721,7 @@ mod tests {
                 reserve: None,
                 zones: None,
                 thp: true,
+                fault_socket: None,
             },
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from("/path/to/kernel")),
