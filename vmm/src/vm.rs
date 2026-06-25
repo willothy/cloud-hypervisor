@@ -249,6 +249,9 @@ pub enum Error {
     #[error("Cannot capture dirty guest memory")]
     CaptureDirtyMemory(#[source] MigratableError),
 
+    #[error("Cannot count dirty guest pages")]
+    DirtyPageCount(#[source] MigratableError),
+
     #[error("Cannot take a live checkpoint")]
     LiveCheckpoint(#[source] MigratableError),
 
@@ -2976,6 +2979,18 @@ impl Vm {
         Ok(())
     }
 
+    /// The number of guest pages dirtied since the last checkpoint, read
+    /// without consuming the dirty set so checkpoint cadence can poll it
+    /// between checkpoints.
+    pub fn dirty_page_count(&self) -> std::result::Result<u64, MigratableError> {
+        self.memory_manager
+            .lock()
+            .map_err(|e| {
+                MigratableError::MigrateSend(anyhow!("memory manager lock poisoned: {e}"))
+            })?
+            .dirty_page_count()
+    }
+
     /// Capture the pages dirtied since the last checkpoint into `out_path`,
     /// consistently and without pausing the VM, writing the captured range
     /// table to a `<out_path>.ranges` sidecar so a caller can map the captured
@@ -3057,7 +3072,8 @@ impl Vm {
         state_path.push(SNAPSHOT_STATE_FILE);
         let vm_state =
             serde_json::to_vec(&snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-        std::fs::write(&state_path, &vm_state).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        std::fs::write(&state_path, &vm_state)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Record which bytes of the dense memory image changed since the last
         // checkpoint (as offsets into the memory-ranges file) so the caller can
@@ -3065,7 +3081,11 @@ impl Vm {
         // manifest for the rest. The full image is still captured below; this is
         // metadata that lets the caller skip the unchanged chunks. Resets the
         // dirty bitmap for the next interval.
-        let dirty = self.memory_manager.lock().unwrap().dirty_capture_offsets()?;
+        let dirty = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .dirty_capture_offsets()?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =

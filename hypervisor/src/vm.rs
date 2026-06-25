@@ -212,6 +212,11 @@ pub enum HypervisorVmError {
     #[error("Failed to get dirty log")]
     GetDirtyLog(#[source] anyhow::Error),
     ///
+    /// Clear dirty log error
+    ///
+    #[error("Failed to clear dirty log")]
+    ClearDirtyLog(#[source] anyhow::Error),
+    ///
     /// Assert virtual interrupt error
     ///
     #[error("Failed to assert virtual Interrupt")]
@@ -435,6 +440,20 @@ pub trait Vm: Send + Sync + Any {
     fn stop_dirty_log(&self) -> Result<()>;
     /// Get dirty pages bitmap
     fn get_dirty_log(&self, slot: u32, base_gpa: u64, memory_size: u64) -> Result<Vec<u64>>;
+    /// Clear (and re-protect) dirty pages for a memory slot under manual
+    /// dirty-log protect. `bitmap` selects the pages to clear, in the same
+    /// per-page bit layout [`Vm::get_dirty_log`] returns. Backends that clear
+    /// the bitmap when it is read leave this a no-op, so a caller must always
+    /// call it after reading to stay correct on every backend.
+    fn clear_dirty_log(
+        &self,
+        _slot: u32,
+        _base_gpa: u64,
+        _memory_size: u64,
+        _bitmap: &[u64],
+    ) -> Result<()> {
+        Ok(())
+    }
     #[cfg(feature = "sev_snp")]
     /// Initialize SEV-SNP on this VM
     fn sev_snp_init(&self, guest_policy: SnpPolicy) -> Result<()>;

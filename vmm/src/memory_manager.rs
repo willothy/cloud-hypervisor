@@ -1276,6 +1276,26 @@ impl MemoryManager {
         Ok(out)
     }
 
+    /// The number of guest pages dirtied since the last checkpoint, read
+    /// without clearing the dirty bitmap so checkpoint cadence can poll it
+    /// between checkpoints. Relies on manual dirty-log protect, which is
+    /// required and enabled at VM creation, so the read does not consume the
+    /// set a later checkpoint captures.
+    ///
+    /// Counts KVM-tracked guest writes. VMM-side (device DMA) dirty pages are
+    /// folded into the capture itself, not counted here — reading them would
+    /// reset their software bitmap — and are negligible next to guest writes.
+    pub(crate) fn dirty_page_count(&self) -> std::result::Result<u64, MigratableError> {
+        let mut count = 0u64;
+        for r in &self.guest_ram_mappings {
+            let bitmap = self.vm.get_dirty_log(r.slot, r.gpa, r.size).map_err(|e| {
+                MigratableError::MigrateSend(anyhow!("Error getting VM dirty log {e}"))
+            })?;
+            count += bitmap.iter().map(|w| w.count_ones() as u64).sum::<u64>();
+        }
+        Ok(count)
+    }
+
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
             uffd_handler.stop_event.write(1).ok();
@@ -3514,6 +3534,16 @@ impl Migratable for MemoryManager {
                 .map(|(x, y)| x | y);
 
             let sub_table = MemoryRangeTable::from_dirty_bitmap(dirty_bitmap, r.gpa, 4096);
+
+            // Clear and re-protect the pages just consumed so the next interval
+            // tracks writes from here. Under manual dirty-log protect this is
+            // required (KVM_GET_DIRTY_LOG no longer cleared); otherwise it is a
+            // no-op (the bitmap already cleared on read).
+            self.vm
+                .clear_dirty_log(r.slot, r.gpa, r.size, &vm_dirty_bitmap)
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("Error clearing VM dirty log {e}"))
+                })?;
 
             if sub_table.regions().is_empty() {
                 debug!("Dirty Memory Range Table is empty");

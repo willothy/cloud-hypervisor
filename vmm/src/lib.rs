@@ -2355,6 +2355,19 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_dirty_page_count(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => {
+                let count = vm.dirty_page_count().map_err(VmError::DirtyPageCount)?;
+                serde_json::to_vec(&count)
+                    .map(Some)
+                    .map_err(VmError::SerializeJson)
+            }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
     fn vm_live_checkpoint(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         match self.vm {
             // The VM keeps running through a live checkpoint, so its console

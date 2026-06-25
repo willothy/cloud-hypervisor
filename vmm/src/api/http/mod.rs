@@ -30,9 +30,9 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCaptureDirtyMemory, VmCounters,
-    VmDelete, VmLiveCheckpoint, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
-    VmShutdown, VmSnapshot,
+    VmDelete, VmDirtyPageCount, VmLiveCheckpoint, VmNmi, VmPause, VmPowerButton, VmReboot,
+    VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume,
+    VmSendMigration, VmShutdown, VmSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -243,6 +243,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.counters"),
         Box::new(VmActionHandler::new(&VmCounters)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.dirty-page-count"),
+        Box::new(VmActionHandler::new(&VmDirtyPageCount)),
     );
     r.routes
         .insert(endpoint!("/vm.create"), Box::new(VmCreate {}));

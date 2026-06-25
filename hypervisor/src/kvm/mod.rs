@@ -150,10 +150,10 @@ use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::ioctl::ioctl_with_ref;
-#[cfg(target_arch = "x86_64")]
-use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr};
 #[cfg(feature = "tdx")]
-use vmm_sys_util::{ioctl::ioctl_with_val, ioctl_iowr_nr};
+use vmm_sys_util::ioctl::ioctl_with_val;
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use crate::RegList;
@@ -184,6 +184,15 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
+// kvm-ioctls does not wrap KVM_CLEAR_DIRTY_LOG, needed to clear (and re-protect)
+// the dirty bitmap under manual dirty-log protect.
+#[cfg(target_arch = "x86_64")]
+ioctl_iowr_nr!(
+    KVM_CLEAR_DIRTY_LOG,
+    kvm_bindings::KVMIO,
+    0xc0,
+    kvm_bindings::kvm_clear_dirty_log
+);
 // kvm-ioctls only exposes the vCPU device-attribute ioctls for aarch64.
 #[cfg(target_arch = "x86_64")]
 ioctl_iow_nr!(
@@ -1478,6 +1487,43 @@ impl vm::Vm for KvmVm {
     }
 
     ///
+    /// Clear (and re-protect) the dirty pages selected by `bitmap` for a slot.
+    /// x86_64 only, matching where manual dirty-log protect is enabled; other
+    /// arches use the trait's no-op (their dirty log clears on read).
+    ///
+    #[cfg(target_arch = "x86_64")]
+    fn clear_dirty_log(
+        &self,
+        slot: u32,
+        _base_gpa: u64,
+        memory_size: u64,
+        bitmap: &[u64],
+    ) -> vm::Result<()> {
+        // Manual dirty-log protect is enabled at VM creation, so KVM_GET_DIRTY_LOG
+        // does not clear; this re-protects the pages whose bit is set, one bit
+        // per host page over the whole slot, so subsequent guest writes redirty
+        // them.
+        let num_pages = memory_size.div_ceil(4096) as u32;
+        let clear = kvm_bindings::kvm_clear_dirty_log {
+            slot,
+            num_pages,
+            first_page: 0,
+            __bindgen_anon_1: kvm_bindings::kvm_clear_dirty_log__bindgen_ty_1 {
+                dirty_bitmap: bitmap.as_ptr() as *mut libc::c_void,
+            },
+        };
+        // SAFETY: `clear` outlives the ioctl and `dirty_bitmap` points at
+        // `bitmap`, which covers `num_pages` bits (one per page of the slot).
+        let ret = unsafe { ioctl_with_ref(&self.fd, KVM_CLEAR_DIRTY_LOG(), &clear) };
+        if ret != 0 {
+            return Err(vm::HypervisorVmError::ClearDirtyLog(
+                std::io::Error::last_os_error().into(),
+            ));
+        }
+        Ok(())
+    }
+
+    ///
     /// Initialize TDX for this VM
     ///
     #[cfg(feature = "tdx")]
@@ -1741,6 +1787,39 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 }
             }
             break;
+        }
+
+        // Enable manual dirty-log protect: KVM_GET_DIRTY_LOG then reports the
+        // dirty bitmap without clearing or re-protecting pages, and an explicit
+        // KVM_CLEAR_DIRTY_LOG does the clearing. This lets the dirty-page count
+        // be read between checkpoints without consuming the set a later
+        // checkpoint captures. The capability is required; refuse to create the
+        // VM on a kernel that lacks it rather than silently degrading.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if fd.check_extension_raw(
+                kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 as libc::c_ulong,
+            ) <= 0
+            {
+                return Err(hypervisor::HypervisorError::VmCreate(
+                    std::io::Error::other(
+                        "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is required but unsupported by this kernel",
+                    )
+                    .into(),
+                ));
+            }
+            let cap = kvm_bindings::kvm_enable_cap {
+                cap: kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
+                args: [
+                    kvm_bindings::KVM_DIRTY_LOG_MANUAL_PROTECT_ENABLE as u64,
+                    0,
+                    0,
+                    0,
+                ],
+                ..Default::default()
+            };
+            fd.enable_cap(&cap)
+                .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
         }
 
         #[cfg(target_arch = "x86_64")]

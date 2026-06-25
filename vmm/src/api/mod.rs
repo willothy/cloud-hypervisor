@@ -131,6 +131,10 @@ pub enum ApiError {
     #[error("The VM could not capture its dirty memory")]
     VmCaptureDirtyMemory(#[source] VmError),
 
+    /// The VM could not report its dirty-page count.
+    #[error("The VM could not report its dirty-page count")]
+    VmDirtyPageCount(#[source] VmError),
+
     /// The VM could not take a live checkpoint.
     #[error("The VM could not take a live checkpoint")]
     VmLiveCheckpoint(#[source] VmError),
@@ -708,6 +712,8 @@ pub trait RequestHandler {
 
     fn vm_capture_dirty_memory(&mut self, out_path: &str) -> Result<(), VmError>;
 
+    fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+
     fn vm_live_checkpoint(&mut self, destination_url: &str) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
@@ -1262,6 +1268,39 @@ impl ApiAction for VmCounters {
             let response = vmm
                 .vm_counters()
                 .map_err(ApiError::VmInfo)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmDirtyPageCount;
+
+impl ApiAction for VmDirtyPageCount {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmDirtyPageCount");
+
+            let response = vmm
+                .vm_dirty_page_count()
+                .map_err(ApiError::VmDirtyPageCount)
                 .map(ApiResponsePayload::VmAction);
 
             response_sender
