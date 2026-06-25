@@ -30,9 +30,9 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCaptureDirtyMemory, VmCounters,
-    VmDelete, VmNmi,
-    VmPause, VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown, VmSnapshot,
+    VmDelete, VmLiveCheckpoint, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration,
+    VmShutdown, VmSnapshot,
 };
 use crate::landlock::Landlock;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -306,6 +306,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.capture-dirty-memory"),
         Box::new(VmActionHandler::new(&VmCaptureDirtyMemory)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.live-checkpoint"),
+        Box::new(VmActionHandler::new(&VmLiveCheckpoint)),
     );
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     r.routes.insert(

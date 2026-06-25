@@ -131,6 +131,10 @@ pub enum ApiError {
     #[error("The VM could not capture its dirty memory")]
     VmCaptureDirtyMemory(#[source] VmError),
 
+    /// The VM could not take a live checkpoint.
+    #[error("The VM could not take a live checkpoint")]
+    VmLiveCheckpoint(#[source] VmError),
+
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
     VmRestore(#[source] VmError),
@@ -703,6 +707,8 @@ pub trait RequestHandler {
     fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
 
     fn vm_capture_dirty_memory(&mut self, out_path: &str) -> Result<(), VmError>;
+
+    fn vm_live_checkpoint(&mut self, destination_url: &str) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1862,6 +1868,44 @@ impl ApiAction for VmCaptureDirtyMemory {
             let response = vmm
                 .vm_capture_dirty_memory(&config.out_path)
                 .map_err(ApiError::VmCaptureDirtyMemory)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmLiveCheckpoint;
+
+impl ApiAction for VmLiveCheckpoint {
+    // A live checkpoint, like a snapshot, just needs a destination directory.
+    type RequestBody = VmSnapshotConfig;
+    type ResponseBody = Option<Body>;
+
+    fn request(
+        &self,
+        config: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmLiveCheckpoint {config:?}");
+
+            let response = vmm
+                .vm_live_checkpoint(&config.destination_url)
+                .map_err(ApiError::VmLiveCheckpoint)
                 .map(|_| ApiResponsePayload::Empty);
 
             response_sender

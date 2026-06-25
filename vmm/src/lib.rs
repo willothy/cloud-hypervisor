@@ -2355,6 +2355,18 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_live_checkpoint(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+        match self.vm {
+            // The VM keeps running through a live checkpoint, so its console
+            // FDs must stay intact (unlike vm_snapshot, which drains them).
+            VmOwnership::Owned(ref mut vm) => vm
+                .live_checkpoint(destination_url)
+                .map_err(VmError::LiveCheckpoint),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),

@@ -1133,48 +1133,28 @@ impl MemoryManager {
         features
     }
 
-    /// Capture the memory pages dirtied since dirty logging started into
-    /// `out_path`, consistently and **without pausing the VM**, using UFFD
-    /// write-protect copy-on-write. Returns the table of captured ranges so a
-    /// caller can map them to a manifest.
-    ///
-    /// Dirty logging must be active (`start_dirty_log`). The captured image is
-    /// the guest memory state at the instant protection is armed: a guest write
-    /// during the capture faults, the pre-write page is captured ahead of it,
-    /// and the write then proceeds. The dirty bitmap is consumed (reset) for
-    /// the next interval. Pages are handled at the 4 KiB dirty-log granularity.
-    pub(crate) fn capture_dirty_background(
-        &mut self,
-        out_path: &Path,
-    ) -> Result<MemoryRangeTable, MigratableError> {
-        use std::os::unix::fs::FileExt;
-
+    /// Create a userfaultfd, register write-protect mode on every range in
+    /// `table`, arm protection, and return the fd plus the capture descriptors
+    /// (dense output layout, in `table` order). Arm this while the VM is paused
+    /// so the subsequent capture is a consistent point-in-time; the returned fd
+    /// must outlive the capture.
+    fn arm_wp_capture(
+        &self,
+        table: &MemoryRangeTable,
+    ) -> Result<(OwnedFd, Vec<uffd::CaptureRange>), MigratableError> {
         // A demand-paged restore handler owns the guest-RAM UFFD registration;
         // capturing concurrently would need to share it. Not supported yet.
         if self.uffd_handler.is_some() {
             return Err(MigratableError::MigrateSend(anyhow!(
-                "background capture unsupported while a UFFD restore handler is active"
+                "live memory capture unsupported while a UFFD restore handler is active"
             )));
         }
-
-        let dirty = self.dirty_log()?;
-        let out = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(out_path)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
-        if dirty.regions().is_empty() {
-            return Ok(dirty);
-        }
-
         let guest_memory = self.guest_memory.memory();
         let uffd_fd = uffd::create(crate::userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("creating userfaultfd: {e}")))?;
-
-        let mut ranges = Vec::with_capacity(dirty.regions().len());
+        let mut ranges = Vec::with_capacity(table.regions().len());
         let mut out_offset = 0u64;
-        for r in dirty.regions() {
+        for r in table.regions() {
             let host_addr = guest_memory
                 .get_host_address(GuestAddress(r.gpa))
                 .map_err(|e| {
@@ -1197,13 +1177,69 @@ impl MemoryManager {
             });
             out_offset += r.length;
         }
+        Ok((uffd_fd, ranges))
+    }
 
-        uffd::capture_write_protected(uffd_fd.as_fd(), &ranges, |off, bytes| {
+    /// Run a write-protect capture armed by [`Self::arm_wp_capture`], writing
+    /// each captured page to `out_path` at its dense offset. Call this after
+    /// resuming the VM: the guest keeps running while its pre-write pages are
+    /// copied out.
+    pub(crate) fn run_wp_capture(
+        uffd_fd: &OwnedFd,
+        ranges: &[uffd::CaptureRange],
+        out_path: &Path,
+    ) -> Result<(), MigratableError> {
+        use std::os::unix::fs::FileExt;
+        let out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out_path)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
+        uffd::capture_write_protected(uffd_fd.as_fd(), ranges, |off, bytes| {
             out.write_all_at(bytes, off)
         })
-        .map_err(|e| MigratableError::MigrateSend(anyhow!("capturing dirty pages: {e}")))?;
+        .map_err(|e| MigratableError::MigrateSend(anyhow!("capturing pages: {e}")))
+    }
 
+    /// Capture the memory pages dirtied since dirty logging started into
+    /// `out_path`, consistently and **without pausing the VM**, via UFFD
+    /// write-protect copy-on-write. Returns the captured range table.
+    ///
+    /// Dirty logging must be active (`start_dirty_log`); the dirty bitmap is
+    /// consumed (reset) for the next interval. Pages are handled at the 4 KiB
+    /// dirty-log granularity.
+    pub(crate) fn capture_dirty_background(
+        &mut self,
+        out_path: &Path,
+    ) -> Result<MemoryRangeTable, MigratableError> {
+        let dirty = self.dirty_log()?;
+        if dirty.regions().is_empty() {
+            // Nothing changed since the last checkpoint; write an empty capture
+            // so the caller always finds the file.
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(out_path)
+                .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
+            return Ok(dirty);
+        }
+        let (uffd_fd, ranges) = self.arm_wp_capture(&dirty)?;
+        Self::run_wp_capture(&uffd_fd, &ranges, out_path)?;
         Ok(dirty)
+    }
+
+    /// Memory-capture half of a live checkpoint: arm write-protect over all
+    /// guest RAM while the caller holds the VM paused, returning the armed fd,
+    /// the capture descriptors, and the matching range table to record in the
+    /// snapshot state. The caller resumes the VM, then calls
+    /// [`Self::run_wp_capture`] to copy the pages out while the guest runs.
+    pub(crate) fn arm_full_capture(
+        &self,
+    ) -> Result<(OwnedFd, Vec<uffd::CaptureRange>, MemoryRangeTable), MigratableError> {
+        let table = self.memory_range_table(true)?;
+        let (uffd_fd, ranges) = self.arm_wp_capture(&table)?;
+        Ok((uffd_fd, ranges, table))
     }
 
     fn stop_uffd_handler(&mut self) {
