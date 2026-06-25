@@ -1203,17 +1203,19 @@ impl MemoryManager {
                     source: e,
                 })? as u64;
 
-            let ioctls = uffd::register(
-                uffd_fd.as_fd(),
-                host_addr,
-                range.length,
-                uffd_requires_minor_mode,
-            )
-            .map_err(|e| UffdError::Register {
-                addr: host_addr,
-                len: range.length,
-                source: e,
-            })?;
+            let mode = if uffd_requires_minor_mode {
+                userfaultfd::UFFDIO_REGISTER_MODE_MISSING | userfaultfd::UFFDIO_REGISTER_MODE_MINOR
+            } else {
+                userfaultfd::UFFDIO_REGISTER_MODE_MISSING
+            };
+            let ioctls =
+                uffd::register(uffd_fd.as_fd(), host_addr, range.length, mode).map_err(|e| {
+                    UffdError::Register {
+                        addr: host_addr,
+                        len: range.length,
+                        source: e,
+                    }
+                })?;
 
             let required_ioctls = if uffd_requires_minor_mode {
                 userfaultfd::UFFD_API_RANGE_IOCTLS_MINOR
