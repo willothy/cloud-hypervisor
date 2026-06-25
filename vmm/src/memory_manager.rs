@@ -1242,6 +1242,40 @@ impl MemoryManager {
         Ok((uffd_fd, ranges, table))
     }
 
+    /// The pages dirtied since the last checkpoint, as byte ranges into the
+    /// dense `memory-ranges` capture file (the layout `arm_full_capture` uses),
+    /// so a caller can re-chunk only those and reuse the prior checkpoint's
+    /// manifest for the rest. Consumes the dirty bitmap for the next interval.
+    ///
+    /// The dirty log reports guest-physical ranges; this maps each into its
+    /// dense file offset using the same region ordering as the capture, so it
+    /// is correct even when guest RAM spans multiple regions.
+    pub(crate) fn dirty_capture_offsets(&mut self) -> Result<Vec<(u64, u64)>, MigratableError> {
+        let layout = self.memory_range_table(true)?;
+        let dirty = self.dirty_log()?;
+
+        // Dense base offset of each guest-RAM region, in capture order.
+        let mut regions = Vec::with_capacity(layout.regions().len());
+        let mut offset = 0u64;
+        for r in layout.regions() {
+            regions.push((r.gpa, r.length, offset));
+            offset += r.length;
+        }
+
+        let mut out = Vec::with_capacity(dirty.regions().len());
+        for d in dirty.regions() {
+            // A dirty range lies within a single region (the dirty log is built
+            // per region); map its gpa to the dense capture offset.
+            if let Some(&(gpa, _len, base)) = regions
+                .iter()
+                .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
+            {
+                out.push((base + (d.gpa - gpa), d.length));
+            }
+        }
+        Ok(out)
+    }
+
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
             uffd_handler.stop_event.write(1).ok();

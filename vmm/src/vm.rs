@@ -3059,6 +3059,20 @@ impl Vm {
             serde_json::to_vec(&snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
         std::fs::write(&state_path, &vm_state).map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
+        // Record which bytes of the dense memory image changed since the last
+        // checkpoint (as offsets into the memory-ranges file) so the caller can
+        // re-chunk only those incrementally, reusing the prior checkpoint's
+        // manifest for the rest. The full image is still captured below; this is
+        // metadata that lets the caller skip the unchanged chunks. Resets the
+        // dirty bitmap for the next interval.
+        let dirty = self.memory_manager.lock().unwrap().dirty_capture_offsets()?;
+        let mut dirty_path = url_to_path(destination_url)?;
+        dirty_path.push("memory-dirty.ranges");
+        let dirty_json =
+            serde_json::to_vec(&dirty).map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        std::fs::write(&dirty_path, &dirty_json)
+            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+
         let (uffd_fd, ranges, _table) = self.memory_manager.lock().unwrap().arm_full_capture()?;
         Ok((uffd_fd, ranges))
     }
