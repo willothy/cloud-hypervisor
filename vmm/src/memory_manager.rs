@@ -1133,6 +1133,79 @@ impl MemoryManager {
         features
     }
 
+    /// Capture the memory pages dirtied since dirty logging started into
+    /// `out_path`, consistently and **without pausing the VM**, using UFFD
+    /// write-protect copy-on-write. Returns the table of captured ranges so a
+    /// caller can map them to a manifest.
+    ///
+    /// Dirty logging must be active (`start_dirty_log`). The captured image is
+    /// the guest memory state at the instant protection is armed: a guest write
+    /// during the capture faults, the pre-write page is captured ahead of it,
+    /// and the write then proceeds. The dirty bitmap is consumed (reset) for
+    /// the next interval. Pages are handled at the 4 KiB dirty-log granularity.
+    pub(crate) fn capture_dirty_background(
+        &mut self,
+        out_path: &Path,
+    ) -> Result<MemoryRangeTable, MigratableError> {
+        use std::os::unix::fs::FileExt;
+
+        // A demand-paged restore handler owns the guest-RAM UFFD registration;
+        // capturing concurrently would need to share it. Not supported yet.
+        if self.uffd_handler.is_some() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "background capture unsupported while a UFFD restore handler is active"
+            )));
+        }
+
+        let dirty = self.dirty_log()?;
+        let out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out_path)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
+        if dirty.regions().is_empty() {
+            return Ok(dirty);
+        }
+
+        let guest_memory = self.guest_memory.memory();
+        let uffd_fd = uffd::create(crate::userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating userfaultfd: {e}")))?;
+
+        let mut ranges = Vec::with_capacity(dirty.regions().len());
+        let mut out_offset = 0u64;
+        for r in dirty.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(r.gpa))
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("translating gpa {:#x}: {e}", r.gpa))
+                })? as u64;
+            uffd::register(
+                uffd_fd.as_fd(),
+                host_addr,
+                r.length,
+                crate::userfaultfd::UFFDIO_REGISTER_MODE_WP,
+            )
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("registering WP range: {e}")))?;
+            uffd::write_protect(uffd_fd.as_fd(), host_addr, r.length, true, false)
+                .map_err(|e| MigratableError::MigrateSend(anyhow!("arming write-protect: {e}")))?;
+            ranges.push(uffd::CaptureRange {
+                host_addr,
+                length: r.length,
+                out_offset,
+                page_size: 4096,
+            });
+            out_offset += r.length;
+        }
+
+        uffd::capture_write_protected(uffd_fd.as_fd(), &ranges, |off, bytes| {
+            out.write_all_at(bytes, off)
+        })
+        .map_err(|e| MigratableError::MigrateSend(anyhow!("capturing dirty pages: {e}")))?;
+
+        Ok(dirty)
+    }
+
     fn stop_uffd_handler(&mut self) {
         if let Some(uffd_handler) = self.uffd_handler.take() {
             uffd_handler.stop_event.write(1).ok();
