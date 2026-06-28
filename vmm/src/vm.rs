@@ -1369,6 +1369,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        restore_fault_socket: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1424,6 +1425,7 @@ impl Vm {
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode.unwrap_or_default(),
+                    restore_fault_socket.as_deref(),
                     phys_bits,
                     &exit_evt,
                 )

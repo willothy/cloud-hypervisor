@@ -2790,6 +2790,12 @@ pub struct RestoreConfig {
     pub memory_restore_mode: MemoryRestoreMode,
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// Unix socket to fault guest-memory pages in from during on-demand
+    /// restore, instead of reading them from the snapshot file. The peer
+    /// serves pages identified by their byte offset into the snapshot memory
+    /// image. Only meaningful with `memory_restore_mode=ondemand`.
+    #[serde(default)]
+    pub restore_fault_socket: Option<PathBuf>,
     #[serde(default)]
     pub resume: bool,
 }
@@ -2797,10 +2803,11 @@ pub struct RestoreConfig {
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
+        memory_fault_socket=<path>,net_fds=<list_of_net_ids_with_their_associated_fds>,resume=true|false\" \
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, while `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable \
+        \n`memory_fault_socket` is a Unix socket to fault guest-memory pages in from during on-demand restore, instead of the snapshot file \
         \n`net_fds` is a list of net ids with new file descriptors. \
         Only net devices backed by FDs directly are needed as input.\
         \n `resume` controls whether the VM will be directly resumed after restore ";
@@ -2811,6 +2818,7 @@ impl RestoreConfig {
             .add("source_url")
             .add("prefault")
             .add("memory_restore_mode")
+            .add("memory_fault_socket")
             .add("net_fds")
             .add("resume");
         parser.parse(restore).map_err(Error::ParseRestore)?;
@@ -2828,6 +2836,7 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
+        let restore_fault_socket = parser.get("memory_fault_socket").map(PathBuf::from);
         let net_fds = parser
             .convert::<Tuple<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
@@ -2850,6 +2859,7 @@ impl RestoreConfig {
             source_url,
             prefault,
             memory_restore_mode,
+            restore_fault_socket,
             net_fds,
             resume,
         })

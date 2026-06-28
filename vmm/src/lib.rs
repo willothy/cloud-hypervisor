@@ -1905,6 +1905,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        restore_fault_socket: Option<std::path::PathBuf>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -1957,6 +1958,7 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    restore_fault_socket,
                 )?;
 
                 if self
@@ -2293,6 +2295,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2424,6 +2427,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
+                    restore_cfg.restore_fault_socket,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2526,6 +2530,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,

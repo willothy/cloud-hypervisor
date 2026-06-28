@@ -13,6 +13,7 @@ use std::num::NonZeroUsize;
 use std::ops::{BitAnd, Not, Sub};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -945,6 +946,46 @@ impl MemoryManager {
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(snapshot_file));
         self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled");
+        Ok(())
+    }
+
+    /// Restore guest memory using userfaultfd, faulting each page in from a
+    /// page-fault socket rather than a local snapshot file.
+    ///
+    /// This is [`Self::restore_by_uffd`] with the page source swapped: instead
+    /// of reading the missing page from a file, the handler requests it from a
+    /// peer over a Unix socket (the management software's page server, which
+    /// backs the pages with its own storage). The page is identified on the
+    /// wire by its byte offset into the dense snapshot memory image — the same
+    /// offset `restore_by_uffd` would seek to in the file — so the peer needs
+    /// only the snapshot's memory layout to answer, not its address space.
+    ///
+    /// The peer must already be listening on `socket_path`. The connection is
+    /// held open by the handler thread for as long as lazy restore is active.
+    fn restore_by_uffd_socket(
+        &mut self,
+        socket_path: &Path,
+        saved_regions: &MemoryRangeTable,
+        exit_evt: &EventFd,
+    ) -> Result<(), Error> {
+        let mut file_offset: u64 = 0;
+        let Some((uffd_fd, ranges)) = self.prepare_uffd(saved_regions, |r| {
+            let o = file_offset;
+            file_offset += r.length;
+            o
+        })?
+        else {
+            return Ok(());
+        };
+        let stream = UnixStream::connect(socket_path).map_err(UffdError::ConnectFaultSocket)?;
+        // Inline page transfer (no shared backing): the peer sends each page's
+        // content in its response and the handler installs it with UFFDIO_COPY.
+        let source: Box<dyn UffdMemorySource> = Box::new(SocketUffdMemorySource::new(
+            SocketStream::Unix(stream),
+            false,
+        ));
+        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        info!("UFFD restore: demand-paged restore enabled (page-fault socket)");
         Ok(())
     }
 
@@ -2038,6 +2079,7 @@ impl MemoryManager {
         source_url: Option<&str>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
+        restore_fault_socket: Option<&Path>,
         phys_bits: u8,
         exit_evt: &EventFd,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -2060,11 +2102,20 @@ impl MemoryManager {
             )?;
 
             if memory_restore_mode == MemoryRestoreMode::OnDemand {
-                mm.lock().unwrap().restore_by_uffd(
-                    &memory_file_path,
-                    &mem_snapshot.memory_ranges,
-                    exit_evt,
-                )?;
+                // With a page-fault socket the pages are served by a peer over
+                // the socket; without one they are read from the snapshot file.
+                match restore_fault_socket {
+                    Some(socket_path) => mm.lock().unwrap().restore_by_uffd_socket(
+                        socket_path,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?,
+                    None => mm.lock().unwrap().restore_by_uffd(
+                        &memory_file_path,
+                        &mem_snapshot.memory_ranges,
+                        exit_evt,
+                    )?,
+                }
             } else {
                 mm.lock()
                     .unwrap()
