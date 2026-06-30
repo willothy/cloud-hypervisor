@@ -1368,6 +1368,15 @@ impl MemoryManager {
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
 
+        // Pages the background prefault pass fetches and installs per batch.
+        // Faulting in 4 KiB pages one socket round-trip at a time cannot keep
+        // ahead of a booting guest; a run of this many contiguous pages
+        // (~1 MiB) is fetched in one request and installed with one
+        // UFFDIO_COPY, so the fill races ahead and most guest accesses find
+        // their page already present. Bounded so an on-demand fault arriving
+        // mid-batch waits at most one batch.
+        const PREFAULT_BATCH_PAGES: u64 = 256;
+
         let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
         let mut pages_served: u64 = 0;
         let mut pages_prefaulted: u64 = 0;
@@ -1555,35 +1564,38 @@ impl MemoryManager {
 
             let range = &ranges[range_idx];
 
-            let advance = match source.resolve(uffd_fd.as_fd(), range, page_idx) {
-                Ok(FaultResolution::Served) => {
-                    pages_prefaulted += 1;
-                    served_bitmap[range_idx].set_bit(page_idx as usize);
-                    true
-                }
-                Ok(FaultResolution::Retry) => {
-                    // Unlike the on demand handler (which must retry to wake
-                    // the faulting thread), prefault can safely skip: any
-                    // future guest access will simply page-fault and be
-                    // served by the on demand path.
-                    true
-                }
-                Err(e) => {
-                    let page_addr = range.page_addr(page_idx);
-                    warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
-                    false
-                }
-            };
-
-            if !advance {
-                // Prefault hit an unrecoverable error; give up but keep
-                // serving on-demand faults.
-                warn!("UFFD prefault: abandoning background prefault after error");
-                prefault_cursor = None;
-                continue;
+            // Extend the run over consecutive un-served pages within this
+            // range, capped at the batch size, so the source fetches and
+            // installs them in one round-trip instead of one page at a time.
+            let max_run = PREFAULT_BATCH_PAGES.min(range.num_pages() - page_idx);
+            let mut run = 1u64;
+            while run < max_run && !served_bitmap[range_idx].is_bit_set((page_idx + run) as usize) {
+                run += 1;
             }
 
-            prefault_cursor = Some((range_idx, page_idx + 1));
+            match source.resolve_run(uffd_fd.as_fd(), range, page_idx, run) {
+                Ok(0) => {
+                    // Nothing installed this round (a transient kernel state);
+                    // skip the page and let the on-demand path serve it. Any
+                    // future guest access simply faults and is served then.
+                    prefault_cursor = Some((range_idx, page_idx + 1));
+                }
+                Ok(installed) => {
+                    pages_prefaulted += installed;
+                    for i in 0..installed {
+                        served_bitmap[range_idx].set_bit((page_idx + i) as usize);
+                    }
+                    prefault_cursor = Some((range_idx, page_idx + installed));
+                }
+                Err(e) => {
+                    // Prefault hit an unrecoverable error; give up but keep
+                    // serving on-demand faults.
+                    let page_addr = range.page_addr(page_idx);
+                    warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
+                    warn!("UFFD prefault: abandoning background prefault after error");
+                    prefault_cursor = None;
+                }
+            }
         }
     }
 

@@ -236,6 +236,31 @@ pub(crate) trait UffdMemorySource: Send {
         range: &UffdRange,
         page_idx: u64,
     ) -> Result<FaultResolution, io::Error>;
+
+    /// Resolve a contiguous run of up to `num_pages` pages starting at
+    /// `start_page`, in as few operations as the source supports, returning
+    /// the number of leading pages actually installed.
+    ///
+    /// The background prefault pass uses this to fill ahead of the guest in
+    /// large strides instead of one page per round-trip. A returned count
+    /// below `num_pages` (including zero) just means the caller resolves the
+    /// rest later — those pages stay un-installed, so a guest access still
+    /// faults them in normally. The default installs a single page via
+    /// [`resolve`](UffdMemorySource::resolve); sources that can transfer a
+    /// whole run at once override this.
+    fn resolve_run(
+        &mut self,
+        uffd_fd: BorrowedFd<'_>,
+        range: &UffdRange,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Result<u64, io::Error> {
+        let _ = num_pages;
+        match self.resolve(uffd_fd, range, start_page)? {
+            FaultResolution::Served => Ok(1),
+            FaultResolution::Retry => Ok(0),
+        }
+    }
 }
 
 /// Source that reads pages from a local snapshot file.
@@ -367,6 +392,75 @@ impl UffdMemorySource for SocketUffdMemorySource {
                 Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(FaultResolution::Retry),
                 Err(e) => Err(e),
             }
+        }
+    }
+
+    fn resolve_run(
+        &mut self,
+        uffd_fd: BorrowedFd<'_>,
+        range: &UffdRange,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Result<u64, io::Error> {
+        // Shared backing installs each page by waking its faulting thread, so
+        // there is nothing to batch; the inline path transfers the whole run
+        // in one request and installs it with a single UFFDIO_COPY.
+        if self.shared_backing || num_pages <= 1 {
+            return match self.resolve(uffd_fd, range, start_page)? {
+                FaultResolution::Served => Ok(1),
+                FaultResolution::Retry => Ok(0),
+            };
+        }
+
+        let page_size = range.page_size;
+        let run_pages = num_pages.min(range.num_pages() - start_page);
+        let start_addr = range.page_addr(start_page);
+        let start_gpa = range.page_source_offset(start_page);
+        let bytes = run_pages * page_size;
+
+        let resp_len = self.request_page(start_gpa, bytes)?;
+        if resp_len != bytes {
+            return Err(io::Error::other(format!(
+                "inline PageFault response length {resp_len} != requested run {bytes}",
+            )));
+        }
+        let len = bytes as usize;
+        if self.buf.len() < len {
+            self.buf.resize(len, 0);
+        }
+        self.stream.read_exact(&mut self.buf[..len])?;
+
+        match copy(uffd_fd, start_addr, self.buf.as_ptr(), bytes) {
+            Ok(()) => Ok(run_pages),
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(0),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                // A page in the run was already present (the caller builds runs
+                // of un-installed pages, so this is rare). Install the run from
+                // the buffer we already fetched, page by page, waking any page
+                // that turns out present and stopping at the first the kernel
+                // is still resolving.
+                let mut installed = 0u64;
+                while installed < run_pages {
+                    let off = (installed * page_size) as usize;
+                    let dst = start_addr + installed * page_size;
+                    // SAFETY: `self.buf` holds `bytes` valid bytes; `off` is
+                    // within it and `dst` is the matching guest page address.
+                    let src = unsafe { self.buf.as_ptr().add(off) };
+                    match copy(uffd_fd, dst, src, page_size) {
+                        Ok(()) => {}
+                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                            if let Err(e) = wake(uffd_fd, dst, page_size) {
+                                log::warn!("UFFDIO_WAKE failed at {dst:#x}: {e}");
+                            }
+                        }
+                        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => break,
+                        Err(e) => return Err(e),
+                    }
+                    installed += 1;
+                }
+                Ok(installed)
+            }
+            Err(e) => Err(e),
         }
     }
 }
