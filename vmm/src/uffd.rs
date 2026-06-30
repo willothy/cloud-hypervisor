@@ -690,6 +690,39 @@ pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error>
     Ok(())
 }
 
+/// A working-set trace: the dense-image byte offsets a prior restore faulted
+/// on demand, in access order. Replaying it as the prefault order lets the
+/// next restore install those (otherwise scattered, late-streamed) pages
+/// before the guest reaches them. Stored as a little-endian `u64` array.
+pub(crate) fn read_trace(path: &std::path::Path) -> io::Result<Vec<u64>> {
+    let bytes = std::fs::read(path)?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8 bytes")))
+        .collect())
+}
+
+/// Write a working-set trace atomically (temp file + rename), so a reader
+/// never observes a partial trace.
+pub(crate) fn write_trace(path: &std::path::Path, offsets: &[u64]) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(offsets.len() * 8);
+    for offset in offsets {
+        buf.extend_from_slice(&offset.to_le_bytes());
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &buf)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Map a dense-image byte offset back to the (range index, page index) that
+/// covers it, or `None` when no registered range does.
+pub(crate) fn locate_offset(ranges: &[UffdRange], offset: u64) -> Option<(usize, u64)> {
+    ranges.iter().enumerate().find_map(|(i, r)| {
+        (offset >= r.source_offset && offset < r.source_offset + r.length)
+            .then(|| (i, (offset - r.source_offset) / r.page_size))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsFd;

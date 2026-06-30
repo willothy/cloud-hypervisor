@@ -944,7 +944,7 @@ impl MemoryManager {
         };
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(snapshot_file));
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd_fd, None, ranges, source, None, exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -984,7 +984,10 @@ impl MemoryManager {
             SocketStream::Unix(stream),
             false,
         ));
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        // The page server and supervisor share the VM's directory (the fault
+        // socket's parent); the working-set trace lives there.
+        let workset_dir = socket_path.parent().map(Path::to_path_buf);
+        self.spawn_uffd_handler(uffd_fd, None, ranges, source, workset_dir, exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled (page-fault socket)");
         Ok(())
     }
@@ -1010,7 +1013,7 @@ impl MemoryManager {
             .map_err(UffdError::SetSocket)?;
         let source: Box<dyn UffdMemorySource> =
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
-        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, exit_evt)
+        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, None, exit_evt)
     }
 
     /// Create a UFFD fd and register every range.
@@ -1103,6 +1106,7 @@ impl MemoryManager {
         fault_socket_fd: Option<OwnedFd>,
         handler_ranges: Vec<UffdRange>,
         source: Box<dyn UffdMemorySource>,
+        workset_dir: Option<PathBuf>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         info!(
@@ -1125,6 +1129,7 @@ impl MemoryManager {
                         thread_stop_event,
                         source,
                         &handler_ranges,
+                        workset_dir,
                         &ready_tx,
                     );
 
@@ -1364,6 +1369,7 @@ impl MemoryManager {
         stop_event: EventFd,
         mut source: Box<dyn UffdMemorySource>,
         ranges: &[UffdRange],
+        workset_dir: Option<PathBuf>,
         ready_tx: &SyncSender<()>,
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
@@ -1405,6 +1411,44 @@ impl MemoryManager {
         let mut prefault_cursor: Option<(usize, u64)> = (!ranges.is_empty()).then_some((0, 0));
         let prefault_start = time::Instant::now();
 
+        // Working-set record & replay. A `workset.replay` left by the
+        // supervisor is the order a prior restore faulted pages on demand;
+        // prefault those first so the guest finds its scattered working set
+        // already present. With no replay trace, record this restore's
+        // on-demand faults to `workset.record` for the supervisor to keep,
+        // so the next restore can replay them. Bounded so a long-lived VM's
+        // later faults never grow it without limit.
+        const WORKSET_TRACE_MAX: usize = 1 << 16;
+        let replay_trace: Option<Vec<u64>> = workset_dir
+            .as_ref()
+            .map(|dir| dir.join("workset.replay"))
+            .filter(|path| path.exists())
+            .and_then(|path| match uffd::read_trace(&path) {
+                Ok(trace) => Some(trace),
+                Err(e) => {
+                    warn!("UFFD replay: reading {path:?} failed: {e}");
+                    None
+                }
+            });
+        let mut replay_cursor = 0usize;
+        // Record only when not replaying: a replay restore's residual faults
+        // would make a sparser, worse trace than the one it replayed.
+        let record_path: Option<PathBuf> = match (&workset_dir, &replay_trace) {
+            (Some(dir), None) => Some(dir.join("workset.record")),
+            _ => None,
+        };
+        let mut record_trace: Vec<u64> = Vec::new();
+        let mut record_written = false;
+        // Persist the recorded trace (once) so the supervisor can keep it for
+        // a future restore. No captures, so it can be called from every exit.
+        let flush_record = |path: &Option<PathBuf>, trace: &[u64]| {
+            if let Some(path) = path {
+                if let Err(e) = uffd::write_trace(path, trace) {
+                    warn!("UFFD record: writing {path:?} failed: {e}");
+                }
+            }
+        };
+
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
 
@@ -1432,9 +1476,17 @@ impl MemoryManager {
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
         loop {
-            // Block only when prefault is done; otherwise poll non-blocking
+            // Block only when there is no prefault work left (neither the
+            // replay trace nor the linear sweep); otherwise poll non-blocking
             // so we can advance prefault between faults.
-            let timeout = if prefault_cursor.is_some() { 0 } else { -1 };
+            let replaying = replay_trace
+                .as_ref()
+                .is_some_and(|t| replay_cursor < t.len());
+            let timeout = if prefault_cursor.is_some() || replaying {
+                0
+            } else {
+                -1
+            };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1449,6 +1501,10 @@ impl MemoryManager {
                 if token == EVENT_STOP {
                     stop_event.read().ok();
                     info!("UFFD handler: received stop event, exiting");
+                    if !record_written {
+                        record_written = true;
+                        flush_record(&record_path, &record_trace);
+                    }
                     return Ok(());
                 }
 
@@ -1457,6 +1513,10 @@ impl MemoryManager {
                     && (evt_flags & epoll::Events::EPOLLIN.bits()) == 0
                 {
                     info!("UFFD handler: fd closed (EPOLLHUP), exiting");
+                    if !record_written {
+                        record_written = true;
+                        flush_record(&record_path, &record_trace);
+                    }
                     return Ok(());
                 }
 
@@ -1485,6 +1545,10 @@ impl MemoryManager {
                 }
                 if n == 0 {
                     info!("UFFD handler: EOF on fd, exiting");
+                    if !record_written {
+                        record_written = true;
+                        flush_record(&record_path, &record_trace);
+                    }
                     return Ok(());
                 }
                 if n as usize != size_of::<uffd::UffdMsg>() {
@@ -1533,6 +1597,16 @@ impl MemoryManager {
                                 for i in 0..installed {
                                     served_bitmap[range_idx].set_bit((page_idx + i) as usize);
                                 }
+                                // Record the guest's actual fault (not the
+                                // readahead pages) as part of the working-set
+                                // access order for a future restore to replay.
+                                if record_path.is_some() && !record_written {
+                                    record_trace.push(range.page_source_offset(page_idx));
+                                    if record_trace.len() >= WORKSET_TRACE_MAX {
+                                        flush_record(&record_path, &record_trace);
+                                        record_written = true;
+                                    }
+                                }
                                 break;
                             }
                         }
@@ -1548,6 +1622,44 @@ impl MemoryManager {
                 }
 
                 continue;
+            }
+
+            // Replay phase: install the working-set trace (a prior restore's
+            // on-demand faults, in access order) ahead of the linear sweep, so
+            // those scattered pages are present before the guest reaches them.
+            // One entry per loop iteration, so on-demand faults — checked at
+            // the top of the loop — stay prioritized between entries.
+            if let Some(trace) = &replay_trace {
+                if replay_cursor < trace.len() {
+                    let offset = trace[replay_cursor];
+                    replay_cursor += 1;
+                    if let Some((range_idx, page_idx)) = uffd::locate_offset(ranges, offset) {
+                        if !served_bitmap[range_idx].is_bit_set(page_idx as usize) {
+                            let range = &ranges[range_idx];
+                            let max_run =
+                                ON_DEMAND_READAHEAD_PAGES.min(range.num_pages() - page_idx);
+                            let mut run = 1u64;
+                            while run < max_run
+                                && !served_bitmap[range_idx].is_bit_set((page_idx + run) as usize)
+                            {
+                                run += 1;
+                            }
+                            match source.resolve_run(uffd_fd.as_fd(), range, page_idx, run) {
+                                Ok(installed) => {
+                                    pages_prefaulted += installed;
+                                    for i in 0..installed {
+                                        served_bitmap[range_idx].set_bit((page_idx + i) as usize);
+                                    }
+                                }
+                                Err(e) => {
+                                    let page_addr = range.page_addr(page_idx);
+                                    warn!("UFFD replay: source error at {page_addr:#x}: {e}");
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
             }
 
             // No fault pending — advance the prefault cursor past served and
@@ -1569,6 +1681,10 @@ impl MemoryManager {
                          prefaulted={pages_prefaulted} served={pages_served} \
                          total={total_pages}"
                     );
+                    if !record_written {
+                        record_written = true;
+                        flush_record(&record_path, &record_trace);
+                    }
                     return Ok(());
                 }
                 if served_bitmap[range_idx].is_bit_set(page_idx as usize) {
