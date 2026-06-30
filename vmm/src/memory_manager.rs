@@ -61,7 +61,7 @@ use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::sparse::{next_data_extent, write_region_sparse};
 use crate::uffd::{
-    self, FaultResolution, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource,
+    self, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource,
     UffdRange,
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
@@ -1377,6 +1377,11 @@ impl MemoryManager {
         // mid-batch waits at most one batch.
         const PREFAULT_BATCH_PAGES: u64 = 256;
 
+        // Pages to fetch around an on-demand fault (~64 KiB). Guest accesses
+        // are spatially local, so serving a window per fault pre-serves its
+        // next few faults in the region it just entered.
+        const ON_DEMAND_READAHEAD_PAGES: u64 = 16;
+
         let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
         let mut pages_served: u64 = 0;
         let mut pages_prefaulted: u64 = 0;
@@ -1501,17 +1506,34 @@ impl MemoryManager {
                         continue;
                     };
 
+                    // Serve the faulting page plus a readahead window of
+                    // consecutive un-served pages in one batch. Guest accesses
+                    // are spatially local, so this pre-serves the next few
+                    // faults in the region the guest just entered, instead of
+                    // a round-trip per page.
+                    let max_run = ON_DEMAND_READAHEAD_PAGES.min(range.num_pages() - page_idx);
+                    let mut run = 1u64;
+                    while run < max_run
+                        && !served_bitmap[range_idx].is_bit_set((page_idx + run) as usize)
+                    {
+                        run += 1;
+                    }
+
                     loop {
-                        match source.resolve(uffd_fd.as_fd(), range, page_idx)? {
-                            FaultResolution::Served => {
-                                pages_served += 1;
-                                served_bitmap[range_idx].set_bit(page_idx as usize);
-                                break;
-                            }
-                            FaultResolution::Retry => {
-                                // The kernel reported a transient state while the fault
-                                // is being resolved; yield and retry instead of aborting.
+                        // The faulting page is first in the run, so any nonzero
+                        // count installs it and wakes the faulting thread.
+                        match source.resolve_run(uffd_fd.as_fd(), range, page_idx, run)? {
+                            0 => {
+                                // Transient kernel state; yield and retry,
+                                // since the faulting thread is waiting on it.
                                 thread::yield_now();
+                            }
+                            installed => {
+                                pages_served += installed;
+                                for i in 0..installed {
+                                    served_bitmap[range_idx].set_bit((page_idx + i) as usize);
+                                }
+                                break;
                             }
                         }
                     }
