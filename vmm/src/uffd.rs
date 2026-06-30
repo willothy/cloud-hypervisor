@@ -702,16 +702,16 @@ pub(crate) fn read_trace(path: &std::path::Path) -> io::Result<Vec<u64>> {
         .collect())
 }
 
-/// Write a working-set trace atomically (temp file + rename), so a reader
-/// never observes a partial trace.
+/// Write a working-set trace. Written directly (not via a temp file +
+/// rename): the VMM's seccomp filter does not allow `rename`, and a torn tail
+/// is harmless — [`read_trace`] reads whole 8-byte offsets and ignores any
+/// trailing partial bytes, and the reader polls long after the single write.
 pub(crate) fn write_trace(path: &std::path::Path, offsets: &[u64]) -> io::Result<()> {
     let mut buf = Vec::with_capacity(offsets.len() * 8);
     for offset in offsets {
         buf.extend_from_slice(&offset.to_le_bytes());
     }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &buf)?;
-    std::fs::rename(&tmp, path)
+    std::fs::write(path, &buf)
 }
 
 /// Map a dense-image byte offset back to the (range index, page index) that
