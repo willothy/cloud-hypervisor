@@ -1367,27 +1367,16 @@ impl MemoryManager {
     ) -> Result<(), io::Error> {
         let uffd_raw_fd = uffd_fd.as_raw_fd();
 
-        // Pages the background prefault pass fetches and installs per batch.
-        // Faulting in 4 KiB pages one socket round-trip at a time cannot keep
-        // ahead of a booting guest; a run of this many contiguous pages
-        // (~1 MiB) is fetched in one request and installed with one
-        // UFFDIO_COPY, so the fill races ahead and most guest accesses find
-        // their page already present. Bounded so an on-demand fault arriving
-        // mid-batch waits at most one batch.
-        const PREFAULT_BATCH_PAGES: u64 = 256;
-
         // Pages to fetch around an on-demand fault (~64 KiB). Guest accesses
         // are spatially local, so serving a window per fault pre-serves its
         // next few faults in the region it just entered.
         const ON_DEMAND_READAHEAD_PAGES: u64 = 16;
 
-        let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
         let mut pages_served: u64 = 0;
         let mut pages_prefaulted: u64 = 0;
 
-        // Per-range bitmap tracking which pages have been populated by the
-        // on-demand fault handler. Lets the prefault cursor skip them without
-        // doing a wasted file read + UFFDIO_COPY.
+        // Per-range bitmap tracking which pages have been populated, so the
+        // working-set replay skips pages an on-demand fault already served.
         let served_bitmap: Vec<AtomicBitmap> = ranges
             .iter()
             .map(|r| {
@@ -1398,23 +1387,20 @@ impl MemoryManager {
             })
             .collect();
 
-        // Prefault cursor: (range index, page index within range). `None`
-        // means prefault was given up due to an error (natural completion
-        // returns from the function instead).
-        let mut prefault_cursor: Option<(usize, u64)> = (!ranges.is_empty()).then_some((0, 0));
         let prefault_start = time::Instant::now();
 
-        // The working set to install ahead of the linear sweep: dense-image
-        // byte offsets the memory source provides in priority order (the
-        // supervisor's aggregated dirty-page set). Prefaulting these first
-        // means the guest finds its scattered working set already present
-        // instead of stalling on faults the linear sweep reaches late. A source
-        // with no working set (a file-backed restore) returns empty.
+        // The working set to prefault: dense-image byte offsets the memory
+        // source provides in priority order (the supervisor's aggregated
+        // dirty-page set). These are installed ahead of the guest; everything
+        // else is left to fault in on demand — no linear sweep, so pages the
+        // guest never touches are never loaded. A source with no working set (a
+        // file-backed restore) returns empty and the restore is fully lazy.
         let replay_trace = source.working_set().unwrap_or_else(|e| {
             warn!("UFFD working set: request failed: {e}");
             Vec::new()
         });
         let mut replay_cursor = 0usize;
+        let mut replay_done_logged = false;
 
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
@@ -1443,15 +1429,12 @@ impl MemoryManager {
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
         loop {
-            // Block only when there is no prefault work left (neither the
-            // working-set replay nor the linear sweep); otherwise poll
-            // non-blocking so we can advance prefault between faults.
+            // While the working set is still being replayed, poll non-blocking
+            // so we can install its pages between faults; once it is drained,
+            // block until the next on-demand fault (there is no linear sweep to
+            // advance).
             let replaying = replay_cursor < replay_trace.len();
-            let timeout = if prefault_cursor.is_some() || replaying {
-                0
-            } else {
-                -1
-            };
+            let timeout = if replaying { 0 } else { -1 };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1604,73 +1587,19 @@ impl MemoryManager {
                 continue;
             }
 
-            // No fault pending — advance the prefault cursor past served and
-            // end-of-range pages, then prefault one fresh page below.
-            let cursor = loop {
-                let Some((range_idx, page_idx)) = prefault_cursor else {
-                    break None;
-                };
-                if page_idx >= ranges[range_idx].num_pages() {
-                    if range_idx + 1 < ranges.len() {
-                        prefault_cursor = Some((range_idx + 1, 0));
-                        continue;
-                    }
-                    // Reached the end of the last range — every page is
-                    // mapped, so no future faults can occur. Exit.
-                    let elapsed = prefault_start.elapsed();
-                    info!(
-                        "UFFD handler: prefault done in {elapsed:.3?} — \
-                         prefaulted={pages_prefaulted} served={pages_served} \
-                         total={total_pages}"
-                    );
-                    return Ok(());
-                }
-                if served_bitmap[range_idx].is_bit_set(page_idx as usize) {
-                    prefault_cursor = Some((range_idx, page_idx + 1));
-                    continue;
-                }
-                break Some((range_idx, page_idx));
-            };
-
-            let Some((range_idx, page_idx)) = cursor else {
-                // Prefault was given up earlier (or the range list was
-                // empty). Keep serving on-demand faults.
-                continue;
-            };
-
-            let range = &ranges[range_idx];
-
-            // Extend the run over consecutive un-served pages within this
-            // range, capped at the batch size, so the source fetches and
-            // installs them in one round-trip instead of one page at a time.
-            let max_run = PREFAULT_BATCH_PAGES.min(range.num_pages() - page_idx);
-            let mut run = 1u64;
-            while run < max_run && !served_bitmap[range_idx].is_bit_set((page_idx + run) as usize) {
-                run += 1;
-            }
-
-            match source.resolve_run(uffd_fd.as_fd(), range, page_idx, run) {
-                Ok(0) => {
-                    // Nothing installed this round (a transient kernel state);
-                    // skip the page and let the on-demand path serve it. Any
-                    // future guest access simply faults and is served then.
-                    prefault_cursor = Some((range_idx, page_idx + 1));
-                }
-                Ok(installed) => {
-                    pages_prefaulted += installed;
-                    for i in 0..installed {
-                        served_bitmap[range_idx].set_bit((page_idx + i) as usize);
-                    }
-                    prefault_cursor = Some((range_idx, page_idx + installed));
-                }
-                Err(e) => {
-                    // Prefault hit an unrecoverable error; give up but keep
-                    // serving on-demand faults.
-                    let page_addr = range.page_addr(page_idx);
-                    warn!("UFFD prefault: source error at {page_addr:#x}: {e}");
-                    warn!("UFFD prefault: abandoning background prefault after error");
-                    prefault_cursor = None;
-                }
+            // The working set is installed and there is no linear sweep — a
+            // bounded prefault with a lazy tail. Pages the guest never touches
+            // are never loaded (they fault in on demand if it ever does),
+            // rather than the whole image being read whether it is used or not.
+            // Log the transition to lazy-only once, then block for faults.
+            if !replay_done_logged {
+                replay_done_logged = true;
+                let elapsed = prefault_start.elapsed();
+                info!(
+                    "UFFD handler: working set prefaulted in {elapsed:.3?} — \
+                     prefaulted={pages_prefaulted} served={pages_served}; \
+                     serving remaining faults on demand"
+                );
             }
         }
     }
