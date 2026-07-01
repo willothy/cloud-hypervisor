@@ -143,6 +143,11 @@ pub enum Command {
     /// Request a page to be faulted in. The page content can be sent
     /// through the response or simply written to the shared memory.
     PageFault = 9,
+    /// Request the guest-memory working set: the dense-image byte offsets the
+    /// on-demand restore handler should prefault ahead of the guest, in
+    /// priority order. The response payload is a little-endian `u64` array.
+    /// Sent once at the start of a socket-sourced restore.
+    WorkingSet = 10,
 }
 
 /// Role announced as the first message on an additional migration connection.
@@ -261,6 +266,12 @@ impl Request {
     /// PageFault request always carries a single `MemoryRange`.
     pub fn page_fault() -> Self {
         Self::new(Command::PageFault, size_of::<MemoryRange>() as u64)
+    }
+
+    /// WorkingSet request. Carries a single (ignored) `MemoryRange` so its
+    /// frame shape matches the page-fault path the peer already reads.
+    pub fn working_set() -> Self {
+        Self::new(Command::WorkingSet, size_of::<MemoryRange>() as u64)
     }
 
     pub fn command(&self) -> Command {

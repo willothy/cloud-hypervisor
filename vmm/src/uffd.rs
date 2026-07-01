@@ -261,6 +261,15 @@ pub(crate) trait UffdMemorySource: Send {
             FaultResolution::Retry => Ok(0),
         }
     }
+
+    /// The working set to prefault ahead of the linear sweep: dense-image byte
+    /// offsets in priority order (most-recently-dirtied first). The handler
+    /// installs these before sweeping so the guest finds its scattered working
+    /// set already present. Empty when the source has no working set (the
+    /// default, e.g. a file-backed restore).
+    fn working_set(&mut self) -> Result<Vec<u64>, io::Error> {
+        Ok(Vec::new())
+    }
 }
 
 /// Source that reads pages from a local snapshot file.
@@ -341,6 +350,35 @@ impl SocketUffdMemorySource {
             Status::Ok => Ok(resp.length()),
             s => Err(io::Error::other(format!(
                 "peer returned {s:?} for PageFault at gpa={gpa:#x} len={len}",
+            ))),
+        }
+    }
+
+    /// Ask the peer for the working set: dense-image byte offsets to prefault,
+    /// in priority order. The response payload is a little-endian `u64` array.
+    fn request_working_set(&mut self) -> Result<Vec<u64>, io::Error> {
+        Request::working_set()
+            .write_to(&mut self.stream)
+            .map_err(io_other)?;
+        // A single (ignored) MemoryRange keeps the frame shape identical to the
+        // page-fault path the peer reads.
+        MemoryRange { gpa: 0, length: 0 }
+            .write_to(&mut self.stream)
+            .map_err(io_other)?;
+
+        let resp = Response::read_from(&mut self.stream).map_err(io_other)?;
+        match resp.status() {
+            Status::Ok => {
+                let len = resp.length() as usize;
+                let mut buf = vec![0u8; len];
+                self.stream.read_exact(&mut buf)?;
+                Ok(buf
+                    .chunks_exact(8)
+                    .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8")))
+                    .collect())
+            }
+            s => Err(io::Error::other(format!(
+                "peer returned {s:?} for WorkingSet request",
             ))),
         }
     }
@@ -462,6 +500,10 @@ impl UffdMemorySource for SocketUffdMemorySource {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn working_set(&mut self) -> Result<Vec<u64>, io::Error> {
+        self.request_working_set()
     }
 }
 
@@ -688,6 +730,17 @@ pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error>
         return Err(Error::last_os_error());
     }
     Ok(())
+}
+
+/// Map a dense-image byte offset back to the (range index, page index) that
+/// covers it, or `None` when no registered range does. Used to place a
+/// working-set offset (which the peer provides as a dense-image offset) onto
+/// the range it belongs to.
+pub(crate) fn locate_offset(ranges: &[UffdRange], offset: u64) -> Option<(usize, u64)> {
+    ranges.iter().enumerate().find_map(|(i, r)| {
+        (offset >= r.source_offset && offset < r.source_offset + r.length)
+            .then(|| (i, (offset - r.source_offset) / r.page_size))
+    })
 }
 
 #[cfg(test)]

@@ -1404,6 +1404,18 @@ impl MemoryManager {
         let mut prefault_cursor: Option<(usize, u64)> = (!ranges.is_empty()).then_some((0, 0));
         let prefault_start = time::Instant::now();
 
+        // The working set to install ahead of the linear sweep: dense-image
+        // byte offsets the memory source provides in priority order (the
+        // supervisor's aggregated dirty-page set). Prefaulting these first
+        // means the guest finds its scattered working set already present
+        // instead of stalling on faults the linear sweep reaches late. A source
+        // with no working set (a file-backed restore) returns empty.
+        let replay_trace = source.working_set().unwrap_or_else(|e| {
+            warn!("UFFD working set: request failed: {e}");
+            Vec::new()
+        });
+        let mut replay_cursor = 0usize;
+
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
 
@@ -1431,10 +1443,15 @@ impl MemoryManager {
 
         let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
         loop {
-            // Block only when there is no prefault work left (the linear
-            // sweep); otherwise poll non-blocking so we can advance prefault
-            // between faults.
-            let timeout = if prefault_cursor.is_some() { 0 } else { -1 };
+            // Block only when there is no prefault work left (neither the
+            // working-set replay nor the linear sweep); otherwise poll
+            // non-blocking so we can advance prefault between faults.
+            let replaying = replay_cursor < replay_trace.len();
+            let timeout = if prefault_cursor.is_some() || replaying {
+                0
+            } else {
+                -1
+            };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1547,6 +1564,43 @@ impl MemoryManager {
                     )));
                 }
 
+                continue;
+            }
+
+            // Working-set replay: install one working-set page ahead of the
+            // linear sweep, so the guest's scattered pages are present before
+            // it reaches them. One entry per loop iteration, so on-demand
+            // faults — checked at the top of the loop — stay prioritized. An
+            // offset outside every range (a stale set from a mismatched
+            // checkpoint) is skipped; content always comes from the source, so
+            // the set is only an ordering hint and can never corrupt memory.
+            if replay_cursor < replay_trace.len() {
+                let offset = replay_trace[replay_cursor];
+                replay_cursor += 1;
+                if let Some((range_idx, page_idx)) = uffd::locate_offset(ranges, offset)
+                    && !served_bitmap[range_idx].is_bit_set(page_idx as usize)
+                {
+                    let range = &ranges[range_idx];
+                    let max_run = ON_DEMAND_READAHEAD_PAGES.min(range.num_pages() - page_idx);
+                    let mut run = 1u64;
+                    while run < max_run
+                        && !served_bitmap[range_idx].is_bit_set((page_idx + run) as usize)
+                    {
+                        run += 1;
+                    }
+                    match source.resolve_run(uffd_fd.as_fd(), range, page_idx, run) {
+                        Ok(installed) => {
+                            pages_prefaulted += installed;
+                            for i in 0..installed {
+                                served_bitmap[range_idx].set_bit((page_idx + i) as usize);
+                            }
+                        }
+                        Err(e) => {
+                            let page_addr = range.page_addr(page_idx);
+                            warn!("UFFD working set: source error at {page_addr:#x}: {e}");
+                        }
+                    }
+                }
                 continue;
             }
 
