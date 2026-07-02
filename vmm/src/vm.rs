@@ -3109,6 +3109,16 @@ impl Vm {
             .try_lock_disks()
             .map_err(Error::LockingError)?;
 
+        // Track dirtied guest pages before any vCPU runs: the next live
+        // memory checkpoint captures incrementally against the checkpoint
+        // this VM was restored from, so a write missed here would let it
+        // reuse a stale chunk for a changed page.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log()
+            .map_err(Error::StartDirtyLog)?;
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
