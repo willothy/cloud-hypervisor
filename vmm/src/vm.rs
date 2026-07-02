@@ -3047,8 +3047,8 @@ impl Vm {
         // before returning so a failed checkpoint never leaves the VM paused —
         // the operation stays cleanly retryable.
         self.pause()?;
-        let ranges = match self.checkpoint_paused_phase(destination_url, full) {
-            Ok(armed) => armed,
+        let done_rx = match self.checkpoint_paused_phase(destination_url, full) {
+            Ok(queued) => queued,
             Err(e) => {
                 if let Err(resume_err) = self.resume() {
                     error!("failed to resume VM after a failed live checkpoint: {resume_err}");
@@ -3057,16 +3057,11 @@ impl Vm {
             }
         };
 
-        // Resume immediately, then copy the (write-protected) pages out live.
+        // Resume immediately; the handler (which already owns the queued
+        // capture) copies the write-protected pages out while the guest runs.
         self.resume()?;
 
-        let mut memory_path = url_to_path(destination_url)?;
-        // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
-        memory_path.push("memory-ranges");
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .run_handler_capture(ranges, &memory_path)
+        MemoryManager::wait_handler_capture(done_rx)
     }
 
     /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
@@ -3077,12 +3072,18 @@ impl Vm {
     /// With `full`, all of guest RAM is armed and captured (the caller has no
     /// previous manifest to diff an incremental against); otherwise only the
     /// dirty pages are, and the caller's incremental re-chunk reads exactly
-    /// the sidecar's offsets.
+    /// the sidecar's offsets. The copy-out is queued to the uffd handler
+    /// before returning — while the VM is still paused — so the handler owns
+    /// the capture before the first post-resume write can fault; the caller
+    /// waits on the returned channel after resuming.
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
         full: bool,
-    ) -> std::result::Result<Vec<crate::uffd::CaptureRange>, MigratableError> {
+    ) -> std::result::Result<
+        std::sync::mpsc::Receiver<std::result::Result<(), std::io::Error>>,
+        MigratableError,
+    > {
         let snapshot = self.snapshot()?;
 
         let mut config_path = url_to_path(destination_url)?;
@@ -3116,7 +3117,13 @@ impl Vm {
         std::fs::write(&dirty_path, &dirty_json)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
-        Ok(ranges)
+        let mut memory_path = url_to_path(destination_url)?;
+        // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
+        memory_path.push("memory-ranges");
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .queue_handler_capture(ranges, &memory_path)
     }
 
     pub fn restore(&mut self) -> Result<()> {

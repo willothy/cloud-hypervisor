@@ -1337,7 +1337,22 @@ impl MemoryManager {
             });
             out_offset += r.length;
         }
-        self.delegate_capture(ranges, out)?;
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        handler
+            .capture_tx
+            .send(HandlerCapture {
+                ranges,
+                out,
+                done_tx,
+            })
+            .map_err(|_| {
+                MigratableError::MigrateSend(anyhow!("UFFD handler is gone; capture not started"))
+            })?;
+        handler
+            .capture_event
+            .write(1)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("signaling the UFFD handler: {e}")))?;
+        Self::wait_handler_capture(done_rx)?;
         Ok(dirty)
     }
 
@@ -1459,11 +1474,19 @@ impl MemoryManager {
     /// the full dense layout so its offsets match a full capture's; a
     /// dirty-only capture populates just those ranges, and only those are
     /// ever read back.
-    pub(crate) fn run_handler_capture(
+    /// Queue the copy-out of a live checkpoint to the UFFD handler thread,
+    /// returning the completion channel to wait on. Queued while the VM is
+    /// still paused so the handler owns the capture before the first
+    /// post-resume write-protect fault can arrive; the sweep may even begin
+    /// during the pause, which only helps. The file is shaped to the full
+    /// dense layout so its offsets match a full capture's; a dirty-only
+    /// capture populates just those ranges, and only those are ever read
+    /// back.
+    pub(crate) fn queue_handler_capture(
         &self,
         ranges: Vec<uffd::CaptureRange>,
         out_path: &Path,
-    ) -> Result<(), MigratableError> {
+    ) -> Result<mpsc::Receiver<Result<(), io::Error>>, MigratableError> {
         let out = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1478,22 +1501,15 @@ impl MemoryManager {
             .sum();
         out.set_len(total)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("sizing capture file: {e}")))?;
-        if ranges.is_empty() {
-            return Ok(());
-        }
-        self.delegate_capture(ranges, out)
-    }
 
-    /// Hand a capture to the UFFD handler thread and wait for it to finish.
-    fn delegate_capture(
-        &self,
-        ranges: Vec<uffd::CaptureRange>,
-        out: File,
-    ) -> Result<(), MigratableError> {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if ranges.is_empty() {
+            done_tx.send(Ok(())).expect("receiver is held right here");
+            return Ok(done_rx);
+        }
         let handler = self.uffd_handler.as_ref().ok_or_else(|| {
             MigratableError::MigrateSend(anyhow!("no UFFD handler to run the capture"))
         })?;
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
         handler
             .capture_tx
             .send(HandlerCapture {
@@ -1508,6 +1524,14 @@ impl MemoryManager {
             .capture_event
             .write(1)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("signaling the UFFD handler: {e}")))?;
+        Ok(done_rx)
+    }
+
+    /// Block until a capture queued by [`Self::queue_handler_capture`]
+    /// finishes.
+    pub(crate) fn wait_handler_capture(
+        done_rx: mpsc::Receiver<Result<(), io::Error>>,
+    ) -> Result<(), MigratableError> {
         match done_rx.recv() {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(MigratableError::MigrateSend(anyhow!("capture failed: {e}"))),
@@ -1703,21 +1727,19 @@ impl MemoryManager {
 
                 if token == EVENT_CAPTURE {
                     capture_event.read().ok();
-                    match capture_rx.try_recv() {
-                        Ok(request) => {
-                            info!(
-                                "UFFD handler: starting interleaved capture of {} range(s)",
-                                request.ranges.len()
-                            );
-                            capture = Some(ActiveCapture {
-                                progress: uffd::CaptureProgress::new(request.ranges),
-                                out: request.out,
-                                done_tx: request.done_tx,
-                            });
-                        }
-                        Err(_) => {
-                            warn!("UFFD handler: capture event with no queued capture");
-                        }
+                    // An empty channel is normal: a write-protect fault read
+                    // ahead of this event within one poll batch adopts the
+                    // capture first.
+                    if let Ok(request) = capture_rx.try_recv() {
+                        info!(
+                            "UFFD handler: starting interleaved capture of {} range(s)",
+                            request.ranges.len()
+                        );
+                        capture = Some(ActiveCapture {
+                            progress: uffd::CaptureProgress::new(request.ranges),
+                            out: request.out,
+                            done_tx: request.done_tx,
+                        });
                     }
                 }
             }
@@ -1762,6 +1784,23 @@ impl MemoryManager {
                 // release the writer. Never falls through to demand paging —
                 // the page is present (only present pages are armed).
                 if msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_WP != 0 {
+                    // The capture is queued while the VM is paused, but this
+                    // fault can be read from the uffd ahead of the capture
+                    // event within one poll batch — adopt the queued capture
+                    // rather than treating its armed page as stray.
+                    if capture.is_none()
+                        && let Ok(request) = capture_rx.try_recv()
+                    {
+                        info!(
+                            "UFFD handler: starting interleaved capture of {} range(s) (at fault)",
+                            request.ranges.len()
+                        );
+                        capture = Some(ActiveCapture {
+                            progress: uffd::CaptureProgress::new(request.ranges),
+                            out: request.out,
+                            done_tx: request.done_tx,
+                        });
+                    }
                     match capture.as_mut() {
                         Some(active) => {
                             let ActiveCapture { progress, out, .. } = active;
@@ -1779,9 +1818,10 @@ impl MemoryManager {
                             }
                         }
                         None => {
-                            // No capture owns the protection (an aborted one
-                            // released what it knew of); release this page so
-                            // the writer never parks forever.
+                            // No capture owns the protection — only reachable
+                            // after a failed arm or aborted capture released
+                            // what it knew of. Release this page so the
+                            // writer never parks forever.
                             warn!(
                                 "UFFD handler: stray WP fault at {fault_addr:#x}; releasing"
                             );
