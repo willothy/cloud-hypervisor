@@ -285,6 +285,17 @@ pub struct VmCaptureDirtyMemoryConfig {
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
+pub struct VmLiveCheckpointConfig {
+    /// The checkpoint destination directory URL.
+    pub destination_url: String,
+    /// Capture all of guest RAM rather than just the pages dirtied since the
+    /// last capture. The caller decides — it knows whether a previous
+    /// checkpoint exists to diff an incremental against — and a full capture
+    /// of a demand-paged VM is refused (it would fault the entire lazy tail).
+    pub full: bool,
+}
+
+#[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmCoredumpData {
     /// The coredump destination file
     pub destination_url: String,
@@ -714,7 +725,7 @@ pub trait RequestHandler {
 
     fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
-    fn vm_live_checkpoint(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_live_checkpoint(&mut self, destination_url: &str, full: bool) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1930,8 +1941,7 @@ impl ApiAction for VmCaptureDirtyMemory {
 pub struct VmLiveCheckpoint;
 
 impl ApiAction for VmLiveCheckpoint {
-    // A live checkpoint, like a snapshot, just needs a destination directory.
-    type RequestBody = VmSnapshotConfig;
+    type RequestBody = VmLiveCheckpointConfig;
     type ResponseBody = Option<Body>;
 
     fn request(
@@ -1943,7 +1953,7 @@ impl ApiAction for VmLiveCheckpoint {
             info!("API request event: VmLiveCheckpoint {config:?}");
 
             let response = vmm
-                .vm_live_checkpoint(&config.destination_url)
+                .vm_live_checkpoint(&config.destination_url, config.full)
                 .map_err(ApiError::VmLiveCheckpoint)
                 .map(|_| ApiResponsePayload::Empty);
 

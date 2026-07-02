@@ -3040,13 +3040,14 @@ impl Vm {
     pub fn live_checkpoint(
         &mut self,
         destination_url: &str,
+        full: bool,
     ) -> std::result::Result<(), MigratableError> {
         // Brief pause to capture config + CPU/device state and arm write-protect
         // at a consistent point. If any of the paused-phase work fails, resume
         // before returning so a failed checkpoint never leaves the VM paused —
         // the operation stays cleanly retryable.
         self.pause()?;
-        let ranges = match self.checkpoint_paused_phase(destination_url) {
+        let ranges = match self.checkpoint_paused_phase(destination_url, full) {
             Ok(armed) => armed,
             Err(e) => {
                 if let Err(resume_err) = self.resume() {
@@ -3073,13 +3074,14 @@ impl Vm {
     /// consistent point, on the one uffd that owns guest RAM. The VM must be
     /// paused; the caller resumes it whether this succeeds or fails.
     ///
-    /// Only a booted VM's first checkpoint arms all of guest RAM (there is no
-    /// previous manifest to diff against); every other checkpoint arms the
-    /// dirty pages only, and the caller's incremental re-chunk reads exactly
+    /// With `full`, all of guest RAM is armed and captured (the caller has no
+    /// previous manifest to diff an incremental against); otherwise only the
+    /// dirty pages are, and the caller's incremental re-chunk reads exactly
     /// the sidecar's offsets.
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
+        full: bool,
     ) -> std::result::Result<Vec<crate::uffd::CaptureRange>, MigratableError> {
         let snapshot = self.snapshot()?;
 
@@ -3102,7 +3104,11 @@ impl Vm {
         // file) so the caller can re-chunk only those incrementally, reusing
         // the prior checkpoint's manifest for the rest. Resets the dirty
         // bitmap for the next interval.
-        let (dirty, ranges) = self.memory_manager.lock().unwrap().arm_handler_capture()?;
+        let (dirty, ranges) = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .arm_handler_capture(full)?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =

@@ -261,14 +261,9 @@ pub struct MemoryManager {
     /// be unregistered and silently escape capture otherwise.
     uffd_registered_layout: Vec<(u64, u64)>,
     /// This VM's guest memory is demand-paged from a checkpoint (a lazy
-    /// restore): its checkpoints must capture dirty-only — a full capture
-    /// would fault the entire lazy tail in — and a previous checkpoint is
-    /// guaranteed to exist for the incremental to diff against.
+    /// restore): a full capture is refused — it would fault the entire lazy
+    /// tail in — so its checkpoints are always incremental.
     demand_paged: bool,
-    /// A capture has been taken by this process. With `demand_paged`, decides
-    /// full versus dirty-only capture: only a booted VM's first checkpoint
-    /// captures everything (there is no previous manifest to diff against).
-    captured_once: bool,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -1351,24 +1346,32 @@ impl MemoryManager {
     /// offsets (the `memory-dirty.ranges` sidecar) with the armed capture
     /// descriptors.
     ///
-    /// Only a booted VM's first capture arms (and later copies) all of guest
-    /// RAM — there is no previous manifest to diff against. Every capture
-    /// after it, and every capture of a demand-paged VM, arms the dirty pages
-    /// only: dirty pages are necessarily present (a guest write faults its
-    /// page in first), so the lazy tail is never touched, and the caller
-    /// re-chunks only the sidecar's offsets — the capture file's clean
-    /// regions are never read. Consumes the dirty bitmap for the next
-    /// interval.
+    /// With `full`, all of guest RAM is armed — the caller asks for that only
+    /// when it has no previous manifest to diff an incremental against, and
+    /// it is refused for demand-paged RAM (copying it would fault the entire
+    /// lazy tail in). Otherwise only the dirty pages are armed: dirty pages
+    /// are necessarily present (a guest write faults its page in first), so
+    /// the lazy tail is never touched, and the caller re-chunks only the
+    /// sidecar's offsets — the capture file's clean regions are never read.
+    /// Consumes the dirty bitmap for the next interval.
     ///
     /// If arming fails partway, already-armed pages self-heal: a guest write
     /// to one raises a WP fault the handler answers by releasing the page
     /// (there is no active capture to own it).
     pub(crate) fn arm_handler_capture(
         &mut self,
+        full: bool,
     ) -> Result<(Vec<(u64, u64)>, Vec<uffd::CaptureRange>), MigratableError> {
         if self.uffd_handler.is_none() {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "no UFFD handler owns guest RAM; was register_capture_handler skipped?"
+            )));
+        }
+        if full && self.demand_paged {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "a full capture of demand-paged guest RAM would fault the entire lazy \
+                 tail in; an incremental needs the checkpoint this VM was restored from \
+                 recorded as its lineage"
             )));
         }
         let layout = self.memory_range_table(true)?;
@@ -1386,8 +1389,6 @@ impl MemoryManager {
         }
 
         let dirty = self.dirty_log()?;
-        let full = !self.demand_paged && !self.captured_once;
-        self.captured_once = true;
 
         // Dense base offset of each guest-RAM region, in capture order — the
         // layout the capture file uses, so offsets line up full or not.
@@ -2411,7 +2412,7 @@ impl MemoryManager {
             uffd_handler: None,
             uffd_registered_layout: Vec::new(),
             demand_paged: false,
-            captured_once: false,
+
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,
