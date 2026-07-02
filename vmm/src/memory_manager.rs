@@ -71,6 +71,24 @@ struct UffdHandler {
     result_rx: Receiver<Result<(), io::Error>>,
     handle: thread::JoinHandle<()>,
     fault_socket_fd: Option<OwnedFd>,
+    /// The handler's userfaultfd, shared with the checkpoint path: guest RAM
+    /// is registered missing+write-protect on it, so a live checkpoint arms
+    /// protection here and hands the copy-out to the handler loop instead of
+    /// creating a second uffd (the kernel allows one per VMA).
+    uffd_fd: Arc<OwnedFd>,
+    /// Hands a capture to the handler loop; paired with `capture_event`,
+    /// which wakes the loop to pick it up.
+    capture_tx: SyncSender<HandlerCapture>,
+    capture_event: EventFd,
+}
+
+/// A capture handed to the UFFD handler thread: copy the (present,
+/// write-protected) pages of `ranges` into `out` at their recorded offsets,
+/// releasing protection as each page lands, then report completion.
+struct HandlerCapture {
+    ranges: Vec<uffd::CaptureRange>,
+    out: File,
+    done_tx: SyncSender<Result<(), io::Error>>,
 }
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -237,6 +255,20 @@ pub struct MemoryManager {
     // slots that the mapping is created in.
     guest_ram_mappings: Vec<GuestRamMapping>,
     uffd_handler: Option<UffdHandler>,
+    /// The guest-RAM layout `(gpa, length)` the handler's uffd registration
+    /// covers. Registration happens once at VM startup, so a checkpoint's arm
+    /// verifies the layout has not changed since — hotplugged regions would
+    /// be unregistered and silently escape capture otherwise.
+    uffd_registered_layout: Vec<(u64, u64)>,
+    /// This VM's guest memory is demand-paged from a checkpoint (a lazy
+    /// restore): its checkpoints must capture dirty-only — a full capture
+    /// would fault the entire lazy tail in — and a previous checkpoint is
+    /// guaranteed to exist for the incremental to diff against.
+    demand_paged: bool,
+    /// A capture has been taken by this process. With `demand_paged`, decides
+    /// full versus dirty-only capture: only a booted VM's first checkpoint
+    /// captures everything (there is no previous manifest to diff against).
+    captured_once: bool,
 
     pub acpi_address: Option<GuestAddress>,
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -943,7 +975,7 @@ impl MemoryManager {
         };
         let snapshot_file = File::open(file_path).map_err(Error::SnapshotOpen)?;
         let source: Box<dyn UffdMemorySource> = Box::new(FileUffdMemorySource::new(snapshot_file));
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd_fd, None, ranges, Some(source), exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -983,7 +1015,7 @@ impl MemoryManager {
             SocketStream::Unix(stream),
             false,
         ));
-        self.spawn_uffd_handler(uffd_fd, None, ranges, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd_fd, None, ranges, Some(source), exit_evt)?;
         info!("UFFD restore: demand-paged restore enabled (page-fault socket)");
         Ok(())
     }
@@ -1009,7 +1041,7 @@ impl MemoryManager {
             .map_err(UffdError::SetSocket)?;
         let source: Box<dyn UffdMemorySource> =
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
-        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, source, exit_evt)
+        self.spawn_uffd_handler(uffd_fd, Some(socket_fd), ranges, Some(source), exit_evt)
     }
 
     /// Create a UFFD fd and register every range.
@@ -1056,11 +1088,16 @@ impl MemoryManager {
                     source: e,
                 })? as u64;
 
+            // Register write-protect mode alongside missing: mode is fixed at
+            // registration time, and a later live checkpoint arms protection
+            // on this same uffd (a VMA admits only one). WP faults only occur
+            // once armed, so demand paging is unaffected until then.
             let ioctls = uffd::register(
                 uffd_fd.as_fd(),
                 host_addr,
                 range.length,
-                crate::userfaultfd::UFFDIO_REGISTER_MODE_MISSING,
+                crate::userfaultfd::UFFDIO_REGISTER_MODE_MISSING
+                    | crate::userfaultfd::UFFDIO_REGISTER_MODE_WP,
             )
             .map_err(|e| UffdError::Register {
                 addr: host_addr,
@@ -1092,7 +1129,75 @@ impl MemoryManager {
             });
         }
 
+        // This VM's memory is demand-paged: checkpoints capture dirty-only,
+        // and arms verify the layout still matches this registration.
+        self.uffd_registered_layout = saved_regions
+            .regions()
+            .iter()
+            .map(|r| (r.gpa, r.length))
+            .collect();
+        self.demand_paged = true;
+
         Ok(Some((uffd_fd, handler_ranges)))
+    }
+
+    /// Ensure one uffd owns guest RAM, so a live checkpoint always arms
+    /// write-protection on it and delegates the capture to its handler loop.
+    /// Called at every VM startup: a demand-paged restore's handler (missing +
+    /// write-protect, spawned by the restore machinery) already is this owner;
+    /// a boot — or a restore mode that loaded memory eagerly — gets a
+    /// write-protect-only handler with no memory source, which is inert until
+    /// a checkpoint arms it.
+    pub(crate) fn register_capture_handler(&mut self, exit_evt: &EventFd) -> Result<(), Error> {
+        if self.uffd_handler.is_some() {
+            return Ok(());
+        }
+
+        let layout = self.memory_range_table(true).map_err(Error::Restore)?;
+        let guest_memory = self.guest_memory.memory();
+        let uffd_fd = uffd::create(userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP)
+            .map_err(UffdError::Create)?;
+
+        info!(
+            "UFFD: registering {} region(s) write-protect-only for capture",
+            layout.regions().len()
+        );
+
+        let mut handler_ranges: Vec<UffdRange> = Vec::new();
+        let mut dense_offset = 0u64;
+        for range in layout.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(range.gpa))
+                .map_err(|e| UffdError::GpaTranslation {
+                    gpa: range.gpa,
+                    source: e,
+                })? as u64;
+            uffd::register(
+                uffd_fd.as_fd(),
+                host_addr,
+                range.length,
+                crate::userfaultfd::UFFDIO_REGISTER_MODE_WP,
+            )
+            .map_err(|e| UffdError::Register {
+                addr: host_addr,
+                len: range.length,
+                source: e,
+            })?;
+            handler_ranges.push(UffdRange {
+                host_addr,
+                length: range.length,
+                source_offset: dense_offset,
+                page_size: 4096,
+            });
+            dense_offset += range.length;
+        }
+        self.uffd_registered_layout = layout
+            .regions()
+            .iter()
+            .map(|r| (r.gpa, r.length))
+            .collect();
+
+        self.spawn_uffd_handler(uffd_fd, None, handler_ranges, None, exit_evt)
     }
 
     /// Spawn the UFFD handler thread that resolves faults through `source`.
@@ -1101,7 +1206,7 @@ impl MemoryManager {
         uffd_fd: OwnedFd,
         fault_socket_fd: Option<OwnedFd>,
         handler_ranges: Vec<UffdRange>,
-        source: Box<dyn UffdMemorySource>,
+        source: Option<Box<dyn UffdMemorySource>>,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
         info!(
@@ -1113,18 +1218,27 @@ impl MemoryManager {
         let thread_stop_event = stop_event.try_clone().map_err(Error::EventFdFail)?;
         let thread_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
         let panic_exit_evt = exit_evt.try_clone().map_err(Error::EventFdFail)?;
+        let capture_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
+        let thread_capture_event = capture_event.try_clone().map_err(Error::EventFdFail)?;
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
+        // Captures are handed off one at a time: the checkpoint path waits for
+        // completion before submitting another.
+        let (capture_tx, capture_rx) = mpsc::sync_channel::<HandlerCapture>(1);
+        let uffd_fd = Arc::new(uffd_fd);
+        let thread_uffd_fd = Arc::clone(&uffd_fd);
         let handle = thread::Builder::new()
             .name("uffd-handler".to_string())
             .spawn(move || {
                 panic::catch_unwind(panic::AssertUnwindSafe(move || {
                     let result = Self::uffd_handler_loop(
-                        uffd_fd,
+                        &thread_uffd_fd,
                         thread_stop_event,
                         source,
                         &handler_ranges,
                         &ready_tx,
+                        &capture_rx,
+                        thread_capture_event,
                     );
 
                     if let Err(e) = &result {
@@ -1157,13 +1271,19 @@ impl MemoryManager {
             result_rx,
             handle,
             fault_socket_fd,
+            uffd_fd,
+            capture_tx,
+            capture_event,
         });
 
         Ok(())
     }
 
     fn required_uffd_features(&self) -> u64 {
-        let mut features = 0u64;
+        // Write-protect faults are required alongside missing faults: guest
+        // RAM registers both modes so a live checkpoint can arm protection on
+        // this same uffd while the restore handler owns it.
+        let mut features = userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP;
         if self.memory_zones.values().any(|z| z.shared || !z.hugepages) {
             features |= userfaultfd::UFFD_FEATURE_MISSING_SHMEM;
         }
@@ -1173,78 +1293,11 @@ impl MemoryManager {
         features
     }
 
-    /// Create a userfaultfd, register write-protect mode on every range in
-    /// `table`, arm protection, and return the fd plus the capture descriptors
-    /// (dense output layout, in `table` order). Arm this while the VM is paused
-    /// so the subsequent capture is a consistent point-in-time; the returned fd
-    /// must outlive the capture.
-    fn arm_wp_capture(
-        &self,
-        table: &MemoryRangeTable,
-    ) -> Result<(OwnedFd, Vec<uffd::CaptureRange>), MigratableError> {
-        // A demand-paged restore handler owns the guest-RAM UFFD registration;
-        // capturing concurrently would need to share it. Not supported yet.
-        if self.uffd_handler.is_some() {
-            return Err(MigratableError::MigrateSend(anyhow!(
-                "live memory capture unsupported while a UFFD restore handler is active"
-            )));
-        }
-        let guest_memory = self.guest_memory.memory();
-        let uffd_fd = uffd::create(crate::userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating userfaultfd: {e}")))?;
-        let mut ranges = Vec::with_capacity(table.regions().len());
-        let mut out_offset = 0u64;
-        for r in table.regions() {
-            let host_addr = guest_memory
-                .get_host_address(GuestAddress(r.gpa))
-                .map_err(|e| {
-                    MigratableError::MigrateSend(anyhow!("translating gpa {:#x}: {e}", r.gpa))
-                })? as u64;
-            uffd::register(
-                uffd_fd.as_fd(),
-                host_addr,
-                r.length,
-                crate::userfaultfd::UFFDIO_REGISTER_MODE_WP,
-            )
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("registering WP range: {e}")))?;
-            uffd::write_protect(uffd_fd.as_fd(), host_addr, r.length, true, false)
-                .map_err(|e| MigratableError::MigrateSend(anyhow!("arming write-protect: {e}")))?;
-            ranges.push(uffd::CaptureRange {
-                host_addr,
-                length: r.length,
-                out_offset,
-                page_size: 4096,
-            });
-            out_offset += r.length;
-        }
-        Ok((uffd_fd, ranges))
-    }
-
-    /// Run a write-protect capture armed by [`Self::arm_wp_capture`], writing
-    /// each captured page to `out_path` at its dense offset. Call this after
-    /// resuming the VM: the guest keeps running while its pre-write pages are
-    /// copied out.
-    pub(crate) fn run_wp_capture(
-        uffd_fd: &OwnedFd,
-        ranges: &[uffd::CaptureRange],
-        out_path: &Path,
-    ) -> Result<(), MigratableError> {
-        use std::os::unix::fs::FileExt;
-        let out = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(out_path)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
-        uffd::capture_write_protected(uffd_fd.as_fd(), ranges, |off, bytes| {
-            out.write_all_at(bytes, off)
-        })
-        .map_err(|e| MigratableError::MigrateSend(anyhow!("capturing pages: {e}")))
-    }
-
     /// Capture the memory pages dirtied since dirty logging started into
-    /// `out_path`, consistently and **without pausing the VM**, via UFFD
-    /// write-protect copy-on-write. Returns the captured range table.
+    /// `out_path` (packed, in dirty-table order), consistently and **without
+    /// pausing the VM**: the dirty ranges are write-protect armed on the
+    /// handler's uffd and the handler copies them out interleaved with fault
+    /// serving. Returns the captured range table.
     ///
     /// Dirty logging must be active (`start_dirty_log`); the dirty bitmap is
     /// consumed (reset) for the next interval. Pages are handled at the 4 KiB
@@ -1254,47 +1307,90 @@ impl MemoryManager {
         out_path: &Path,
     ) -> Result<MemoryRangeTable, MigratableError> {
         let dirty = self.dirty_log()?;
+        let out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out_path)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
         if dirty.regions().is_empty() {
-            // Nothing changed since the last checkpoint; write an empty capture
-            // so the caller always finds the file.
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(out_path)
-                .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
+            // Nothing changed since the last checkpoint; the empty capture
+            // file is still written so the caller always finds it.
             return Ok(dirty);
         }
-        let (uffd_fd, ranges) = self.arm_wp_capture(&dirty)?;
-        Self::run_wp_capture(&uffd_fd, &ranges, out_path)?;
+        let handler = self.uffd_handler.as_ref().ok_or_else(|| {
+            MigratableError::MigrateSend(anyhow!(
+                "no UFFD handler owns guest RAM; was register_capture_handler skipped?"
+            ))
+        })?;
+        let guest_memory = self.guest_memory.memory();
+        let mut ranges = Vec::with_capacity(dirty.regions().len());
+        let mut out_offset = 0u64;
+        for r in dirty.regions() {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(r.gpa))
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("translating gpa {:#x}: {e}", r.gpa))
+                })? as u64;
+            uffd::write_protect(handler.uffd_fd.as_fd(), host_addr, r.length, true, false)
+                .map_err(|e| MigratableError::MigrateSend(anyhow!("arming write-protect: {e}")))?;
+            ranges.push(uffd::CaptureRange {
+                host_addr,
+                length: r.length,
+                out_offset,
+                page_size: 4096,
+            });
+            out_offset += r.length;
+        }
+        self.delegate_capture(ranges, out)?;
         Ok(dirty)
     }
 
-    /// Memory-capture half of a live checkpoint: arm write-protect over all
-    /// guest RAM while the caller holds the VM paused, returning the armed fd,
-    /// the capture descriptors, and the matching range table to record in the
-    /// snapshot state. The caller resumes the VM, then calls
-    /// [`Self::run_wp_capture`] to copy the pages out while the guest runs.
-    pub(crate) fn arm_full_capture(
-        &self,
-    ) -> Result<(OwnedFd, Vec<uffd::CaptureRange>, MemoryRangeTable), MigratableError> {
-        let table = self.memory_range_table(true)?;
-        let (uffd_fd, ranges) = self.arm_wp_capture(&table)?;
-        Ok((uffd_fd, ranges, table))
-    }
-
-    /// The pages dirtied since the last checkpoint, as byte ranges into the
-    /// dense `memory-ranges` capture file (the layout `arm_full_capture` uses),
-    /// so a caller can re-chunk only those and reuse the prior checkpoint's
-    /// manifest for the rest. Consumes the dirty bitmap for the next interval.
+    /// Paused-phase arm for a live checkpoint: compute the dirty set once,
+    /// arm write-protect on the handler's uffd, and return the dense dirty
+    /// offsets (the `memory-dirty.ranges` sidecar) with the armed capture
+    /// descriptors.
     ///
-    /// The dirty log reports guest-physical ranges; this maps each into its
-    /// dense file offset using the same region ordering as the capture, so it
-    /// is correct even when guest RAM spans multiple regions.
-    pub(crate) fn dirty_capture_offsets(&mut self) -> Result<Vec<(u64, u64)>, MigratableError> {
+    /// Only a booted VM's first capture arms (and later copies) all of guest
+    /// RAM — there is no previous manifest to diff against. Every capture
+    /// after it, and every capture of a demand-paged VM, arms the dirty pages
+    /// only: dirty pages are necessarily present (a guest write faults its
+    /// page in first), so the lazy tail is never touched, and the caller
+    /// re-chunks only the sidecar's offsets — the capture file's clean
+    /// regions are never read. Consumes the dirty bitmap for the next
+    /// interval.
+    ///
+    /// If arming fails partway, already-armed pages self-heal: a guest write
+    /// to one raises a WP fault the handler answers by releasing the page
+    /// (there is no active capture to own it).
+    pub(crate) fn arm_handler_capture(
+        &mut self,
+    ) -> Result<(Vec<(u64, u64)>, Vec<uffd::CaptureRange>), MigratableError> {
+        if self.uffd_handler.is_none() {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "no UFFD handler owns guest RAM; was register_capture_handler skipped?"
+            )));
+        }
         let layout = self.memory_range_table(true)?;
-        let dirty = self.dirty_log()?;
 
-        // Dense base offset of each guest-RAM region, in capture order.
+        // Registration happened once at startup; a layout that has changed
+        // since (hotplugged memory) is not registered and would silently
+        // escape the capture. Fail loudly instead: re-registration on
+        // hotplug is the future fix.
+        let current: Vec<(u64, u64)> = layout.regions().iter().map(|r| (r.gpa, r.length)).collect();
+        if current != self.uffd_registered_layout {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "guest RAM layout changed since uffd registration; \
+                 checkpointing hotplugged memory is not supported"
+            )));
+        }
+
+        let dirty = self.dirty_log()?;
+        let full = !self.demand_paged && !self.captured_once;
+        self.captured_once = true;
+
+        // Dense base offset of each guest-RAM region, in capture order — the
+        // layout the capture file uses, so offsets line up full or not.
         let mut regions = Vec::with_capacity(layout.regions().len());
         let mut offset = 0u64;
         for r in layout.regions() {
@@ -1302,18 +1398,122 @@ impl MemoryManager {
             offset += r.length;
         }
 
-        let mut out = Vec::with_capacity(dirty.regions().len());
+        let guest_memory = self.guest_memory.memory();
+        let handler = self
+            .uffd_handler
+            .as_ref()
+            .expect("presence checked at entry");
+
+        // The sidecar always records the dirty offsets; the armed ranges are
+        // the whole layout for a full capture, the dirty ranges otherwise.
+        let mut sidecar = Vec::with_capacity(dirty.regions().len());
         for d in dirty.regions() {
-            // A dirty range lies within a single region (the dirty log is built
-            // per region); map its gpa to the dense capture offset.
+            // A dirty range lies within a single region (the dirty log is
+            // built per region); map its gpa to the dense capture offset.
             if let Some(&(gpa, _len, base)) = regions
                 .iter()
                 .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
             {
-                out.push((base + (d.gpa - gpa), d.length));
+                sidecar.push((base + (d.gpa - gpa), d.length));
             }
         }
-        Ok(out)
+
+        let to_arm: Vec<(u64, u64, u64)> = if full {
+            regions.clone()
+        } else {
+            dirty
+                .regions()
+                .iter()
+                .filter_map(|d| {
+                    regions
+                        .iter()
+                        .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
+                        .map(|&(gpa, _len, base)| (d.gpa, d.length, base + (d.gpa - gpa)))
+                })
+                .collect()
+        };
+
+        let mut ranges = Vec::with_capacity(to_arm.len());
+        for (gpa, length, out_offset) in to_arm {
+            let host_addr = guest_memory
+                .get_host_address(GuestAddress(gpa))
+                .map_err(|e| {
+                    MigratableError::MigrateSend(anyhow!("translating gpa {gpa:#x}: {e}"))
+                })? as u64;
+            uffd::write_protect(handler.uffd_fd.as_fd(), host_addr, length, true, false)
+                .map_err(|e| MigratableError::MigrateSend(anyhow!("arming write-protect: {e}")))?;
+            ranges.push(uffd::CaptureRange {
+                host_addr,
+                length,
+                out_offset,
+                page_size: 4096,
+            });
+        }
+        Ok((sidecar, ranges))
+    }
+
+    /// Copy-out phase of a live checkpoint: hand the armed ranges to the UFFD
+    /// handler thread, which captures them interleaved with fault serving
+    /// while the guest runs, and wait for it to finish. The file is shaped to
+    /// the full dense layout so its offsets match a full capture's; a
+    /// dirty-only capture populates just those ranges, and only those are
+    /// ever read back.
+    pub(crate) fn run_handler_capture(
+        &self,
+        ranges: Vec<uffd::CaptureRange>,
+        out_path: &Path,
+    ) -> Result<(), MigratableError> {
+        let out = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out_path)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
+        let total: u64 = self
+            .memory_range_table(true)?
+            .regions()
+            .iter()
+            .map(|r| r.length)
+            .sum();
+        out.set_len(total)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("sizing capture file: {e}")))?;
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        self.delegate_capture(ranges, out)
+    }
+
+    /// Hand a capture to the UFFD handler thread and wait for it to finish.
+    fn delegate_capture(
+        &self,
+        ranges: Vec<uffd::CaptureRange>,
+        out: File,
+    ) -> Result<(), MigratableError> {
+        let handler = self.uffd_handler.as_ref().ok_or_else(|| {
+            MigratableError::MigrateSend(anyhow!("no UFFD handler to run the capture"))
+        })?;
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        handler
+            .capture_tx
+            .send(HandlerCapture {
+                ranges,
+                out,
+                done_tx,
+            })
+            .map_err(|_| {
+                MigratableError::MigrateSend(anyhow!("UFFD handler is gone; capture not started"))
+            })?;
+        handler
+            .capture_event
+            .write(1)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("signaling the UFFD handler: {e}")))?;
+        match done_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(MigratableError::MigrateSend(anyhow!("capture failed: {e}"))),
+            Err(_) => Err(MigratableError::MigrateSend(anyhow!(
+                "UFFD handler exited before completing the capture"
+            ))),
+        }
     }
 
     /// The number of guest pages dirtied since the last checkpoint, read
@@ -1359,13 +1559,31 @@ impl MemoryManager {
     /// iteration.
     #[expect(clippy::needless_pass_by_value)]
     fn uffd_handler_loop(
-        uffd_fd: OwnedFd,
+        uffd_fd: &OwnedFd,
         stop_event: EventFd,
-        mut source: Box<dyn UffdMemorySource>,
+        mut source: Option<Box<dyn UffdMemorySource>>,
         ranges: &[UffdRange],
         ready_tx: &SyncSender<()>,
+        capture_rx: &Receiver<HandlerCapture>,
+        capture_event: EventFd,
     ) -> Result<(), io::Error> {
+        use std::os::unix::fs::FileExt;
+
         let uffd_raw_fd = uffd_fd.as_raw_fd();
+
+        /// A write-protect capture in progress, interleaved with fault
+        /// serving: the sweep advances between faults exactly like the
+        /// working-set replay, and a guest write to a still-protected page
+        /// arrives as a WP fault served ahead of the sweep.
+        struct ActiveCapture {
+            progress: uffd::CaptureProgress,
+            out: File,
+            done_tx: SyncSender<Result<(), io::Error>>,
+        }
+        // Pages the capture sweep copies per loop iteration, so on-demand
+        // faults — checked each iteration — stay prioritized over the sweep.
+        const CAPTURE_BATCH_PAGES: usize = 32;
+        let mut capture: Option<ActiveCapture> = None;
 
         // Pages to fetch around an on-demand fault (~64 KiB). Guest accesses
         // are spatially local, so serving a window per fault pre-serves its
@@ -1394,16 +1612,22 @@ impl MemoryManager {
         // dirty-page set). These are installed ahead of the guest; everything
         // else is left to fault in on demand — no linear sweep, so pages the
         // guest never touches are never loaded. A source with no working set (a
-        // file-backed restore) returns empty and the restore is fully lazy.
-        let replay_trace = source.working_set().unwrap_or_else(|e| {
-            warn!("UFFD working set: request failed: {e}");
-            Vec::new()
-        });
+        // file-backed restore) returns empty and the restore is fully lazy; a
+        // handler with no source at all (a booted VM's write-protect-only
+        // registration) has nothing to demand-page and only captures.
+        let replay_trace = match source.as_mut() {
+            Some(source) => source.working_set().unwrap_or_else(|e| {
+                warn!("UFFD working set: request failed: {e}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
         let mut replay_cursor = 0usize;
         let mut replay_done_logged = false;
 
         const EVENT_STOP: u64 = 0;
         const EVENT_UFFD: u64 = 1;
+        const EVENT_CAPTURE: u64 = 2;
 
         let epoll_fd = epoll::create(true).map_err(io::Error::other)?;
         // SAFETY: epoll_fd is valid and owned by this scope.
@@ -1425,16 +1649,28 @@ impl MemoryManager {
         )
         .map_err(io::Error::other)?;
 
+        epoll::ctl(
+            epoll_fd,
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            capture_event.as_raw_fd(),
+            epoll::Event::new(epoll::Events::EPOLLIN, EVENT_CAPTURE),
+        )
+        .map_err(io::Error::other)?;
+
         ready_tx.send(()).ok();
 
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 3];
         loop {
-            // While the working set is still being replayed, poll non-blocking
-            // so we can install its pages between faults; once it is drained,
-            // block until the next on-demand fault (there is no linear sweep to
-            // advance).
+            // While the working set is still being replayed or a capture sweep
+            // is in progress, poll non-blocking so their pages advance between
+            // faults; otherwise block until the next on-demand fault (there is
+            // no linear sweep to advance).
             let replaying = replay_cursor < replay_trace.len();
-            let timeout = if replaying { 0 } else { -1 };
+            let timeout = if replaying || capture.is_some() {
+                0
+            } else {
+                -1
+            };
             let num_events = match epoll::wait(epoll_fd, timeout, &mut events) {
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -1462,6 +1698,26 @@ impl MemoryManager {
 
                 if token == EVENT_UFFD && (evt_flags & epoll::Events::EPOLLIN.bits()) != 0 {
                     got_uffd_data = true;
+                }
+
+                if token == EVENT_CAPTURE {
+                    capture_event.read().ok();
+                    match capture_rx.try_recv() {
+                        Ok(request) => {
+                            info!(
+                                "UFFD handler: starting interleaved capture of {} range(s)",
+                                request.ranges.len()
+                            );
+                            capture = Some(ActiveCapture {
+                                progress: uffd::CaptureProgress::new(request.ranges),
+                                out: request.out,
+                                done_tx: request.done_tx,
+                            });
+                        }
+                        Err(_) => {
+                            warn!("UFFD handler: capture event with no queued capture");
+                        }
+                    }
                 }
             }
 
@@ -1499,6 +1755,51 @@ impl MemoryManager {
                 }
 
                 let fault_addr = msg.pf_address;
+
+                // A write-protect fault: the guest wrote a page a capture has
+                // armed but not yet copied. Capture it ahead of the sweep and
+                // release the writer. Never falls through to demand paging —
+                // the page is present (only present pages are armed).
+                if msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_WP != 0 {
+                    match capture.as_mut() {
+                        Some(active) => {
+                            let ActiveCapture { progress, out, .. } = active;
+                            let mut sink =
+                                |off: u64, bytes: &[u8]| out.write_all_at(bytes, off);
+                            if let Err(e) =
+                                progress.handle_wp_fault(uffd_fd.as_fd(), fault_addr, &mut sink)
+                            {
+                                error!("UFFD handler: capture failed at WP fault: {e}");
+                                let ActiveCapture {
+                                    progress, done_tx, ..
+                                } = capture.take().expect("capture is active in this branch");
+                                progress.abort(uffd_fd.as_fd());
+                                done_tx.send(Err(e)).ok();
+                            }
+                        }
+                        None => {
+                            // No capture owns the protection (an aborted one
+                            // released what it knew of); release this page so
+                            // the writer never parks forever.
+                            warn!(
+                                "UFFD handler: stray WP fault at {fault_addr:#x}; releasing"
+                            );
+                            let page_addr = fault_addr & !4095;
+                            uffd::write_protect(uffd_fd.as_fd(), page_addr, 4096, false, false)
+                                .map_err(io::Error::other)?;
+                        }
+                    }
+                    continue;
+                }
+
+                // A missing fault needs a memory source. A write-protect-only
+                // handler (a booted VM's) registered no missing mode, so a
+                // fault here means a registration bug, not a servable page.
+                let Some(source) = source.as_mut() else {
+                    return Err(io::Error::other(format!(
+                        "UFFD handler: missing fault at {fault_addr:#x} with no memory source",
+                    )));
+                };
 
                 let mut served = false;
                 for (range_idx, range) in ranges.iter().enumerate() {
@@ -1557,7 +1858,11 @@ impl MemoryManager {
             // offset outside every range (a stale set from a mismatched
             // checkpoint) is skipped; content always comes from the source, so
             // the set is only an ordering hint and can never corrupt memory.
-            if replay_cursor < replay_trace.len() {
+            // A non-empty replay trace implies a memory source (it is where
+            // the trace came from), so the source is present on this path.
+            if replay_cursor < replay_trace.len()
+                && let Some(source) = source.as_mut()
+            {
                 let offset = replay_trace[replay_cursor];
                 replay_cursor += 1;
                 if let Some((range_idx, page_idx)) = uffd::locate_offset(ranges, offset)
@@ -1583,6 +1888,35 @@ impl MemoryManager {
                             warn!("UFFD working set: source error at {page_addr:#x}: {e}");
                         }
                     }
+                }
+                continue;
+            }
+
+            // Advance an in-progress capture sweep by a bounded batch, after
+            // faults (drained above) and working-set replay. The sweep reads
+            // present pages only, so it never touches the storage tier —
+            // it competes with fault serving only for this loop's turns.
+            if let Some(active) = capture.as_mut() {
+                let ActiveCapture { progress, out, .. } = active;
+                let mut sink = |off: u64, bytes: &[u8]| out.write_all_at(bytes, off);
+                let result = progress.step(uffd_fd.as_fd(), CAPTURE_BATCH_PAGES, &mut sink);
+                let finished = progress.finished();
+                match result {
+                    Err(e) => {
+                        error!("UFFD handler: capture sweep failed: {e}");
+                        let ActiveCapture {
+                            progress, done_tx, ..
+                        } = capture.take().expect("capture is active in this branch");
+                        progress.abort(uffd_fd.as_fd());
+                        done_tx.send(Err(e)).ok();
+                    }
+                    Ok(()) if finished => {
+                        let ActiveCapture { done_tx, .. } =
+                            capture.take().expect("capture is active in this branch");
+                        info!("UFFD handler: interleaved capture complete");
+                        done_tx.send(Ok(())).ok();
+                    }
+                    Ok(()) => {}
                 }
                 continue;
             }
@@ -2075,6 +2409,9 @@ impl MemoryManager {
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
+            uffd_registered_layout: Vec::new(),
+            demand_paged: false,
+            captured_once: false,
             acpi_address,
             log_dirty: dynamic, // Cannot log dirty pages on a TD
             arch_mem_regions,

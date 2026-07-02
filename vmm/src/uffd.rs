@@ -559,6 +559,7 @@ pub(crate) fn write_protect(
 }
 
 /// One guest-memory range to capture, and where its pages land in the output.
+#[derive(Clone)]
 pub(crate) struct CaptureRange {
     /// Start of the range in this process's address space.
     pub host_addr: u64,
@@ -574,37 +575,6 @@ impl CaptureRange {
     fn num_pages(&self) -> u64 {
         self.length.div_ceil(self.page_size)
     }
-}
-
-/// Read one pending write-protect fault without blocking, returning its
-/// address, or `None` when the queue is drained (`EAGAIN`).
-fn read_wp_fault(uffd_fd: BorrowedFd<'_>) -> Result<Option<u64>, Error> {
-    let mut msg = std::mem::MaybeUninit::<UffdMsg>::uninit();
-    // SAFETY: read up to one `UffdMsg`-sized record from the userfaultfd.
-    let n = unsafe {
-        libc::read(
-            uffd_fd.as_raw_fd(),
-            msg.as_mut_ptr().cast(),
-            std::mem::size_of::<UffdMsg>(),
-        )
-    };
-    if n < 0 {
-        let e = Error::last_os_error();
-        return if e.raw_os_error() == Some(libc::EAGAIN) {
-            Ok(None)
-        } else {
-            Err(e)
-        };
-    }
-    if (n as usize) < std::mem::size_of::<UffdMsg>() {
-        return Ok(None);
-    }
-    // SAFETY: a full `UffdMsg` was read above.
-    let msg = unsafe { msg.assume_init() };
-    if msg.event != userfaultfd::UFFD_EVENT_PAGEFAULT {
-        return Ok(None);
-    }
-    Ok(Some(msg.pf_address))
 }
 
 /// Capture one page's pre-write contents and release its protection.
@@ -635,80 +605,126 @@ where
     Ok(())
 }
 
-/// Capture a consistent, point-in-time copy of `ranges` while the guest keeps
-/// running, using UFFD write-protect copy-on-write.
-///
-/// The ranges must already be registered `UFFDIO_REGISTER_MODE_WP` on
-/// `uffd_fd` and have their protection armed. Each page's pre-write contents
-/// are handed to `sink(out_offset, bytes)` exactly once and its protection is
-/// then released. A background pass copies pages in order; a guest write to a
-/// not-yet-copied page faults, that page is captured ahead of the pass, and
-/// the write proceeds — so the captured image is the memory state at the
-/// moment protection was armed, with no VM pause.
-pub(crate) fn capture_write_protected<S>(
-    uffd_fd: BorrowedFd<'_>,
-    ranges: &[CaptureRange],
-    mut sink: S,
-) -> Result<(), io::Error>
-where
-    S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
-{
-    // Flatten the ranges' pages into one index space, with prefix sums so a
-    // faulting address maps back to its (range, page).
-    let counts: Vec<u64> = ranges.iter().map(CaptureRange::num_pages).collect();
-    let mut starts = Vec::with_capacity(ranges.len());
-    let mut acc = 0u64;
-    for c in &counts {
-        starts.push(acc);
-        acc += c;
-    }
-    let total = acc as usize;
-    let mut captured = vec![false; total];
+/// Bookkeeping for an in-progress write-protect capture: which of the armed
+/// pages have been copied out, flattened into one index space so a faulting
+/// address maps back to its (range, page). The uffd handler's interleaved
+/// capture drives it: the background pass advances via [`Self::step`] between
+/// faults, and a guest write to a still-protected page is served ahead of the
+/// pass via [`Self::handle_wp_fault`].
+pub(crate) struct CaptureProgress {
+    ranges: Vec<CaptureRange>,
+    /// Prefix sums of the ranges' page counts.
+    starts: Vec<u64>,
+    captured: Vec<bool>,
+    total: usize,
+    done: usize,
+    /// Background-pass cursor over the flat index space.
+    next: usize,
+}
 
-    let loc_of = |flat: usize| -> (usize, u64) {
-        let ri = match starts.binary_search(&(flat as u64)) {
+impl CaptureProgress {
+    pub(crate) fn new(ranges: Vec<CaptureRange>) -> Self {
+        let mut starts = Vec::with_capacity(ranges.len());
+        let mut acc = 0u64;
+        for r in &ranges {
+            starts.push(acc);
+            acc += r.num_pages();
+        }
+        let total = acc as usize;
+        Self {
+            ranges,
+            starts,
+            captured: vec![false; total],
+            total,
+            done: 0,
+            next: 0,
+        }
+    }
+
+    /// Every armed page has been captured.
+    pub(crate) fn finished(&self) -> bool {
+        self.done >= self.total
+    }
+
+    fn loc_of(&self, flat: usize) -> (usize, u64) {
+        let ri = match self.starts.binary_search(&(flat as u64)) {
             Ok(i) => i,
             Err(i) => i - 1,
         };
-        (ri, flat as u64 - starts[ri])
-    };
-    let flat_of = |addr: u64| -> Option<usize> {
-        ranges.iter().enumerate().find_map(|(ri, r)| {
-            (addr >= r.host_addr && addr < r.host_addr + r.length)
-                .then(|| (starts[ri] + (addr - r.host_addr) / r.page_size) as usize)
-        })
-    };
+        (ri, flat as u64 - self.starts[ri])
+    }
 
-    let mut done = 0usize;
-    let mut next = 0usize;
-    while done < total {
-        // Drain pending write faults so parked writers are served promptly.
-        while let Some(addr) = read_wp_fault(uffd_fd)? {
-            if let Some(flat) = flat_of(addr) {
-                if !captured[flat] {
-                    captured[flat] = true;
-                    let (ri, pi) = loc_of(flat);
-                    capture_page(uffd_fd, &ranges[ri], pi, &mut sink)?;
-                    done += 1;
-                }
+    fn flat_of(&self, addr: u64) -> Option<usize> {
+        self.ranges.iter().enumerate().find_map(|(ri, r)| {
+            (addr >= r.host_addr && addr < r.host_addr + r.length)
+                .then(|| (self.starts[ri] + (addr - r.host_addr) / r.page_size) as usize)
+        })
+    }
+
+    /// Capture the page a write-protect fault reported, ahead of the
+    /// background pass, and release the parked writer. An address outside the
+    /// armed ranges or already captured is a no-op.
+    pub(crate) fn handle_wp_fault<S>(
+        &mut self,
+        uffd_fd: BorrowedFd<'_>,
+        addr: u64,
+        sink: &mut S,
+    ) -> Result<(), io::Error>
+    where
+        S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
+    {
+        let Some(flat) = self.flat_of(addr) else {
+            return Ok(());
+        };
+        if self.captured[flat] {
+            return Ok(());
+        }
+        self.captured[flat] = true;
+        let (ri, pi) = self.loc_of(flat);
+        capture_page(uffd_fd, &self.ranges[ri], pi, sink)?;
+        self.done += 1;
+        Ok(())
+    }
+
+    /// Advance the background pass by up to `batch` pages.
+    pub(crate) fn step<S>(
+        &mut self,
+        uffd_fd: BorrowedFd<'_>,
+        batch: usize,
+        sink: &mut S,
+    ) -> Result<(), io::Error>
+    where
+        S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
+    {
+        for _ in 0..batch {
+            while self.next < self.total && self.captured[self.next] {
+                self.next += 1;
+            }
+            if self.next >= self.total {
+                break;
+            }
+            self.captured[self.next] = true;
+            let (ri, pi) = self.loc_of(self.next);
+            capture_page(uffd_fd, &self.ranges[ri], pi, sink)?;
+            self.done += 1;
+            self.next += 1;
+        }
+        Ok(())
+    }
+
+    /// Release write-protection on every armed range, waking any parked
+    /// writers — the cleanup for an aborted capture, so a failure never
+    /// leaves guest writes blocked on protection nobody will clear.
+    pub(crate) fn abort(&self, uffd_fd: BorrowedFd<'_>) {
+        for r in &self.ranges {
+            if let Err(e) = write_protect(uffd_fd, r.host_addr, r.length, false, false) {
+                log::warn!(
+                    "releasing write-protect on {:#x}+{:#x} after a failed capture: {e}",
+                    r.host_addr, r.length
+                );
             }
         }
-        if done >= total {
-            break;
-        }
-        // Advance the background pass to the next uncaptured page.
-        while next < total && captured[next] {
-            next += 1;
-        }
-        if next < total {
-            captured[next] = true;
-            let (ri, pi) = loc_of(next);
-            capture_page(uffd_fd, &ranges[ri], pi, &mut sink)?;
-            done += 1;
-            next += 1;
-        }
     }
-    Ok(())
 }
 
 /// Wake threads waiting on a fault in the given range without copying data.

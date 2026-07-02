@@ -566,6 +566,10 @@ pub struct Vm {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
+    /// Signalled to bring the VMM down when a critical background thread (the
+    /// guest-RAM uffd handler) dies; kept here so boot and restore can spawn
+    /// that handler.
+    exit_evt: EventFd,
 }
 
 impl Vm {
@@ -747,6 +751,7 @@ impl Vm {
             hypervisor,
             stop_on_boot,
             load_payload_handle,
+            exit_evt,
         })
     }
 
@@ -2977,6 +2982,16 @@ impl Vm {
             .start_dirty_log()
             .map_err(Error::StartDirtyLog)?;
 
+        // One uffd owns guest RAM from the start — write-protect-only here (a
+        // booted VM never sees a missing fault) — so a live checkpoint always
+        // arms protection on it and delegates to the same handler a
+        // demand-paged restore uses. Inert until a checkpoint arms it.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .register_capture_handler(&self.exit_evt)
+            .map_err(Error::MemoryManager)?;
+
         self.state = new_state;
         Ok(())
     }
@@ -3031,7 +3046,7 @@ impl Vm {
         // before returning so a failed checkpoint never leaves the VM paused —
         // the operation stays cleanly retryable.
         self.pause()?;
-        let (uffd_fd, ranges) = match self.checkpoint_paused_phase(destination_url) {
+        let ranges = match self.checkpoint_paused_phase(destination_url) {
             Ok(armed) => armed,
             Err(e) => {
                 if let Err(resume_err) = self.resume() {
@@ -3047,20 +3062,25 @@ impl Vm {
         let mut memory_path = url_to_path(destination_url)?;
         // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.
         memory_path.push("memory-ranges");
-        MemoryManager::run_wp_capture(&uffd_fd, &ranges, &memory_path)
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .run_handler_capture(ranges, &memory_path)
     }
 
     /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
-    /// CPU/device state into `destination_url` and arm UFFD write-protect over
-    /// all guest RAM. The VM must be paused; the caller resumes it whether this
-    /// succeeds or fails. The snapshot state's `memory_ranges` and the armed
-    /// capture cover the same regions, so the resulting directory restores
-    /// directly.
+    /// CPU/device state into `destination_url` and arm UFFD write-protect at a
+    /// consistent point, on the one uffd that owns guest RAM. The VM must be
+    /// paused; the caller resumes it whether this succeeds or fails.
+    ///
+    /// Only a booted VM's first checkpoint arms all of guest RAM (there is no
+    /// previous manifest to diff against); every other checkpoint arms the
+    /// dirty pages only, and the caller's incremental re-chunk reads exactly
+    /// the sidecar's offsets.
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
-    ) -> std::result::Result<(std::os::fd::OwnedFd, Vec<crate::uffd::CaptureRange>), MigratableError>
-    {
+    ) -> std::result::Result<Vec<crate::uffd::CaptureRange>, MigratableError> {
         let snapshot = self.snapshot()?;
 
         let mut config_path = url_to_path(destination_url)?;
@@ -3077,17 +3097,12 @@ impl Vm {
         std::fs::write(&state_path, &vm_state)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
-        // Record which bytes of the dense memory image changed since the last
-        // checkpoint (as offsets into the memory-ranges file) so the caller can
-        // re-chunk only those incrementally, reusing the prior checkpoint's
-        // manifest for the rest. The full image is still captured below; this is
-        // metadata that lets the caller skip the unchanged chunks. Resets the
-        // dirty bitmap for the next interval.
-        let dirty = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .dirty_capture_offsets()?;
+        // Arm the capture and record which bytes of the dense memory image
+        // changed since the last checkpoint (as offsets into the memory-ranges
+        // file) so the caller can re-chunk only those incrementally, reusing
+        // the prior checkpoint's manifest for the rest. Resets the dirty
+        // bitmap for the next interval.
+        let (dirty, ranges) = self.memory_manager.lock().unwrap().arm_handler_capture()?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =
@@ -3095,8 +3110,7 @@ impl Vm {
         std::fs::write(&dirty_path, &dirty_json)
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
-        let (uffd_fd, ranges, _table) = self.memory_manager.lock().unwrap().arm_full_capture()?;
-        Ok((uffd_fd, ranges))
+        Ok(ranges)
     }
 
     pub fn restore(&mut self) -> Result<()> {
@@ -3118,6 +3132,16 @@ impl Vm {
             .unwrap()
             .start_dirty_log()
             .map_err(Error::StartDirtyLog)?;
+
+        // One uffd owns guest RAM: a demand-paged restore's handler already
+        // is that owner (this is a no-op then); a restore mode that loaded
+        // memory eagerly gets a write-protect-only handler, so a live
+        // checkpoint always arms and delegates the same way.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .register_capture_handler(&self.exit_evt)
+            .map_err(Error::MemoryManager)?;
 
         // Now we can start all vCPUs from here.
         self.cpu_manager
