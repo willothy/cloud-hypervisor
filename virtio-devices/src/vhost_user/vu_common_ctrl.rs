@@ -330,7 +330,8 @@ impl VhostUserHandle {
         acked_protocol_features: u64,
     ) -> Result<()> {
         self.vu.set_owner().map_err(Error::VhostUserSetOwner)?;
-        self.vu
+        let backend_features = self
+            .vu
             .get_features()
             .map_err(Error::VhostUserGetFeatures)?;
 
@@ -347,7 +348,17 @@ impl VhostUserHandle {
             }
         }
 
-        self.update_supported_features(acked_features, acked_protocol_features);
+        // `acked_features` here is the restored device's saved set — the
+        // guest-negotiated virtio features, which never carry
+        // VHOST_F_LOG_ALL (a host-side bit the guest cannot ack). Whether
+        // dirty logging works is a property of the backend this device is
+        // connected to NOW, so take the LOG_ALL half from its freshly
+        // fetched features — exactly what a fresh negotiation would
+        // conclude, since the frontend always offers LOG_ALL.
+        self.update_supported_features(
+            acked_features | (backend_features & VhostUserVirtioFeatures::LOG_ALL.bits()),
+            acked_protocol_features,
+        );
 
         Ok(())
     }
