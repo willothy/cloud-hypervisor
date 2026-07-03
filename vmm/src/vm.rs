@@ -566,6 +566,14 @@ pub struct Vm {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
+    /// Whether the device managers' dirty logging (vhost-user backends'
+    /// shared dirty logs) is running. Started eagerly on restore — a
+    /// restored VM's first checkpoint can be incremental, so the interval
+    /// from restore onward must be tracked — and lazily at the first live
+    /// capture for a booted VM, whose first capture is always full: device
+    /// activation (which the log start needs) completes during restore but
+    /// only some time into a boot.
+    device_log_active: bool,
 }
 
 impl Vm {
@@ -747,6 +755,7 @@ impl Vm {
             hypervisor,
             stop_on_boot,
             load_payload_handle,
+            device_log_active: false,
         })
     }
 
@@ -3008,6 +3017,23 @@ impl Vm {
             .dirty_page_count()
     }
 
+    /// The guest-memory ranges the devices (vhost-user backends, via their
+    /// shared dirty logs) have written since the last capture, consumed for
+    /// the next interval. On the first capture of a booted VM the logs are
+    /// started instead and the answer is empty: that capture is full, so the
+    /// untracked interval before it needs no tracking, and by the time any
+    /// capture can run the guest is booted and its devices activated — which
+    /// the log start requires.
+    fn device_dirty_ranges(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        if self.device_log_active {
+            self.device_manager.lock().unwrap().dirty_log()
+        } else {
+            self.device_manager.lock().unwrap().start_dirty_log()?;
+            self.device_log_active = true;
+            Ok(MemoryRangeTable::default())
+        }
+    }
+
     /// Capture the pages dirtied since the last checkpoint into `out_path`,
     /// consistently and without pausing the VM, writing the captured range
     /// table to a `<out_path>.ranges` sidecar so a caller can map the captured
@@ -3016,11 +3042,12 @@ impl Vm {
         &mut self,
         out_path: &str,
     ) -> std::result::Result<(), MigratableError> {
+        let device_dirty = self.device_dirty_ranges()?;
         let table = self
             .memory_manager
             .lock()
             .unwrap()
-            .capture_dirty_background(std::path::Path::new(out_path))?;
+            .capture_dirty_background(std::path::Path::new(out_path), device_dirty)?;
         let json = serde_json::to_vec(&table)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("serializing range table: {e}")))?;
         std::fs::write(format!("{out_path}.ranges"), json)
@@ -3107,12 +3134,14 @@ impl Vm {
         // changed since the last checkpoint (as offsets into the memory-ranges
         // file) so the caller can re-chunk only those incrementally, reusing
         // the prior checkpoint's manifest for the rest. Resets the dirty
-        // bitmap for the next interval.
+        // bitmaps for the next interval. The device dirty log is what covers
+        // vhost-user DMA writes, which KVM's tracking cannot see.
+        let device_dirty = self.device_dirty_ranges()?;
         let (dirty, ranges) = self
             .memory_manager
             .lock()
             .unwrap()
-            .arm_session_capture(full)?;
+            .arm_session_capture(full, device_dirty)?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =
@@ -3169,6 +3198,19 @@ impl Vm {
             .unwrap()
             .start_restored_vcpus()
             .map_err(Error::CpuManager)?;
+
+        // Track device (vhost-user backend) writes to guest memory from the
+        // start too: a restored VM's first checkpoint captures incrementally
+        // against its lineage, so a DMA write missed here would let it reuse
+        // a stale chunk for a changed page. Devices active at the snapshot
+        // are re-activated by the restore itself, so their backends are
+        // connected and negotiated by now.
+        self.device_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log()
+            .map_err(Error::StartDirtyLog)?;
+        self.device_log_active = true;
 
         event!("vm", "restored");
         Ok(())

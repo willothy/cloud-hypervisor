@@ -1354,12 +1354,15 @@ impl MemoryManager {
     ///
     /// Dirty logging must be active (`start_dirty_log`); the dirty bitmap is
     /// consumed (reset) for the next interval. Pages are handled at the 4 KiB
-    /// dirty-log granularity.
+    /// dirty-log granularity. `device_dirty` is the devices' view of the
+    /// interval (vhost-user DMA writes KVM cannot see), merged in.
     pub(crate) fn capture_dirty_background(
         &mut self,
         out_path: &Path,
+        device_dirty: MemoryRangeTable,
     ) -> Result<MemoryRangeTable, MigratableError> {
-        let dirty = self.dirty_log()?;
+        let layout = self.memory_range_table(true)?;
+        let dirty = Self::coalesce_dirty(vec![self.dirty_log()?, device_dirty], &layout);
         let out = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1407,6 +1410,54 @@ impl MemoryManager {
         Ok(dirty)
     }
 
+    /// Merge dirty range tables (KVM's and the devices') into one table of
+    /// disjoint, ascending ranges, each lying within a single region of
+    /// `layout` (the guest-RAM range table). Coalescing is not cosmetic: a
+    /// page in two source tables would otherwise be armed and swept twice,
+    /// and the second sweep pass — after the first released the page's
+    /// protection — could read post-release contents into the same output
+    /// offset, tearing the capture. Clipping to the layout matters because
+    /// the device log is one linear bitmap: a range of it could span two
+    /// abutting RAM regions, whose host mappings need not abut — every
+    /// consumer of the result translates a range through the region
+    /// containing its start.
+    fn coalesce_dirty(
+        tables: Vec<MemoryRangeTable>,
+        layout: &MemoryRangeTable,
+    ) -> MemoryRangeTable {
+        let mut ranges: Vec<MemoryRange> = tables
+            .iter()
+            .flat_map(|table| table.regions().iter().cloned())
+            .collect();
+        ranges.sort_by_key(|range| range.gpa);
+        let mut merged: Vec<MemoryRange> = Vec::new();
+        for range in ranges {
+            match merged.last_mut() {
+                Some(open) if range.gpa <= open.gpa + open.length => {
+                    let end = (range.gpa + range.length).max(open.gpa + open.length);
+                    open.length = end - open.gpa;
+                }
+                _ => merged.push(range),
+            }
+        }
+
+        let mut clipped = MemoryRangeTable::default();
+        for range in merged {
+            let range_end = range.gpa + range.length;
+            for region in layout.regions() {
+                let start = range.gpa.max(region.gpa);
+                let end = range_end.min(region.gpa + region.length);
+                if start < end {
+                    clipped.push(MemoryRange {
+                        gpa: start,
+                        length: end - start,
+                    });
+                }
+            }
+        }
+        clipped
+    }
+
     /// Paused-phase arm for a live checkpoint: compute the dirty set once,
     /// arm write-protect on the session's uffd, and return the dense dirty
     /// offsets (the `memory-dirty.ranges` sidecar) with the armed capture
@@ -1419,7 +1470,10 @@ impl MemoryManager {
     /// are necessarily present (a guest write faults its page in first), so
     /// the lazy tail is never touched, and the caller re-chunks only the
     /// sidecar's offsets — the capture file's clean regions are never read.
-    /// Consumes the dirty bitmap for the next interval.
+    /// Consumes the dirty bitmap for the next interval. `device_dirty` is
+    /// the devices' view of the interval (vhost-user DMA writes KVM cannot
+    /// see), merged and coalesced with KVM's so no page is armed or captured
+    /// twice.
     ///
     /// If arming fails partway, already-armed pages self-heal: a guest write
     /// to one raises a WP fault the fault handler answers by releasing the
@@ -1427,6 +1481,7 @@ impl MemoryManager {
     pub(crate) fn arm_session_capture(
         &mut self,
         full: bool,
+        device_dirty: MemoryRangeTable,
     ) -> Result<(Vec<(u64, u64)>, Vec<handoff::CaptureRange>), MigratableError> {
         if self.fault_session.is_none() {
             return Err(MigratableError::MigrateSend(anyhow!(
@@ -1454,7 +1509,7 @@ impl MemoryManager {
             )));
         }
 
-        let dirty = self.dirty_log()?;
+        let dirty = Self::coalesce_dirty(vec![self.dirty_log()?, device_dirty], &layout);
 
         // Dense base offset of each guest-RAM region, in capture order — the
         // layout the capture file uses, so offsets line up full or not.
