@@ -41,7 +41,8 @@ const MSG_CAPTURE_DONE: u32 = 3;
 const HEADER_LEN: usize = 8;
 
 /// Upper bound accepted for a capture-done body, defending the
-/// length-prefixed read against a corrupt peer.
+/// length-prefixed read against a corrupt peer. Done messages carry at most
+/// an error string.
 const MAX_DONE_LEN: u32 = 1024 * 1024;
 
 /// The fault-handling modes guest RAM was registered with before the
@@ -200,9 +201,11 @@ fn send_message(
     body: &[u8],
     fds: &[RawFd],
 ) -> io::Result<()> {
+    let body_len = u32::try_from(body.len())
+        .map_err(|_| io::Error::other("message body exceeds the u32 length field"))?;
     let mut header = [0u8; HEADER_LEN];
     header[0..4].copy_from_slice(&message_type.to_le_bytes());
-    header[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    header[4..8].copy_from_slice(&body_len.to_le_bytes());
     let sent = stream
         .send_with_fds(&[&header[..], body], fds)
         .map_err(|e| io::Error::other(format!("sendmsg to the fault handler: {e}")))?;
