@@ -57,10 +57,10 @@ use crate::config::MemoryRestoreMode;
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
+use crate::handoff::{self, FaultSession};
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::sparse::{next_data_extent, write_region_sparse};
-use crate::handoff::{self, FaultSession};
 use crate::uffd::{
     self, FaultResolution, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource,
     UffdRange,
@@ -1149,13 +1149,14 @@ impl MemoryManager {
                     source: e,
                 })? as u64;
 
-            let ioctls = uffd::register(uffd_fd.as_fd(), host_addr, range.length, mode).map_err(
-                |e| UffdError::Register {
-                    addr: host_addr,
-                    len: range.length,
-                    source: e,
-                },
-            )?;
+            let ioctls =
+                uffd::register(uffd_fd.as_fd(), host_addr, range.length, mode).map_err(|e| {
+                    UffdError::Register {
+                        addr: host_addr,
+                        len: range.length,
+                        source: e,
+                    }
+                })?;
 
             if ioctls & userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
                 != userfaultfd::UFFD_API_RANGE_IOCTLS_BASIC
@@ -1215,8 +1216,8 @@ impl MemoryManager {
 
         let layout = self.memory_range_table(true).map_err(Error::Restore)?;
         let guest_memory = self.guest_memory.memory();
-        let uffd_fd = uffd::create(userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP)
-            .map_err(UffdError::Create)?;
+        let uffd_fd =
+            uffd::create(userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP).map_err(UffdError::Create)?;
 
         info!(
             "UFFD: registering {} region(s) write-protect-only for capture",
@@ -1251,11 +1252,7 @@ impl MemoryManager {
             });
             dense_offset += range.length;
         }
-        self.uffd_registered_layout = layout
-            .regions()
-            .iter()
-            .map(|r| (r.gpa, r.length))
-            .collect();
+        self.uffd_registered_layout = layout.regions().iter().map(|r| (r.gpa, r.length)).collect();
 
         let gpas: Vec<u64> = layout.regions().iter().map(|r| r.gpa).collect();
         let (regions, memfds) = self.handoff_regions(&handler_ranges, &gpas)?;

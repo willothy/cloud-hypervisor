@@ -194,7 +194,12 @@ impl FaultSession {
 /// then the JSON body. The descriptors ride the first byte, so a partial
 /// send (a large capture body interrupted mid-write) resumes with plain
 /// writes without re-sending them.
-fn send_message(stream: &UnixStream, message_type: u32, body: &[u8], fds: &[RawFd]) -> io::Result<()> {
+fn send_message(
+    stream: &UnixStream,
+    message_type: u32,
+    body: &[u8],
+    fds: &[RawFd],
+) -> io::Result<()> {
     let mut header = [0u8; HEADER_LEN];
     header[0..4].copy_from_slice(&message_type.to_le_bytes());
     header[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());

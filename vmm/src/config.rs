@@ -5070,6 +5070,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
+                restore_fault_socket: None,
                 resume: false,
             }
         );
@@ -5093,6 +5094,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         fds: Some(vec![5, 6, 7, 8]),
                     }
                 ]),
+                restore_fault_socket: None,
                 resume: false,
             }
         );
@@ -5103,6 +5105,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
                 net_fds: None,
+                restore_fault_socket: None,
                 resume: false,
             }
         );
@@ -5113,6 +5116,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 prefault: false,
                 memory_restore_mode: MemoryRestoreMode::Copy,
                 net_fds: None,
+                restore_fault_socket: None,
                 resume: true,
             }
         );
@@ -5225,6 +5229,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     fds: Some(vec![7, 8]),
                 },
             ]),
+            restore_fault_socket: None,
             resume: false,
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
@@ -5290,6 +5295,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
             net_fds: None,
+            restore_fault_socket: None,
             resume: false,
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
@@ -5307,6 +5313,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
             net_fds: None,
+            restore_fault_socket: None,
             resume: false,
         };
         assert_eq!(
@@ -5371,6 +5378,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 reserve: false,
                 zones: None,
                 thp: true,
+                fault_socket: None,
             },
             payload: Some(PayloadConfig {
                 kernel: Some(PathBuf::from("/path/to/kernel")),
