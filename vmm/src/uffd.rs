@@ -185,12 +185,6 @@ struct UffdioRange {
     len: u64,
 }
 
-#[repr(C)]
-struct UffdioWriteprotect {
-    range: UffdioRange,
-    mode: u64,
-}
-
 /// A guest memory range registered with userfaultfd, plus where its bytes
 /// live for the data source.
 pub(crate) struct UffdRange {
@@ -236,40 +230,6 @@ pub(crate) trait UffdMemorySource: Send {
         range: &UffdRange,
         page_idx: u64,
     ) -> Result<FaultResolution, io::Error>;
-
-    /// Resolve a contiguous run of up to `num_pages` pages starting at
-    /// `start_page`, in as few operations as the source supports, returning
-    /// the number of leading pages actually installed.
-    ///
-    /// The background prefault pass uses this to fill ahead of the guest in
-    /// large strides instead of one page per round-trip. A returned count
-    /// below `num_pages` (including zero) just means the caller resolves the
-    /// rest later — those pages stay un-installed, so a guest access still
-    /// faults them in normally. The default installs a single page via
-    /// [`resolve`](UffdMemorySource::resolve); sources that can transfer a
-    /// whole run at once override this.
-    fn resolve_run(
-        &mut self,
-        uffd_fd: BorrowedFd<'_>,
-        range: &UffdRange,
-        start_page: u64,
-        num_pages: u64,
-    ) -> Result<u64, io::Error> {
-        let _ = num_pages;
-        match self.resolve(uffd_fd, range, start_page)? {
-            FaultResolution::Served => Ok(1),
-            FaultResolution::Retry => Ok(0),
-        }
-    }
-
-    /// The working set to prefault ahead of the linear sweep: dense-image byte
-    /// offsets in priority order (most-recently-dirtied first). The handler
-    /// installs these before sweeping so the guest finds its scattered working
-    /// set already present. Empty when the source has no working set (the
-    /// default, e.g. a file-backed restore).
-    fn working_set(&mut self) -> Result<Vec<u64>, io::Error> {
-        Ok(Vec::new())
-    }
 }
 
 /// Source that reads pages from a local snapshot file.
@@ -353,35 +313,6 @@ impl SocketUffdMemorySource {
             ))),
         }
     }
-
-    /// Ask the peer for the working set: dense-image byte offsets to prefault,
-    /// in priority order. The response payload is a little-endian `u64` array.
-    fn request_working_set(&mut self) -> Result<Vec<u64>, io::Error> {
-        Request::working_set()
-            .write_to(&mut self.stream)
-            .map_err(io_other)?;
-        // A single (ignored) MemoryRange keeps the frame shape identical to the
-        // page-fault path the peer reads.
-        MemoryRange { gpa: 0, length: 0 }
-            .write_to(&mut self.stream)
-            .map_err(io_other)?;
-
-        let resp = Response::read_from(&mut self.stream).map_err(io_other)?;
-        match resp.status() {
-            Status::Ok => {
-                let len = resp.length() as usize;
-                let mut buf = vec![0u8; len];
-                self.stream.read_exact(&mut buf)?;
-                Ok(buf
-                    .chunks_exact(8)
-                    .map(|c| u64::from_le_bytes(c.try_into().expect("chunks_exact(8) yields 8")))
-                    .collect())
-            }
-            s => Err(io::Error::other(format!(
-                "peer returned {s:?} for WorkingSet request",
-            ))),
-        }
-    }
 }
 
 impl UffdMemorySource for SocketUffdMemorySource {
@@ -432,79 +363,6 @@ impl UffdMemorySource for SocketUffdMemorySource {
             }
         }
     }
-
-    fn resolve_run(
-        &mut self,
-        uffd_fd: BorrowedFd<'_>,
-        range: &UffdRange,
-        start_page: u64,
-        num_pages: u64,
-    ) -> Result<u64, io::Error> {
-        // Shared backing installs each page by waking its faulting thread, so
-        // there is nothing to batch; the inline path transfers the whole run
-        // in one request and installs it with a single UFFDIO_COPY.
-        if self.shared_backing || num_pages <= 1 {
-            return match self.resolve(uffd_fd, range, start_page)? {
-                FaultResolution::Served => Ok(1),
-                FaultResolution::Retry => Ok(0),
-            };
-        }
-
-        let page_size = range.page_size;
-        let run_pages = num_pages.min(range.num_pages() - start_page);
-        let start_addr = range.page_addr(start_page);
-        let start_gpa = range.page_source_offset(start_page);
-        let bytes = run_pages * page_size;
-
-        let resp_len = self.request_page(start_gpa, bytes)?;
-        if resp_len != bytes {
-            return Err(io::Error::other(format!(
-                "inline PageFault response length {resp_len} != requested run {bytes}",
-            )));
-        }
-        let len = bytes as usize;
-        if self.buf.len() < len {
-            self.buf.resize(len, 0);
-        }
-        self.stream.read_exact(&mut self.buf[..len])?;
-
-        match copy(uffd_fd, start_addr, self.buf.as_ptr(), bytes) {
-            Ok(()) => Ok(run_pages),
-            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(0),
-            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                // A page in the run was already present (the caller builds runs
-                // of un-installed pages, so this is rare). Install the run from
-                // the buffer we already fetched, page by page, waking any page
-                // that turns out present and stopping at the first the kernel
-                // is still resolving.
-                let mut installed = 0u64;
-                while installed < run_pages {
-                    let off = (installed * page_size) as usize;
-                    let dst = start_addr + installed * page_size;
-                    // SAFETY: `self.buf` holds `bytes` valid bytes; `off` is
-                    // within it and `dst` is the matching guest page address.
-                    let src = unsafe { self.buf.as_ptr().add(off) };
-                    match copy(uffd_fd, dst, src, page_size) {
-                        Ok(()) => {}
-                        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-                            if let Err(e) = wake(uffd_fd, dst, page_size) {
-                                log::warn!("UFFDIO_WAKE failed at {dst:#x}: {e}");
-                            }
-                        }
-                        Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => break,
-                        Err(e) => return Err(e),
-                    }
-                    installed += 1;
-                }
-                Ok(installed)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    fn working_set(&mut self) -> Result<Vec<u64>, io::Error> {
-        self.request_working_set()
-    }
 }
 
 impl Drop for SocketUffdMemorySource {
@@ -518,11 +376,38 @@ fn io_other<E: fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Wake threads waiting on a fault in the given range without copying data.
+///
+/// Needed after UFFDIO_COPY returns EEXIST: the page was already resolved
+/// by a concurrent fault, but any additional threads blocked on that page
+/// may not have been woken.
+pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
+    let mut range = UffdioRange { start: addr, len };
+    // SAFETY: `range` is a valid, correctly-sized struct for this ioctl.
+    let ret = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            userfaultfd::UFFDIO_WAKE as libc::Ioctl,
+            &mut range,
+        )
+    };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[repr(C)]
+struct UffdioWriteprotect {
+    range: UffdioRange,
+    mode: u64,
+}
+
 /// Arm or release write-protection on a registered range.
 ///
 /// With `protect` set, each page in the range delivers a write-protect fault
 /// (`UFFD_PAGEFAULT_FLAG_WP`) on the next write instead of completing it, so a
-/// handler can copy the pre-write contents out first; clearing `protect`
+/// capture can copy the pre-write contents out first; clearing `protect`
 /// releases the protection and, unless `dont_wake`, wakes any threads blocked
 /// on a write fault in the range. The range must have been registered with
 /// `UFFDIO_REGISTER_MODE_WP`.
@@ -556,321 +441,4 @@ pub(crate) fn write_protect(
         return Err(Error::last_os_error());
     }
     Ok(())
-}
-
-/// One guest-memory range to capture, and where its pages land in the output.
-#[derive(Clone)]
-pub(crate) struct CaptureRange {
-    /// Start of the range in this process's address space.
-    pub host_addr: u64,
-    /// Length of the range in bytes.
-    pub length: u64,
-    /// Byte offset the range's first page maps to in the capture output.
-    pub out_offset: u64,
-    /// Page size the range is captured and protected at.
-    pub page_size: u64,
-}
-
-impl CaptureRange {
-    fn num_pages(&self) -> u64 {
-        self.length.div_ceil(self.page_size)
-    }
-}
-
-/// Capture one page's pre-write contents and release its protection.
-///
-/// The page must be currently write-protected, so the guest cannot mutate it
-/// between the read and the release: a concurrent write parks on the WP fault
-/// and only proceeds once protection is cleared here.
-fn capture_page<S>(
-    uffd_fd: BorrowedFd<'_>,
-    range: &CaptureRange,
-    page_idx: u64,
-    sink: &mut S,
-) -> Result<(), io::Error>
-where
-    S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
-{
-    let offset = page_idx * range.page_size;
-    let page_addr = range.host_addr + offset;
-    let len = (range.length - offset).min(range.page_size) as usize;
-    // SAFETY: `[page_addr, page_addr + len)` lies within a mapped, present
-    // guest-memory range that is write-protected for the duration of this read,
-    // so its contents cannot change under us.
-    let bytes = unsafe { std::slice::from_raw_parts(page_addr as *const u8, len) };
-    sink(range.out_offset + offset, bytes)?;
-    // Release protection (waking any writer parked on this page) now that the
-    // pre-write contents are captured.
-    write_protect(uffd_fd, page_addr, range.page_size, false, false)?;
-    Ok(())
-}
-
-/// Bookkeeping for an in-progress write-protect capture: which of the armed
-/// pages have been copied out, flattened into one index space so a faulting
-/// address maps back to its (range, page). The uffd handler's interleaved
-/// capture drives it: the background pass advances via [`Self::step`] between
-/// faults, and a guest write to a still-protected page is served ahead of the
-/// pass via [`Self::handle_wp_fault`].
-pub(crate) struct CaptureProgress {
-    ranges: Vec<CaptureRange>,
-    /// Prefix sums of the ranges' page counts.
-    starts: Vec<u64>,
-    captured: Vec<bool>,
-    total: usize,
-    done: usize,
-    /// Background-pass cursor over the flat index space.
-    next: usize,
-}
-
-impl CaptureProgress {
-    pub(crate) fn new(ranges: Vec<CaptureRange>) -> Self {
-        let mut starts = Vec::with_capacity(ranges.len());
-        let mut acc = 0u64;
-        for r in &ranges {
-            starts.push(acc);
-            acc += r.num_pages();
-        }
-        let total = acc as usize;
-        Self {
-            ranges,
-            starts,
-            captured: vec![false; total],
-            total,
-            done: 0,
-            next: 0,
-        }
-    }
-
-    /// Every armed page has been captured.
-    pub(crate) fn finished(&self) -> bool {
-        self.done >= self.total
-    }
-
-    fn loc_of(&self, flat: usize) -> (usize, u64) {
-        let ri = match self.starts.binary_search(&(flat as u64)) {
-            Ok(i) => i,
-            Err(i) => i - 1,
-        };
-        (ri, flat as u64 - self.starts[ri])
-    }
-
-    fn flat_of(&self, addr: u64) -> Option<usize> {
-        self.ranges.iter().enumerate().find_map(|(ri, r)| {
-            (addr >= r.host_addr && addr < r.host_addr + r.length)
-                .then(|| (self.starts[ri] + (addr - r.host_addr) / r.page_size) as usize)
-        })
-    }
-
-    /// Capture the page a write-protect fault reported, ahead of the
-    /// background pass, and release the parked writer. An address outside the
-    /// armed ranges or already captured is a no-op.
-    pub(crate) fn handle_wp_fault<S>(
-        &mut self,
-        uffd_fd: BorrowedFd<'_>,
-        addr: u64,
-        sink: &mut S,
-    ) -> Result<(), io::Error>
-    where
-        S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
-    {
-        let Some(flat) = self.flat_of(addr) else {
-            return Ok(());
-        };
-        if self.captured[flat] {
-            return Ok(());
-        }
-        self.captured[flat] = true;
-        let (ri, pi) = self.loc_of(flat);
-        capture_page(uffd_fd, &self.ranges[ri], pi, sink)?;
-        self.done += 1;
-        Ok(())
-    }
-
-    /// Advance the background pass by up to `batch` pages.
-    pub(crate) fn step<S>(
-        &mut self,
-        uffd_fd: BorrowedFd<'_>,
-        batch: usize,
-        sink: &mut S,
-    ) -> Result<(), io::Error>
-    where
-        S: FnMut(u64, &[u8]) -> Result<(), io::Error>,
-    {
-        for _ in 0..batch {
-            while self.next < self.total && self.captured[self.next] {
-                self.next += 1;
-            }
-            if self.next >= self.total {
-                break;
-            }
-            self.captured[self.next] = true;
-            let (ri, pi) = self.loc_of(self.next);
-            capture_page(uffd_fd, &self.ranges[ri], pi, sink)?;
-            self.done += 1;
-            self.next += 1;
-        }
-        Ok(())
-    }
-
-    /// Release write-protection on every armed range, waking any parked
-    /// writers — the cleanup for an aborted capture, so a failure never
-    /// leaves guest writes blocked on protection nobody will clear.
-    pub(crate) fn abort(&self, uffd_fd: BorrowedFd<'_>) {
-        for r in &self.ranges {
-            if let Err(e) = write_protect(uffd_fd, r.host_addr, r.length, false, false) {
-                log::warn!(
-                    "releasing write-protect on {:#x}+{:#x} after a failed capture: {e}",
-                    r.host_addr, r.length
-                );
-            }
-        }
-    }
-}
-
-/// Wake threads waiting on a fault in the given range without copying data.
-///
-/// Needed after UFFDIO_COPY returns EEXIST: the page was already resolved
-/// by a concurrent fault, but any additional threads blocked on that page
-/// may not have been woken.
-pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
-    let mut range = UffdioRange { start: addr, len };
-    // SAFETY: `range` is a valid, correctly-sized struct for this ioctl.
-    let ret = unsafe {
-        libc::ioctl(
-            fd.as_raw_fd(),
-            userfaultfd::UFFDIO_WAKE as libc::Ioctl,
-            &mut range,
-        )
-    };
-    if ret < 0 {
-        return Err(Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Map a dense-image byte offset back to the (range index, page index) that
-/// covers it, or `None` when no registered range does. Used to place a
-/// working-set offset (which the peer provides as a dense-image offset) onto
-/// the range it belongs to.
-pub(crate) fn locate_offset(ranges: &[UffdRange], offset: u64) -> Option<(usize, u64)> {
-    ranges.iter().enumerate().find_map(|(i, r)| {
-        (offset >= r.source_offset && offset < r.source_offset + r.length)
-            .then(|| (i, (offset - r.source_offset) / r.page_size))
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::os::fd::AsFd;
-
-    use super::{UffdMsg, create, register, write_protect};
-    use crate::userfaultfd::{
-        UFFD_EVENT_PAGEFAULT, UFFD_FEATURE_PAGEFAULT_FLAG_WP, UFFD_PAGEFAULT_FLAG_WP,
-        UFFDIO_REGISTER_MODE_WP,
-    };
-
-    const PAGE: usize = 4096;
-
-    /// A present, write-protected page delivers a write-protect fault on the
-    /// next write — carrying the faulting address and the WP flag — and the
-    /// blocked write proceeds once protection is released. This exercises the
-    /// whole WP path (register MODE_WP, arm, fault, release) against the kernel.
-    #[test]
-    fn write_protect_fault_roundtrip() {
-        let len = 2 * PAGE;
-        // SAFETY: anonymous private mapping; checked for MAP_FAILED below.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED, "mmap failed");
-        let base_addr = base as u64;
-        // Populate both pages so they are present (WP tracks present pages).
-        // SAFETY: `base` is a valid, writable `len`-byte mapping.
-        unsafe { std::ptr::write_bytes(base.cast::<u8>(), 0xAB, len) };
-
-        let uffd = create(UFFD_FEATURE_PAGEFAULT_FLAG_WP).expect("create uffd");
-        register(uffd.as_fd(), base_addr, len as u64, UFFDIO_REGISTER_MODE_WP)
-            .expect("register WP");
-        write_protect(uffd.as_fd(), base_addr, len as u64, true, false).expect("arm WP");
-
-        // Write to the second page from another thread; the store faults and
-        // parks until protection is released.
-        let page1 = base_addr + PAGE as u64;
-        let writer = std::thread::spawn(move || {
-            // SAFETY: `page1` is in the mapping; the store parks on the WP fault.
-            unsafe { std::ptr::write_volatile(page1 as *mut u8, 0xCD) };
-        });
-
-        let fault_addr = poll_one_wp_fault(uffd.as_fd());
-        assert_eq!(
-            fault_addr & !(PAGE as u64 - 1),
-            page1,
-            "fault address is in the written page"
-        );
-
-        write_protect(uffd.as_fd(), page1, PAGE as u64, false, false).expect("release WP");
-        writer.join().expect("writer joined");
-
-        // SAFETY: `page1` is still mapped; read back the writer's byte.
-        let written = unsafe { std::ptr::read_volatile(page1 as *const u8) };
-        assert_eq!(written, 0xCD, "the writer's store landed after release");
-
-        // SAFETY: unmap the region this test mapped.
-        unsafe { libc::munmap(base, len) };
-    }
-
-    /// Read one `UFFD_EVENT_PAGEFAULT` carrying the WP flag, returning its
-    /// address. The fd is non-blocking, so poll until a message arrives.
-    fn poll_one_wp_fault(fd: std::os::fd::BorrowedFd<'_>) -> u64 {
-        use std::os::fd::AsRawFd;
-        loop {
-            let mut pfd = libc::pollfd {
-                fd: fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: a single valid pollfd with a 1s timeout.
-            let n = unsafe { libc::poll(&mut pfd, 1, 1000) };
-            assert!(n >= 0, "poll failed: {}", std::io::Error::last_os_error());
-            assert_ne!(n, 0, "timed out waiting for a write-protect fault");
-
-            let mut msg = std::mem::MaybeUninit::<UffdMsg>::uninit();
-            // SAFETY: read up to one `UffdMsg`-sized record from the uffd.
-            let r = unsafe {
-                libc::read(
-                    fd.as_raw_fd(),
-                    msg.as_mut_ptr().cast(),
-                    std::mem::size_of::<UffdMsg>(),
-                )
-            };
-            if r < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EAGAIN) {
-                    continue;
-                }
-                panic!("read uffd: {e}");
-            }
-            assert_eq!(
-                r as usize,
-                std::mem::size_of::<UffdMsg>(),
-                "short uffd read"
-            );
-            // SAFETY: a full `UffdMsg` was read above.
-            let msg = unsafe { msg.assume_init() };
-            assert_eq!(msg.event, UFFD_EVENT_PAGEFAULT, "event is a pagefault");
-            assert_ne!(
-                msg.pf_flags & UFFD_PAGEFAULT_FLAG_WP,
-                0,
-                "fault carries the write-protect flag"
-            );
-            return msg.pf_address;
-        }
-    }
 }

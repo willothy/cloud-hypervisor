@@ -1081,7 +1081,8 @@ impl MemoryConfig {
             .add("hugepage_size")
             .add("prefault")
             .add("reserve")
-            .add("thp");
+            .add("thp")
+            .add("fault_socket");
         parser.parse(memory).map_err(Error::ParseMemory)?;
 
         let size = parser
@@ -1135,6 +1136,7 @@ impl MemoryConfig {
             .map_err(Error::ParseMemory)?
             .unwrap_or(Toggle(true))
             .0;
+        let fault_socket = parser.get("fault_socket").map(PathBuf::from);
 
         let zones: Option<Vec<MemoryZoneConfig>> = if let Some(memory_zones) = &memory_zones {
             let mut zones = Vec::new();
@@ -1237,6 +1239,7 @@ impl MemoryConfig {
             reserve,
             zones,
             thp,
+            fault_socket,
         })
     }
 

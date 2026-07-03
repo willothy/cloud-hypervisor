@@ -86,6 +86,7 @@ pub mod device_manager;
 pub mod device_tree;
 #[cfg(feature = "guest_debug")]
 mod gdb;
+mod handoff;
 #[cfg(feature = "igvm")]
 mod igvm;
 pub mod interrupt;

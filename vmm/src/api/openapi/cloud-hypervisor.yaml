@@ -904,6 +904,11 @@ components:
         thp:
           type: boolean
           default: true
+        fault_socket:
+          type: string
+          description:
+            Unix socket of an external fault handler to hand the VM's
+            userfaultfd to at startup, enabling live checkpoints.
         zones:
           type: array
           items:

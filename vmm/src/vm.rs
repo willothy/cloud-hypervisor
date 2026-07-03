@@ -566,10 +566,6 @@ pub struct Vm {
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
-    /// Signalled to bring the VMM down when a critical background thread (the
-    /// guest-RAM uffd handler) dies; kept here so boot and restore can spawn
-    /// that handler.
-    exit_evt: EventFd,
 }
 
 impl Vm {
@@ -751,7 +747,6 @@ impl Vm {
             hypervisor,
             stop_on_boot,
             load_payload_handle,
-            exit_evt,
         })
     }
 
@@ -2983,14 +2978,19 @@ impl Vm {
             .map_err(Error::StartDirtyLog)?;
 
         // One uffd owns guest RAM from the start — write-protect-only here (a
-        // booted VM never sees a missing fault) — so a live checkpoint always
-        // arms protection on it and delegates to the same handler a
-        // demand-paged restore uses. Inert until a checkpoint arms it.
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .register_capture_handler(&self.exit_evt)
-            .map_err(Error::MemoryManager)?;
+        // booted VM never sees a missing fault) — handed to the external
+        // fault handler on the configured socket, so a live checkpoint always
+        // arms protection on it and delegates the copy-out the same way a
+        // demand-paged restore's session does. Inert until a checkpoint arms
+        // it; without a configured socket, live checkpoints are refused.
+        let fault_socket = self.config.lock().unwrap().memory.fault_socket.clone();
+        if let Some(socket) = fault_socket {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .register_capture_uffd(&socket)
+                .map_err(Error::MemoryManager)?;
+        }
 
         self.state = new_state;
         Ok(())
@@ -3047,8 +3047,8 @@ impl Vm {
         // before returning so a failed checkpoint never leaves the VM paused —
         // the operation stays cleanly retryable.
         self.pause()?;
-        let done_rx = match self.checkpoint_paused_phase(destination_url, full) {
-            Ok(queued) => queued,
+        let done = match self.checkpoint_paused_phase(destination_url, full) {
+            Ok(sent) => sent,
             Err(e) => {
                 if let Err(resume_err) = self.resume() {
                     error!("failed to resume VM after a failed live checkpoint: {resume_err}");
@@ -3057,11 +3057,16 @@ impl Vm {
             }
         };
 
-        // Resume immediately; the handler (which already owns the queued
-        // capture) copies the write-protected pages out while the guest runs.
+        // Resume immediately; the fault handler (whose capture message is
+        // already buffered on its connection) copies the write-protected
+        // pages out while the guest runs.
         self.resume()?;
 
-        MemoryManager::wait_handler_capture(done_rx)
+        match done {
+            Some(stream) => MemoryManager::wait_session_capture(&stream),
+            // Nothing was dirty; there is no capture to wait for.
+            None => Ok(()),
+        }
     }
 
     /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
@@ -3072,18 +3077,16 @@ impl Vm {
     /// With `full`, all of guest RAM is armed and captured (the caller has no
     /// previous manifest to diff an incremental against); otherwise only the
     /// dirty pages are, and the caller's incremental re-chunk reads exactly
-    /// the sidecar's offsets. The copy-out is queued to the uffd handler
-    /// before returning — while the VM is still paused — so the handler owns
-    /// the capture before the first post-resume write can fault; the caller
-    /// waits on the returned channel after resuming.
+    /// the sidecar's offsets. The copy-out is sent to the external fault
+    /// handler before returning — while the VM is still paused — so its
+    /// message is buffered ahead of the first post-resume write fault; the
+    /// caller waits for the done message on the returned connection after
+    /// resuming (`None` when nothing was dirty).
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
         full: bool,
-    ) -> std::result::Result<
-        std::sync::mpsc::Receiver<std::result::Result<(), std::io::Error>>,
-        MigratableError,
-    > {
+    ) -> std::result::Result<Option<std::os::unix::net::UnixStream>, MigratableError> {
         let snapshot = self.snapshot()?;
 
         let mut config_path = url_to_path(destination_url)?;
@@ -3109,7 +3112,7 @@ impl Vm {
             .memory_manager
             .lock()
             .unwrap()
-            .arm_handler_capture(full)?;
+            .arm_session_capture(full)?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =
@@ -3123,7 +3126,7 @@ impl Vm {
         self.memory_manager
             .lock()
             .unwrap()
-            .queue_handler_capture(ranges, &memory_path)
+            .send_session_capture(ranges, &memory_path)
     }
 
     pub fn restore(&mut self) -> Result<()> {
@@ -3146,15 +3149,19 @@ impl Vm {
             .start_dirty_log()
             .map_err(Error::StartDirtyLog)?;
 
-        // One uffd owns guest RAM: a demand-paged restore's handler already
-        // is that owner (this is a no-op then); a restore mode that loaded
-        // memory eagerly gets a write-protect-only handler, so a live
+        // One uffd owns guest RAM: a demand-paged restore's handoff already
+        // established the fault session (this is a no-op then); a restore
+        // mode that loaded memory eagerly registers write-protect-only and
+        // hands it to the fault handler on the configured socket, so a live
         // checkpoint always arms and delegates the same way.
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .register_capture_handler(&self.exit_evt)
-            .map_err(Error::MemoryManager)?;
+        let fault_socket = self.config.lock().unwrap().memory.fault_socket.clone();
+        if let Some(socket) = fault_socket {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .register_capture_uffd(&socket)
+                .map_err(Error::MemoryManager)?;
+        }
 
         // Now we can start all vCPUs from here.
         self.cpu_manager
