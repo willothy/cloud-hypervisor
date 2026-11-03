@@ -3765,6 +3765,15 @@ impl Transportable for MemoryManager {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
         }
+        // A demand-paged VM's untouched pages are still in the checkpoint it
+        // was restored from, not in its memory: the sparse image written
+        // below would record them as holes, read back as zeros. Its memory
+        // is captured incrementally, by a live checkpoint, instead.
+        if self.demand_paged {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "a demand-paged VM's memory is not all resident; capture it with a live checkpoint"
+            )));
+        }
 
         let mut memory_file_path = url_to_path(destination_url)?;
         memory_file_path.push(String::from(SNAPSHOT_FILENAME));

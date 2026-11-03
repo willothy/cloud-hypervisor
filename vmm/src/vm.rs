@@ -3064,10 +3064,15 @@ impl Vm {
     /// the exact paused point-in-time. Writes `config.json`, `state.json`, and
     /// the dense `memory-ranges` file into `destination_url` — a directory the
     /// existing on-demand restore path loads directly.
+    ///
+    /// With `leave_paused`, the VM stays paused once captured instead of
+    /// resuming, its memory copied out at the paused point all the same: the
+    /// source half of a move. A capture that fails resumes the VM either way.
     pub fn live_checkpoint(
         &mut self,
         destination_url: &str,
         full: bool,
+        leave_paused: bool,
     ) -> std::result::Result<(), MigratableError> {
         // Brief pause to capture config + CPU/device state and arm write-protect
         // at a consistent point. If any of the paused-phase work fails, resume
@@ -3084,10 +3089,12 @@ impl Vm {
             }
         };
 
-        // Resume immediately; the fault handler (whose capture message is
-        // already buffered on its connection) copies the write-protected
-        // pages out while the guest runs.
-        self.resume()?;
+        // Resume immediately, unless the caller keeps the VM stopped; the
+        // fault handler (whose capture message is already buffered on its
+        // connection) copies the write-protected pages out either way.
+        if !leave_paused {
+            self.resume()?;
+        }
 
         match done {
             Some(stream) => MemoryManager::wait_session_capture(&stream),

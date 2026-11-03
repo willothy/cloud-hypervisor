@@ -293,6 +293,11 @@ pub struct VmLiveCheckpointConfig {
     /// checkpoint exists to diff an incremental against — and a full capture
     /// of a demand-paged VM is refused (it would fault the entire lazy tail).
     pub full: bool,
+    /// Leave the VM paused once its state is captured, rather than resuming
+    /// it: the source half of a move, which stops the VM where it is
+    /// captured. A failed capture resumes the VM either way.
+    #[serde(default)]
+    pub leave_paused: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -725,7 +730,12 @@ pub trait RequestHandler {
 
     fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
-    fn vm_live_checkpoint(&mut self, destination_url: &str, full: bool) -> Result<(), VmError>;
+    fn vm_live_checkpoint(
+        &mut self,
+        destination_url: &str,
+        full: bool,
+        leave_paused: bool,
+    ) -> Result<(), VmError>;
 
     fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
 
@@ -1953,7 +1963,7 @@ impl ApiAction for VmLiveCheckpoint {
             info!("API request event: VmLiveCheckpoint {config:?}");
 
             let response = vmm
-                .vm_live_checkpoint(&config.destination_url, config.full)
+                .vm_live_checkpoint(&config.destination_url, config.full, config.leave_paused)
                 .map_err(ApiError::VmLiveCheckpoint)
                 .map(|_| ApiResponsePayload::Empty);
 
