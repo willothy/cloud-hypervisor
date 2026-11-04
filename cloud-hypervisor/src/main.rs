@@ -317,6 +317,15 @@ fn get_cli_options_sorted(
             .help("Path to report events on: path=<path> or fd=<fd>")
             .num_args(1)
             .group("vmm-config"),
+        Arg::new("exit-reason")
+            .long("exit-reason")
+            .help(
+                "Exit the VMM when the guest resets, instead of rebooting it in place, as \
+                 well as when it shuts down, first writing why to this path: \"reset\" or \
+                 \"shutdown\"",
+            )
+            .num_args(1)
+            .group("vmm-config"),
         Arg::new("firmware")
             .long("firmware")
             .help("Path to firmware that is loaded in an architectural specific way")
@@ -445,15 +454,6 @@ fn get_cli_options_sorted(
             .help("Do not exit the VMM when the guest shuts down")
             .num_args(0)
             .action(ArgAction::SetTrue)
-            .group("vmm-config"),
-        Arg::new("exit-reason")
-            .long("exit-reason")
-            .help(
-                "Exit the VMM when the guest resets, instead of rebooting it in place, as \
-                 well as when it shuts down, first writing why to this path: \"reset\" or \
-                 \"shutdown\"",
-            )
-            .num_args(1)
             .group("vmm-config"),
         Arg::new("numa")
             .long("numa")
