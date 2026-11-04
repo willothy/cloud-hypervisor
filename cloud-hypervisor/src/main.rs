@@ -10,7 +10,6 @@ mod test_util;
 use std::fs::{self, File};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
-#[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::{any, cmp, env, io, num, process, str, thread};
@@ -393,6 +392,15 @@ fn get_cli_options_sorted(
             .num_args(0)
             .action(ArgAction::SetTrue)
             .group("vmm-config"),
+        Arg::new("exit-reason")
+            .long("exit-reason")
+            .help(
+                "Exit the VMM when the guest resets, instead of rebooting it in place, as \
+                 well as when it shuts down, first writing why to this path: \"reset\" or \
+                 \"shutdown\"",
+            )
+            .num_args(1)
+            .group("vmm-config"),
         Arg::new("numa")
             .long("numa")
             .help(NumaConfig::SYNTAX)
@@ -653,6 +661,9 @@ fn start_vmm(
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
     let landlock_enable = cmd_arguments.get_flag("landlock");
     let no_shutdown = cmd_arguments.get_flag("no-shutdown");
+    let exit_reason = cmd_arguments
+        .get_one::<String>("exit-reason")
+        .map(PathBuf::from);
 
     #[allow(unused_mut)]
     let mut event_monitor = cmd_arguments
@@ -749,6 +760,7 @@ fn start_vmm(
         &seccomp_action,
         hypervisor,
         no_shutdown,
+        exit_reason,
         landlock_enable,
     )
     .map_err(Error::StartVmmThread)?;
