@@ -8,7 +8,6 @@ use std::fs::File;
 use std::io::{Read, Write, stdout};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
-#[cfg(feature = "guest_debug")]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "guest_debug")]
@@ -481,6 +480,7 @@ pub fn start_vmm_thread(
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     no_shutdown: bool,
+    exit_reason: Option<PathBuf>,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -521,6 +521,7 @@ pub fn start_vmm_thread(
                     hypervisor,
                     exit_event,
                     no_shutdown,
+                    exit_reason,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -721,6 +722,9 @@ pub struct Vmm {
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
     no_shutdown: bool,
+    /// Where to record why the VMM exits, when it was asked to: a guest
+    /// reset then exits the VMM instead of rebooting the guest in place.
+    exit_reason: Option<PathBuf>,
     check_migration_evt: EventFd,
 }
 
@@ -899,6 +903,7 @@ impl Vmm {
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
         no_shutdown: bool,
+        exit_reason: Option<PathBuf>,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -959,8 +964,20 @@ impl Vmm {
             serial_socket_listener: None,
             console_socket_listener: None,
             no_shutdown,
+            exit_reason,
             check_migration_evt,
         })
+    }
+
+    /// Record why the VMM is about to exit at the path it was given, if any.
+    /// A failure to write is logged: the VMM exits either way, and a missing
+    /// reason reads as an exit with no reason given.
+    fn record_exit_reason(&self, reason: &str) {
+        if let Some(path) = &self.exit_reason
+            && let Err(e) = std::fs::write(path, reason)
+        {
+            error!("Error recording the exit reason at {}: {e}", path.display());
+        }
     }
 
     /// Try to receive a file descriptor from a socket. Returns the slot number and the file descriptor.
@@ -2302,6 +2319,11 @@ impl Vmm {
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
+                        if self.exit_reason.is_some() {
+                            self.record_exit_reason("reset");
+                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                            break 'outer;
+                        }
                         self.vm_reboot().map_err(Error::VmReboot)?;
                     }
                     EpollDispatch::GuestExit => {
@@ -2311,6 +2333,7 @@ impl Vmm {
                         if self.no_shutdown {
                             self.vm_shutdown().map_err(Error::VmShutdown)?;
                         } else {
+                            self.record_exit_reason("shutdown");
                             self.vmm_shutdown().map_err(Error::VmmShutdown)?;
                             break 'outer;
                         }
@@ -3691,6 +3714,7 @@ mod tests {
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
             false,
+            None,
         )
         .unwrap()
     }
