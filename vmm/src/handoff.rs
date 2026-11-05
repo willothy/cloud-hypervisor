@@ -26,8 +26,12 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process;
+use std::thread::{Builder, JoinHandle};
 
+use log::error;
 use serde::{Deserialize, Serialize};
+use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 /// Header discriminant of a handoff message.
@@ -116,6 +120,9 @@ enum CaptureOutcome {
 /// write-protection during live checkpoints (ioctls do not compete with the
 /// peer reading fault events).
 pub(crate) struct FaultSession {
+    /// Ends the process if the peer hangs up (see [`HangupWatch`]).
+    /// Declared first so it stops before the connection closes.
+    _hangup: HangupWatch,
     stream: UnixStream,
     uffd: OwnedFd,
 }
@@ -138,7 +145,12 @@ impl FaultSession {
         fds.push(uffd.as_raw_fd());
         fds.extend_from_slice(memfds);
         send_message(&stream, MSG_HANDOFF, &body, &fds)?;
-        Ok(Self { stream, uffd })
+        let hangup = HangupWatch::spawn(stream.try_clone()?)?;
+        Ok(Self {
+            _hangup: hangup,
+            stream,
+            uffd,
+        })
     }
 
     /// The userfaultfd, for arming write-protection.
@@ -187,6 +199,98 @@ impl FaultSession {
         match serde_json::from_slice(&body)? {
             CaptureOutcome::Success => Ok(Ok(())),
             CaptureOutcome::Failure { error } => Ok(Err(error)),
+        }
+    }
+}
+
+/// Watches a fault session's connection for the fault handler hanging up.
+///
+/// The handler owns every fault on guest RAM. Once it is gone, a vCPU that
+/// touches a missing or write-protected page sleeps in the kernel until a
+/// fatal signal, so the VM can neither run nor shut down. On a hangup the
+/// watch logs it and exits the process without recording an exit reason:
+/// the VMM can no longer run the VM, and its manager restores the VM from
+/// its last checkpoint.
+///
+/// Only `POLLRDHUP` is polled for, so capture-done messages stay queued for
+/// [`FaultSession::wait_done`].
+struct HangupWatch {
+    stop: EventFd,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl HangupWatch {
+    /// Start watching `stream`, a clone of the session's connection.
+    fn spawn(stream: UnixStream) -> io::Result<Self> {
+        let stop = EventFd::new(0)?;
+        let stopped = stop.try_clone()?;
+        let thread = Builder::new()
+            .name("fault_hangup".to_string())
+            .spawn(move || Self::watch(&stream, &stopped))?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    /// Block until `stop` is signalled, returning, or the peer hangs up,
+    /// ending the process.
+    fn watch(stream: &UnixStream, stop: &EventFd) {
+        let mut fds = [
+            libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLRDHUP,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        loop {
+            // SAFETY: `fds` is an array of two initialized pollfds whose
+            // descriptors stay open for the duration of the call.
+            let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // An unwatched session would leave a hangup to wedge the
+                // VM, so losing the watch ends the VM as a hangup does.
+                error!("watching the fault-handler connection failed: {error}");
+                Self::exit();
+            }
+            if fds[1].revents != 0 {
+                return;
+            }
+            if fds[0].revents & (libc::POLLRDHUP | libc::POLLHUP | libc::POLLERR) != 0 {
+                error!(
+                    "the fault handler closed the VM's fault session; guest memory can no longer be served"
+                );
+                Self::exit();
+            }
+        }
+    }
+
+    /// End the process, flushing the log first.
+    fn exit() -> ! {
+        log::logger().flush();
+        process::exit(1)
+    }
+}
+
+impl Drop for HangupWatch {
+    fn drop(&mut self) {
+        if let Err(error) = self.stop.write(1) {
+            error!("stopping the fault-handler hangup watch failed: {error}");
+            return;
+        }
+        if let Some(thread) = self.thread.take()
+            && thread.join().is_err()
+        {
+            error!("the fault-handler hangup watch panicked");
         }
     }
 }
