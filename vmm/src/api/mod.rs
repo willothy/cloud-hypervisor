@@ -284,15 +284,30 @@ pub struct VmCaptureDirtyMemoryConfig {
     pub out_path: String,
 }
 
+/// Which pages of guest RAM a live checkpoint captures. The caller decides:
+/// it knows whether a previous checkpoint exists to diff against.
+#[derive(Clone, Copy, Deserialize, Serialize, Default, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureScope {
+    /// The pages dirtied since the last capture.
+    #[default]
+    Dirty,
+    /// All of guest RAM. Refused for a demand-paged VM: it would fault the
+    /// entire lazy tail in.
+    Full,
+    /// Every page of a demand-paged VM's RAM that is resident — faulted in
+    /// or written since its restore; the rest still hold what the image it
+    /// was restored from holds. Refused for a booted VM, whose RAM is all
+    /// resident: capture it full.
+    Resident,
+}
+
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
 pub struct VmLiveCheckpointConfig {
     /// The checkpoint destination directory URL.
     pub destination_url: String,
-    /// Capture all of guest RAM rather than just the pages dirtied since the
-    /// last capture. The caller decides — it knows whether a previous
-    /// checkpoint exists to diff an incremental against — and a full capture
-    /// of a demand-paged VM is refused (it would fault the entire lazy tail).
-    pub full: bool,
+    /// Which pages of guest RAM to capture.
+    pub scope: CaptureScope,
     /// Leave the VM paused once its state is captured, rather than resuming
     /// it: the source half of a move, which stops the VM where it is
     /// captured. A failed capture resumes the VM either way.
@@ -733,7 +748,7 @@ pub trait RequestHandler {
     fn vm_live_checkpoint(
         &mut self,
         destination_url: &str,
-        full: bool,
+        scope: CaptureScope,
         leave_paused: bool,
     ) -> Result<(), VmError>;
 
@@ -1963,7 +1978,7 @@ impl ApiAction for VmLiveCheckpoint {
             info!("API request event: VmLiveCheckpoint {config:?}");
 
             let response = vmm
-                .vm_live_checkpoint(&config.destination_url, config.full, config.leave_paused)
+                .vm_live_checkpoint(&config.destination_url, config.scope, config.leave_paused)
                 .map_err(ApiError::VmLiveCheckpoint)
                 .map(|_| ApiResponsePayload::Empty);
 

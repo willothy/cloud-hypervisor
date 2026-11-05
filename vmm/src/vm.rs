@@ -3071,7 +3071,7 @@ impl Vm {
     pub fn live_checkpoint(
         &mut self,
         destination_url: &str,
-        full: bool,
+        scope: crate::api::CaptureScope,
         leave_paused: bool,
     ) -> std::result::Result<(), MigratableError> {
         // Brief pause to capture config + CPU/device state and arm write-protect
@@ -3079,7 +3079,7 @@ impl Vm {
         // before returning so a failed checkpoint never leaves the VM paused —
         // the operation stays cleanly retryable.
         self.pause()?;
-        let done = match self.checkpoint_paused_phase(destination_url, full) {
+        let done = match self.checkpoint_paused_phase(destination_url, scope) {
             Ok(sent) => sent,
             Err(e) => {
                 if let Err(resume_err) = self.resume() {
@@ -3108,10 +3108,11 @@ impl Vm {
     /// consistent point, on the one uffd that owns guest RAM. The VM must be
     /// paused; the caller resumes it whether this succeeds or fails.
     ///
-    /// With `full`, all of guest RAM is armed and captured (the caller has no
-    /// previous manifest to diff an incremental against); otherwise only the
-    /// dirty pages are, and the caller's incremental re-chunk reads exactly
-    /// the sidecar's offsets. The copy-out is sent to the external fault
+    /// `scope` picks what is armed and captured: all of guest RAM (the caller
+    /// has no previous manifest to diff an incremental against), only the
+    /// dirty pages, or a demand-paged VM's resident pages; see
+    /// [`MemoryManager::arm_session_capture`] for what the sidecar lists.
+    /// The copy-out is sent to the external fault
     /// handler before returning — while the VM is still paused — so its
     /// message is buffered ahead of the first post-resume write fault; the
     /// caller waits for the done message on the returned connection after
@@ -3119,7 +3120,7 @@ impl Vm {
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
-        full: bool,
+        scope: crate::api::CaptureScope,
     ) -> std::result::Result<Option<std::os::unix::net::UnixStream>, MigratableError> {
         let snapshot = self.snapshot()?;
 
@@ -3148,7 +3149,7 @@ impl Vm {
             .memory_manager
             .lock()
             .unwrap()
-            .arm_session_capture(full, device_dirty)?;
+            .arm_session_capture(scope, device_dirty)?;
         let mut dirty_path = url_to_path(destination_url)?;
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =

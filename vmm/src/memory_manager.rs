@@ -1480,20 +1480,28 @@ impl MemoryManager {
     /// page (there is no active capture to own it).
     pub(crate) fn arm_session_capture(
         &mut self,
-        full: bool,
+        scope: crate::api::CaptureScope,
         device_dirty: MemoryRangeTable,
     ) -> Result<(Vec<(u64, u64)>, Vec<handoff::CaptureRange>), MigratableError> {
+        use crate::api::CaptureScope;
         if self.fault_session.is_none() {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "no fault handler owns guest RAM; was register_capture_uffd skipped?"
             )));
         }
-        if full && self.demand_paged {
-            return Err(MigratableError::MigrateSend(anyhow!(
-                "a full capture of demand-paged guest RAM would fault the entire lazy \
-                 tail in; an incremental needs the checkpoint this VM was restored from \
-                 recorded as its lineage"
-            )));
+        match scope {
+            CaptureScope::Full if self.demand_paged => {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "a full capture of demand-paged guest RAM would fault the entire \
+                     lazy tail in; capture its resident pages instead"
+                )));
+            }
+            CaptureScope::Resident if !self.demand_paged => {
+                return Err(MigratableError::MigrateSend(anyhow!(
+                    "a booted VM's guest RAM is all resident; capture it full instead"
+                )));
+            }
+            _ => {}
         }
         let layout = self.memory_range_table(true)?;
 
@@ -1526,34 +1534,37 @@ impl MemoryManager {
             .as_ref()
             .expect("presence checked at entry");
 
-        // The sidecar always records the dirty offsets; the armed ranges are
-        // the whole layout for a full capture, the dirty ranges otherwise.
-        let mut sidecar = Vec::with_capacity(dirty.regions().len());
-        for d in dirty.regions() {
-            // A dirty range lies within a single region (the dirty log is
-            // built per region); map its gpa to the dense capture offset.
-            if let Some(&(gpa, _len, base)) = regions
-                .iter()
-                .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
-            {
-                sidecar.push((base + (d.gpa - gpa), d.length));
-            }
-        }
+        // The dirty ranges, as (gpa, length, dense capture offset). A dirty
+        // range lies within a single region (the dirty log is built per
+        // region). Taking them consumes this interval's dirty state, even for
+        // a capture that arms more.
+        let dirty: Vec<(u64, u64, u64)> = dirty
+            .regions()
+            .iter()
+            .filter_map(|d| {
+                regions
+                    .iter()
+                    .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
+                    .map(|&(gpa, _len, base)| (d.gpa, d.length, base + (d.gpa - gpa)))
+            })
+            .collect();
 
-        let to_arm: Vec<(u64, u64, u64)> = if full {
-            regions.clone()
-        } else {
-            dirty
-                .regions()
-                .iter()
-                .filter_map(|d| {
-                    regions
-                        .iter()
-                        .find(|(gpa, len, _)| d.gpa >= *gpa && d.gpa < *gpa + *len)
-                        .map(|&(gpa, _len, base)| (d.gpa, d.length, base + (d.gpa - gpa)))
-                })
-                .collect()
+        // The armed ranges are the whole layout for a full capture, the
+        // resident ranges for a resident one, and the dirty ranges otherwise.
+        // The sidecar lists the dirty offsets, but for a resident capture,
+        // whose file holds exactly the resident pages, it lists those.
+        let to_arm: Vec<(u64, u64, u64)> = match scope {
+            CaptureScope::Full => regions.clone(),
+            CaptureScope::Resident => self.resident_ranges(&regions)?,
+            CaptureScope::Dirty => dirty.clone(),
         };
+        let sidecar: Vec<(u64, u64)> = match scope {
+            CaptureScope::Resident => &to_arm,
+            CaptureScope::Full | CaptureScope::Dirty => &dirty,
+        }
+        .iter()
+        .map(|&(_gpa, length, out_offset)| (out_offset, length))
+        .collect();
 
         let mut ranges = Vec::with_capacity(to_arm.len());
         for (gpa, length, out_offset) in to_arm {
@@ -1572,6 +1583,64 @@ impl MemoryManager {
             });
         }
         Ok((sidecar, ranges))
+    }
+
+    /// The resident pages of guest RAM, as (gpa, length, dense capture
+    /// offset) ranges within `regions` — the data extents of the memory
+    /// files backing it, found with `SEEK_DATA`/`SEEK_HOLE` so no page is
+    /// touched. A demand-paged VM's page is resident once it was faulted in
+    /// or written since the restore; every other page still holds what the
+    /// image it was restored from holds.
+    fn resident_ranges(
+        &self,
+        regions: &[(u64, u64, u64)],
+    ) -> Result<Vec<(u64, u64, u64)>, MigratableError> {
+        let guest_memory = self.guest_memory.memory();
+        let mut resident = Vec::new();
+        for &(gpa, length, base) in regions {
+            let region = guest_memory.find_region(GuestAddress(gpa)).ok_or_else(|| {
+                MigratableError::MigrateSend(anyhow!("no guest region at {gpa:#x}"))
+            })?;
+            let file_offset = region.file_offset().ok_or_else(|| {
+                MigratableError::MigrateSend(anyhow!(
+                    "guest region at {gpa:#x} is not file backed; its residency is unknown"
+                ))
+            })?;
+            let fd = file_offset.file().as_raw_fd();
+            let start = file_offset.start() + (gpa - region.start_addr().raw_value());
+            let end = start + length;
+            let mut cursor = start;
+            while cursor < end {
+                // SAFETY: lseek on a descriptor this manager holds open, with
+                // no memory passed in.
+                let data = unsafe { libc::lseek64(fd, cursor as i64, libc::SEEK_DATA) };
+                if data < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ENXIO) {
+                        break;
+                    }
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "finding resident guest RAM: {error}"
+                    )));
+                }
+                let data = data as u64;
+                if data >= end {
+                    break;
+                }
+                // SAFETY: as above.
+                let hole = unsafe { libc::lseek64(fd, data as i64, libc::SEEK_HOLE) };
+                if hole < 0 {
+                    return Err(MigratableError::MigrateSend(anyhow!(
+                        "finding resident guest RAM: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+                let hole = (hole as u64).min(end);
+                resident.push((gpa + (data - start), hole - data, base + (data - start)));
+                cursor = hole;
+            }
+        }
+        Ok(resident)
     }
 
     /// Send the copy-out of a live checkpoint to the fault handler, which
