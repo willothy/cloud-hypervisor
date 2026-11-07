@@ -1214,7 +1214,7 @@ impl MemoryManager {
             return Ok(());
         }
 
-        let layout = self.memory_range_table(true).map_err(Error::Restore)?;
+        let layout = self.capture_layout().map_err(Error::Restore)?;
         let guest_memory = self.guest_memory.memory();
         let uffd_fd =
             uffd::create(userfaultfd::UFFD_FEATURE_PAGEFAULT_FLAG_WP).map_err(UffdError::Create)?;
@@ -1361,7 +1361,7 @@ impl MemoryManager {
         out_path: &Path,
         device_dirty: MemoryRangeTable,
     ) -> Result<MemoryRangeTable, MigratableError> {
-        let layout = self.memory_range_table(true)?;
+        let layout = self.capture_layout()?;
         let dirty = Self::coalesce_dirty(vec![self.dirty_log()?, device_dirty], &layout);
         let out = OpenOptions::new()
             .read(true)
@@ -1503,17 +1503,18 @@ impl MemoryManager {
             }
             _ => {}
         }
-        let layout = self.memory_range_table(true)?;
+        let layout = self.capture_layout()?;
 
-        // Registration happened once at startup; a layout that has changed
-        // since (hotplugged memory) is not registered and would silently
-        // escape the capture. Fail loudly instead: re-registration on
-        // hotplug is the future fix.
+        // Registration happened once at startup, over a layout that covers
+        // every virtio-mem block the guest may plug. A layout that has
+        // changed since (memory hotplugged through ACPI, which adds
+        // regions) is not registered and would silently escape the
+        // capture, so it is refused.
         let current: Vec<(u64, u64)> = layout.regions().iter().map(|r| (r.gpa, r.length)).collect();
         if current != self.uffd_registered_layout {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "guest RAM layout changed since uffd registration; \
-                 checkpointing hotplugged memory is not supported"
+                 checkpointing memory hotplugged through ACPI is not supported"
             )));
         }
 
@@ -1549,12 +1550,15 @@ impl MemoryManager {
             })
             .collect();
 
-        // The armed ranges are the whole layout for a full capture, the
-        // resident ranges for a resident one, and the dirty ranges otherwise.
+        // The armed ranges are the populated layout for a full capture —
+        // boot RAM and the plugged virtio-mem blocks; an unplugged block
+        // holds nothing, and reading it would only allocate it — the
+        // resident ranges for a resident one, and the dirty ranges
+        // otherwise.
         // The sidecar lists the dirty offsets, but for a resident capture,
         // whose file holds exactly the resident pages, it lists those.
         let to_arm: Vec<(u64, u64, u64)> = match scope {
-            CaptureScope::Full => regions.clone(),
+            CaptureScope::Full => self.populated_ranges(&regions),
             CaptureScope::Resident => self.resident_ranges(&regions)?,
             CaptureScope::Dirty => dirty.clone(),
         };
@@ -1669,7 +1673,7 @@ impl MemoryManager {
             .open(out_path)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("creating capture file: {e}")))?;
         let total: u64 = self
-            .memory_range_table(true)?
+            .capture_layout()?
             .regions()
             .iter()
             .map(|r| r.length)
@@ -3290,6 +3294,83 @@ impl MemoryManager {
         &mut self.memory_zones
     }
 
+    /// Guest RAM as checkpoints lay it out, and as the capture fault session
+    /// registers it: every boot RAM region in guest-physical order, then
+    /// each virtio-mem zone's whole hotplug region, plugged or not, in
+    /// guest-physical order. A region's dense offset is the sum of the
+    /// lengths before it.
+    ///
+    /// The layout holds for the VM's life, so every dense offset into a
+    /// memory image does: a block the guest plugs later lies inside a
+    /// region already laid out and registered, and a block never plugged
+    /// is a hole the guest never touches. Boot regions skipped by
+    /// [`Self::memory_range_table`] — shared mappings of a host file,
+    /// which the file itself saves — are skipped here too.
+    fn capture_layout(&self) -> result::Result<MemoryRangeTable, MigratableError> {
+        let mut boot = Vec::new();
+        let mut hotplug = Vec::new();
+        for memory_zone in self.memory_zones.values() {
+            if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
+                hotplug.push(MemoryRange {
+                    gpa: virtio_mem_zone.region().start_addr().raw_value(),
+                    length: virtio_mem_zone.region().len(),
+                });
+            }
+            for region in memory_zone.regions() {
+                if let Some(file_offset) = region.file_offset()
+                    && (region.flags() & libc::MAP_SHARED == libc::MAP_SHARED)
+                    && Self::is_hardlink(file_offset.file())
+                {
+                    continue;
+                }
+                boot.push(MemoryRange {
+                    gpa: region.start_addr().raw_value(),
+                    length: region.len(),
+                });
+            }
+        }
+        boot.sort_by_key(|range| range.gpa);
+        hotplug.sort_by_key(|range| range.gpa);
+        let mut table = MemoryRangeTable::default();
+        for range in boot.into_iter().chain(hotplug) {
+            table.push(range);
+        }
+        Ok(table)
+    }
+
+    /// The populated part of guest RAM as `(gpa, length, dense offset)`
+    /// ranges, given `regions`, the [`Self::capture_layout`] regions with
+    /// their dense offsets: each boot region whole, and of each virtio-mem
+    /// region the blocks the guest has plugged.
+    fn populated_ranges(&self, regions: &[(u64, u64, u64)]) -> Vec<(u64, u64, u64)> {
+        let plugged: Vec<MemoryRange> = self
+            .memory_zones
+            .values()
+            .filter_map(|zone| zone.virtio_mem_zone().as_ref())
+            .flat_map(|zone| zone.plugged_ranges().regions().to_vec())
+            .collect();
+        let hotplug: Vec<(u64, u64)> = self
+            .memory_zones
+            .values()
+            .filter_map(|zone| zone.virtio_mem_zone().as_ref())
+            .map(|zone| (zone.region().start_addr().raw_value(), zone.region().len()))
+            .collect();
+        let mut populated = Vec::new();
+        for &(gpa, length, base) in regions {
+            if !hotplug.contains(&(gpa, length)) {
+                populated.push((gpa, length, base));
+                continue;
+            }
+            for range in &plugged {
+                if range.gpa >= gpa && range.gpa + range.length <= gpa + length {
+                    populated.push((range.gpa, range.length, base + (range.gpa - gpa)));
+                }
+            }
+        }
+        populated.sort_by_key(|&(_, _, offset)| offset);
+        populated
+    }
+
     pub fn memory_range_table(
         &self,
         snapshot: bool,
@@ -3807,7 +3888,7 @@ impl Snapshottable for MemoryManager {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let memory_ranges = self.memory_range_table(true)?;
+        let memory_ranges = self.capture_layout()?;
 
         // Store locally this list of ranges as it will be used through the
         // Transportable::send() implementation. The point is to avoid the
