@@ -536,6 +536,16 @@ impl VhostUserCommon {
                 .map_err(ActivateError::CloneEventFd)?,
         );
 
+        // A device asked to log its writes before it was activated (one
+        // hot-plugged while the VM's devices log) starts logging here,
+        // before the guest can hand it a request.
+        if self.dirty_logging {
+            vu.lock()
+                .unwrap()
+                .start_dirty_log(mem.memory().last_addr().raw_value())
+                .map_err(ActivateError::VhostUserSetup)?;
+        }
+
         Ok(VhostUserEpollHandler {
             vu: Arc::clone(vu),
             mem,
@@ -791,8 +801,14 @@ impl VhostUserCommon {
         Ok(snapshot)
     }
 
+    /// Start logging the guest memory the backend writes. A device not yet
+    /// activated has written nothing; it starts logging when it activates.
     pub fn start_dirty_log(&mut self) -> result::Result<(), MigratableError> {
         if let Some(vu) = &self.vu {
+            if self.guest_memory.is_none() {
+                self.dirty_logging = true;
+                return Ok(());
+            }
             if let Some(guest_memory) = &self.guest_memory {
                 let last_ram_addr = guest_memory.memory().last_addr().raw_value();
                 vu.lock()
@@ -816,7 +832,9 @@ impl VhostUserCommon {
     }
 
     pub fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
-        if let Some(vu) = &self.vu {
+        if let Some(vu) = &self.vu
+            && self.guest_memory.is_some()
+        {
             vu.lock().unwrap().stop_dirty_log().map_err(|e| {
                 MigratableError::StopDirtyLog(anyhow!(
                     "Error stopping migration for vhost-user backend: {e:?}"
@@ -828,6 +846,8 @@ impl VhostUserCommon {
         Ok(())
     }
 
+    /// The guest memory the backend wrote since the last call. A device
+    /// not yet activated has written none.
     pub fn dirty_log(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {
         if let Some(vu) = &self.vu {
             if let Some(guest_memory) = &self.guest_memory {
@@ -838,7 +858,7 @@ impl VhostUserCommon {
                     ))
                 })
             } else {
-                Err(MigratableError::DirtyLog(anyhow!("Missing guest memory")))
+                Ok(MemoryRangeTable::default())
             }
         } else {
             Ok(self.saved_dirty_log.take().unwrap_or_default())

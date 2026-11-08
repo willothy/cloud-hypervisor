@@ -642,6 +642,10 @@ pub enum DeviceManagerError {
     #[error("Failed retrieving device state from snapshot")]
     RestoreGetState(#[source] MigratableError),
 
+    /// Failed starting a hot-plugged device's dirty log
+    #[error("Failed starting a hot-plugged device's dirty log")]
+    HotplugStartDirtyLog(#[source] MigratableError),
+
     /// Cannot create a PvPanic device
     #[error("Cannot create a PvPanic device")]
     PvPanicCreate(#[source] pvpanic::PvPanicError),
@@ -1122,6 +1126,10 @@ pub struct DeviceManager {
     #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
     sev_snp_shared_page_tracker: Option<Arc<SevSnpSharedPageTracker>>,
 
+    // Whether the devices log the guest memory they write, which a device
+    // hot-plugged meanwhile then does too.
+    dirty_logging: bool,
+
     #[cfg(feature = "fw_cfg")]
     fw_cfg: Option<Arc<Mutex<FwCfg>>>,
 
@@ -1452,6 +1460,7 @@ impl DeviceManager {
             mmio_regions: Arc::new(Mutex::new(Vec::new())),
             #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
             sev_snp_shared_page_tracker,
+            dirty_logging: false,
             #[cfg(feature = "fw_cfg")]
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
@@ -5877,6 +5886,24 @@ impl DeviceManager {
         self.pci_segments[handle.pci_common.pci_segment as usize].pci_devices_up |=
             1 << bdf.device();
 
+        // While the devices log their writes to guest memory, so does one
+        // plugged meanwhile, from the moment it activates: a capture that
+        // takes the logged writes as every device write misses none of it.
+        if self.dirty_logging
+            && let Some(migratable) = self
+                .device_tree
+                .lock()
+                .unwrap()
+                .get(&id)
+                .and_then(|node| node.migratable.clone())
+        {
+            migratable
+                .lock()
+                .unwrap()
+                .start_dirty_log()
+                .map_err(DeviceManagerError::HotplugStartDirtyLog)?;
+        }
+
         Ok(PciDeviceInfo { id, bdf })
     }
 
@@ -6616,10 +6643,12 @@ impl Migratable for DeviceManager {
                 migratable.lock().unwrap().start_dirty_log()?;
             }
         }
+        self.dirty_logging = true;
         Ok(())
     }
 
     fn stop_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        self.dirty_logging = false;
         for (_, device_node) in self.device_tree.lock().unwrap().iter() {
             if let Some(migratable) = &device_node.migratable {
                 migratable.lock().unwrap().stop_dirty_log()?;
