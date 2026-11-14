@@ -107,6 +107,18 @@ impl MuxerRxQ {
         false
     }
 
+    /// The (local port, peer port) pairs of the RST packets in the queue.
+    ///
+    pub(super) fn rst_ports(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        self.q.iter().filter_map(|rx| match *rx {
+            MuxerRx::RstPkt {
+                local_port,
+                peer_port,
+            } => Some((local_port, peer_port)),
+            MuxerRx::ConnRx(_) => None,
+        })
+    }
+
     /// Peek into the front of the queue.
     ///
     pub(super) fn peek(&self) -> Option<MuxerRx> {
