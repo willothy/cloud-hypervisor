@@ -151,9 +151,15 @@ pub trait VsockChannel {
 /// Currently, the only implementation we have is `crate::virtio::unix::muxer::VsockMuxer`, which
 /// translates guest-side vsock connections to host-side Unix domain socket connections.
 pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
+    /// The (host port, guest port) pairs of every connection the guest may still hold, for a
+    /// snapshot to carry to the backend it is restored into.
     fn connections(&self) -> Vec<(u32, u32)> {
         Vec::new()
     }
+    /// Take on the connections a snapshot carried (see `connections()`) on restore. The guest
+    /// still holds them but nothing on the host side is behind them, so each is sent an RST,
+    /// and no new connection may reuse one's (host port, guest port) pair while the guest can
+    /// still hold it.
     fn queue_rst_for_connections(&mut self, _conns: Vec<(u32, u32)>) {}
 }
 

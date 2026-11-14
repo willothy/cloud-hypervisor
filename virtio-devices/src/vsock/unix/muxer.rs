@@ -39,9 +39,10 @@
 //! mapping `RawFd`s to `EpollListener`s.
 
 use std::cmp::max;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, ErrorKind, Read};
+use std::ops::Range;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::str;
@@ -137,6 +138,12 @@ pub struct VsockMuxer {
     local_port_set: HashSet<u32>,
     /// The last used host-side port.
     local_port_last: u32,
+    /// The connections the guest held when the snapshot this muxer was restored from was
+    /// taken. Nothing on the host side is behind them anymore, so each is owed an RST, sent
+    /// ahead of any other packet. Until it is, its host-side port stays in `local_port_set`,
+    /// so a new host-initiated connection cannot take a (host port, guest port) pair that a
+    /// guest socket still holds.
+    restored: VecDeque<ConnMapKey>,
 }
 
 impl VsockChannel for VsockMuxer {
@@ -148,6 +155,16 @@ impl VsockChannel for VsockMuxer {
     ///   packet.
     ///
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
+        // The guest's restored sockets are reset before anything else goes out.
+        if let Some(key) = self.restored.pop_front() {
+            self.fill_rst_pkt(pkt, key.local_port, key.peer_port);
+            // The guest drops the socket on this RST, which frees its port. Allocation is
+            // already past the port, so it is handed out again only after a wrap, long after
+            // any packet the guest sent from that socket has arrived.
+            self.free_local_port(key.local_port);
+            return Ok(());
+        }
+
         // We'll look for instructions on how to build the RX packet in the RX queue. If the
         // queue is empty, that doesn't necessarily mean we don't have any pending RX, since
         // the queue might be out-of-sync. If that's the case, we'll attempt to sync it first,
@@ -276,7 +293,7 @@ impl VsockChannel for VsockMuxer {
     /// buffer.
     ///
     fn has_pending_rx(&self) -> bool {
-        !self.rxq.is_empty() || !self.rxq.is_synced()
+        !self.restored.is_empty() || !self.rxq.is_empty() || !self.rxq.is_synced()
     }
 }
 
@@ -339,15 +356,29 @@ impl VsockEpollListener for VsockMuxer {
 
 impl VsockBackend for VsockMuxer {
     fn connections(&self) -> Vec<(u32, u32)> {
+        // Besides the live connections, the guest still holds those it is owed an RST for,
+        // whether restored or queued, until that RST reaches it.
         self.conn_map
             .keys()
+            .chain(self.restored.iter())
             .map(|k| (k.local_port, k.peer_port))
+            .chain(self.rxq.rst_ports())
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect()
     }
 
     fn queue_rst_for_connections(&mut self, conns: Vec<(u32, u32)>) {
         for (local_port, peer_port) in conns {
-            self.rxq.push(MuxerRx::RstPkt {
+            // Every muxer allocates from the bottom of the same range, so the previous one
+            // most likely handed out these very ports to the guest's live sockets: reserve
+            // them, and allocate past the highest. The reservations keep the ports from new
+            // connections even once allocation wraps.
+            if Self::LOCAL_PORT_RANGE.contains(&local_port) {
+                self.local_port_set.insert(local_port);
+                self.local_port_last = max(self.local_port_last, local_port);
+            }
+            self.restored.push_back(ConnMapKey {
                 local_port,
                 peer_port,
             });
@@ -356,6 +387,9 @@ impl VsockBackend for VsockMuxer {
 }
 
 impl VsockMuxer {
+    /// The host-side ports `allocate_local_port()` assigns to host-initiated connections.
+    const LOCAL_PORT_RANGE: Range<u32> = (1 << 30)..(1 << 31);
+
     /// Muxer constructor.
     ///
     pub fn new(cid: u32, host_sock_path: String) -> Result<Self> {
@@ -384,6 +418,7 @@ impl VsockMuxer {
             killq: MuxerKillQ::new(),
             local_port_last: (1u32 << 30) - 1,
             local_port_set: HashSet::with_capacity(defs::MAX_CONNECTIONS),
+            restored: VecDeque::new(),
         };
 
         muxer.add_listener(muxer.host_sock.as_raw_fd(), EpollListener::HostSock)?;
@@ -1596,6 +1631,101 @@ mod unit_tests {
         // Since initially the connection had two flags set, now there should
         // not be any pending RX in the muxer.
         assert!(!ctx.muxer.has_pending_rx());
+    }
+
+    #[test]
+    fn test_restored_connection_ports() {
+        let mut ctx = MuxerTestContext::new("restored_connection_ports");
+        let first = VsockMuxer::LOCAL_PORT_RANGE.start;
+        let peer_port = 1024;
+        // The previous muxer allocated from the bottom of the range, as this one would. The
+        // last connection is guest-initiated, to a host port outside it.
+        let restored = [(first, peer_port), (first + 1, peer_port), (1025, 4000)];
+        ctx.muxer.queue_rst_for_connections(restored.to_vec());
+
+        // The host connects to the same guest port before any RST has gone out.
+        let mut stream = UnixStream::connect(ctx.muxer.host_sock_path.clone()).unwrap();
+        stream.set_nonblocking(true).unwrap();
+        ctx.notify_muxer();
+        let command = format!("CONNECT {peer_port}\n");
+        stream.write_all(command.as_bytes()).unwrap();
+        for _ in 0..command.len() {
+            ctx.notify_muxer();
+        }
+
+        // It gets a port the guest does not hold, past the restored ones.
+        let local_port = ctx.muxer.local_port_last;
+        assert_eq!(local_port, first + 2);
+
+        // The restored connections' RSTs go out first, and give their ports up.
+        for (local, peer) in restored {
+            assert!(ctx.muxer.has_pending_rx());
+            ctx.recv();
+            assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+            assert_eq!((ctx.pkt.src_port(), ctx.pkt.dst_port()), (local, peer));
+        }
+        assert!(!ctx.muxer.local_port_set.contains(&first));
+        assert!(!ctx.muxer.local_port_set.contains(&(first + 1)));
+
+        // The new connection outlives them.
+        ctx.recv();
+        assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_REQUEST);
+        assert_eq!(
+            (ctx.pkt.src_port(), ctx.pkt.dst_port()),
+            (local_port, peer_port)
+        );
+        ctx.init_pkt(local_port, peer_port, uapi::VSOCK_OP_RESPONSE);
+        ctx.send();
+        let mut buf = [0u8; 32];
+        let len = stream.read(&mut buf[..]).unwrap();
+        assert_eq!(&buf[..len], format!("OK {local_port}\n").as_bytes());
+
+        // Data the guest sent on an old socket is reset, and never reaches the new connection.
+        ctx.init_data_pkt(first, peer_port, &[1, 2, 3, 4]);
+        ctx.send();
+        ctx.recv();
+        assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+        assert_eq!((ctx.pkt.src_port(), ctx.pkt.dst_port()), (first, peer_port));
+        assert_eq!(
+            stream.read(&mut buf[..]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn test_restored_ports_reserved_across_wrap() {
+        let mut ctx = MuxerTestContext::new("restored_ports_reserved_across_wrap");
+        let range = VsockMuxer::LOCAL_PORT_RANGE;
+        // The previous muxer wrapped: the guest holds the top port and the bottom one again.
+        ctx.muxer
+            .queue_rst_for_connections(vec![(range.end - 1, 1024), (range.start, 1024)]);
+
+        // Allocation wraps past the top port and skips the reserved bottom one.
+        assert_eq!(ctx.muxer.allocate_local_port(), range.start + 1);
+    }
+
+    #[test]
+    fn test_connections_carry_owed_rsts() {
+        let mut ctx = MuxerTestContext::new("connections_carry_owed_rsts");
+        let restored = (VsockMuxer::LOCAL_PORT_RANGE.start, 1024);
+        ctx.muxer.queue_rst_for_connections(vec![restored]);
+
+        // A live, guest-initiated connection.
+        let live = (1026, 5000);
+        let mut listener = ctx.create_local_listener(live.0);
+        ctx.init_pkt(live.0, live.1, uapi::VSOCK_OP_REQUEST);
+        ctx.send();
+        let _stream = listener.accept();
+
+        // A guest packet for a connection the muxer does not know queues an RST for it.
+        let orphan = (1025, 4000);
+        ctx.init_pkt(orphan.0, orphan.1, uapi::VSOCK_OP_RW);
+        ctx.send();
+
+        // A snapshot taken now carries all three: the guest still holds each.
+        let mut connections = ctx.muxer.connections();
+        connections.sort_unstable();
+        assert_eq!(connections, vec![orphan, live, restored]);
     }
 
     #[test]
