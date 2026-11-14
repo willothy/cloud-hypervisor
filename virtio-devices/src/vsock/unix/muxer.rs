@@ -163,16 +163,7 @@ impl VsockChannel for VsockMuxer {
                     local_port,
                     peer_port,
                 } => {
-                    pkt.set_op(uapi::VSOCK_OP_RST)
-                        .set_src_cid(uapi::VSOCK_HOST_CID)
-                        .set_dst_cid(self.cid)
-                        .set_src_port(local_port)
-                        .set_dst_port(peer_port)
-                        .set_len(0)
-                        .set_type(uapi::VSOCK_TYPE_STREAM)
-                        .set_flags(0)
-                        .set_buf_alloc(0)
-                        .set_fwd_cnt(0);
+                    self.fill_rst_pkt(pkt, local_port, peer_port);
                     self.rxq.pop().unwrap();
                     return Ok(());
                 }
@@ -680,6 +671,22 @@ impl VsockMuxer {
         }
 
         maybe_listener
+    }
+
+    /// Fill in `pkt` as an RST packet, going from host-side `local_port` to guest-side
+    /// `peer_port`.
+    ///
+    fn fill_rst_pkt(&self, pkt: &mut VsockPacket, local_port: u32, peer_port: u32) {
+        pkt.set_op(uapi::VSOCK_OP_RST)
+            .set_src_cid(uapi::VSOCK_HOST_CID)
+            .set_dst_cid(self.cid)
+            .set_src_port(local_port)
+            .set_dst_port(peer_port)
+            .set_len(0)
+            .set_type(uapi::VSOCK_TYPE_STREAM)
+            .set_flags(0)
+            .set_buf_alloc(0)
+            .set_fwd_cnt(0);
     }
 
     /// Allocate a host-side port to be assigned to a new host-initiated connection.
