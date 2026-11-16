@@ -76,9 +76,15 @@ jobs:
           fi
           echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "full=$full"
+  # The crucible fork doesn't use DCO: its commits carry no Signed-off-by
+  # trailers. The job stays, skipped rather than removed, because
+  # integration-x86-64-pr and virtio-villain are gated on it and the fork
+  # has never run them. integration-x86-64-pr needs upstream's garm
+  # runners, which the fork doesn't have.
   dco:
     name: dco
     needs: [preflight]
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

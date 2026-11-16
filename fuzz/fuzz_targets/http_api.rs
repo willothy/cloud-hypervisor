@@ -14,8 +14,8 @@ use micro_http::Request;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
-    ApiRequest, BalloonStatsResponse, RequestHandler, VmInfoResponse, VmReceiveMigrationData,
-    VmSendMigrationData, VmmPingResponse,
+    ApiRequest, BalloonStatsResponse, CaptureScope, RequestHandler, VmInfoResponse,
+    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
 use vmm::vm::{Error as VmError, VmState};
@@ -106,6 +106,18 @@ impl RequestHandler for StubApiRequestHandler {
     }
 
     fn vm_snapshot(&mut self, _: &str) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn vm_capture_dirty_memory(&mut self, _: &str) -> Result<(), VmError> {
+        Ok(())
+    }
+
+    fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
+
+    fn vm_live_checkpoint(&mut self, _: &str, _: CaptureScope, _: bool) -> Result<(), VmError> {
         Ok(())
     }
 
