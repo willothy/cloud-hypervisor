@@ -1218,6 +1218,90 @@ mod tests {
         }
     }
 
+    /// PAGEFAULT is sent to a backend only while guest RAM is demand-paged
+    /// and never kept in the protocol features a device saves: a negotiation
+    /// that sent it returns the features without it, and a restore of saved
+    /// features carrying it neither sends it nor requires it of a backend
+    /// when guest RAM is not demand-paged.
+    #[test]
+    fn pagefault_is_negotiated_per_connection_and_never_saved() {
+        struct Unused;
+        impl BackendFaultHandler for Unused {
+            fn adopt(
+                &self,
+                _: &str,
+                _: u64,
+                _: &[BackendMapping],
+                _: Option<BorrowedFd<'_>>,
+            ) -> io::Result<()> {
+                Err(io::Error::other("no memory table is sent"))
+            }
+        }
+
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let mq = VhostUserProtocolFeatures::MQ.bits();
+        let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
+        // (demand-paged, offered by the backend, sent to it)
+        for (demand_paged, available, sent) in
+            [(true, mq | pagefault, mq | pagefault), (false, mq, mq)]
+        {
+            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-pagefault-").unwrap();
+            let socket_path = temp_dir.as_path().join("backend.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let backend = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                for (request, value) in [
+                    (FrontendReq::GET_FEATURES, protocol_features),
+                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
+                ] {
+                    assert!(read_request(&mut stream, request).is_empty());
+                    for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+                        stream.write_all(&field.to_ne_bytes()).unwrap();
+                    }
+                    stream.write_all(&value.to_ne_bytes()).unwrap();
+                }
+                assert_eq!(
+                    read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                    sent.to_ne_bytes()
+                );
+                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+            });
+
+            let faults = demand_paged.then(|| BackendFaults {
+                device: "_disk0".to_owned(),
+                handler: Arc::new(Unused),
+            });
+            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let mut negotiated = None;
+            let vu = VhostUserHandle::connect_vhost_user(
+                false,
+                socket_path.to_str().unwrap(),
+                1,
+                false,
+                &kill_evt,
+                faults.as_ref(),
+                |vu| {
+                    if demand_paged {
+                        negotiated = Some(vu.negotiate_features_vhost_user(
+                            protocol_features,
+                            VhostUserProtocolFeatures::MQ,
+                        )?);
+                        Ok(())
+                    } else {
+                        vu.set_protocol_features_vhost_user(protocol_features, mq | pagefault)
+                    }
+                },
+            )
+            .unwrap();
+            if demand_paged {
+                assert_eq!(negotiated, Some((protocol_features, mq)));
+            }
+            drop(vu);
+            backend.join().unwrap();
+        }
+    }
+
     #[test]
     fn restored_protocol_features_must_be_supported() {
         let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();

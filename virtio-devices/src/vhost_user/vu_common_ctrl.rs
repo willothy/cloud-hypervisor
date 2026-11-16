@@ -240,7 +240,13 @@ impl VhostUserHandle {
             return Err(Error::BackendServesNoFaults);
         }
 
-        Ok((acked_features, acked_protocol_features.bits()))
+        // PAGEFAULT belongs to this connection, not the device: a snapshot
+        // that carried it would require it of every backend the device is
+        // restored with, demand-paged or not.
+        Ok((
+            acked_features,
+            (acked_protocol_features - VhostUserProtocolFeatures::PAGEFAULT).bits(),
+        ))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -421,6 +427,10 @@ impl VhostUserHandle {
         acked_features: u64,
         mut acked_protocol_features: u64,
     ) -> Result<()> {
+        // PAGEFAULT is negotiated per connection, from whether guest RAM is
+        // demand-paged now, never from what was saved: a device hot-plugged
+        // while guest RAM was demand-paged by an earlier build saved it.
+        acked_protocol_features &= !VhostUserProtocolFeatures::PAGEFAULT.bits();
         if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
             let backend_protocol_features = self
                 .vu
@@ -430,9 +440,8 @@ impl VhostUserHandle {
             if unsupported != 0 {
                 return Err(Error::UnsupportedProtocolFeatures(unsupported));
             }
-            // A snapshot taken while guest RAM was not demand-paged did not
-            // negotiate PAGEFAULT; a demand-paged restore needs it of every
-            // backend that offers it, and refuses the rest below.
+            // A demand-paged restore needs PAGEFAULT of every backend that
+            // offers it, and refuses the rest below.
             if self.faults.is_some() {
                 acked_protocol_features |=
                     (backend_protocol_features & VhostUserProtocolFeatures::PAGEFAULT).bits();
