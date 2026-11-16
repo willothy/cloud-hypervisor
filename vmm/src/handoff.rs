@@ -19,7 +19,11 @@
 //! bytes of JSON, with file descriptors attached to the header bytes as
 //! `SCM_RIGHTS`. The VMM sends `Handoff` (type 1, at startup) and `Capture`
 //! (type 2, during a live checkpoint's paused phase) and reads
-//! `CaptureDone` (type 3) back.
+//! `CaptureDone` (type 3) back. While guest RAM is demand-paged, it also
+//! relays `BackendHandoff` (type 4): the userfaultfd a vhost-user backend
+//! registered over its own mapping of guest RAM, through the vhost-user
+//! postcopy flow, so that backend's first touch of a page not yet served
+//! faults to the handler instead of landing a zero page in guest RAM.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -27,10 +31,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process;
+use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
 
 use log::error;
 use serde::{Deserialize, Serialize};
+use virtio_devices::vhost_user::{BackendFaultHandler, BackendMapping};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -40,6 +46,8 @@ const MSG_HANDOFF: u32 = 1;
 const MSG_CAPTURE: u32 = 2;
 /// Header discriminant of a capture-done message.
 const MSG_CAPTURE_DONE: u32 = 3;
+/// Header discriminant of a backend-handoff message.
+const MSG_BACKEND_HANDOFF: u32 = 4;
 
 /// Wire size of the fixed message header.
 const HEADER_LEN: usize = 8;
@@ -51,7 +59,7 @@ const MAX_DONE_LEN: u32 = 1024 * 1024;
 
 /// The fault-handling modes guest RAM was registered with before the
 /// handoff.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RegistrationMode {
     /// Missing + write-protect: a demand-paged restore.
     MissingAndWriteProtect,
@@ -108,6 +116,22 @@ struct Capture {
     ranges: Vec<CaptureRange>,
 }
 
+/// One of a vhost-user backend's mappings of guest RAM: where it sits in the
+/// backend's address space and the range of this process's it maps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendRegion {
+    backend_addr: u64,
+    vmm_addr: u64,
+    length: u64,
+}
+
+/// The backend-handoff body: which device's backend, and its mappings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendHandoff {
+    device: String,
+    regions: Vec<BackendRegion>,
+}
+
 /// How a capture ended, reported by the peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum CaptureOutcome {
@@ -125,6 +149,11 @@ pub(crate) struct FaultSession {
     _hangup: HangupWatch,
     stream: UnixStream,
     uffd: OwnedFd,
+    mode: RegistrationMode,
+    /// Serializes whole messages onto the connection: captures are sent from
+    /// here, and backend handoffs from the [`BackendFaultRelay`]s of
+    /// vhost-user devices, which can connect at any time.
+    write: Arc<Mutex<()>>,
 }
 
 impl FaultSession {
@@ -150,7 +179,22 @@ impl FaultSession {
             _hangup: hangup,
             stream,
             uffd,
+            mode,
+            write: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// The relay vhost-user devices hand their backends' userfaultfds to,
+    /// when guest RAM is demand-paged through this session; `None` for a
+    /// write-protect-only session, whose guest RAM has nothing to serve.
+    pub(crate) fn backend_fault_relay(&self) -> io::Result<Option<BackendFaultRelay>> {
+        if self.mode != RegistrationMode::MissingAndWriteProtect {
+            return Ok(None);
+        }
+        Ok(Some(BackendFaultRelay {
+            stream: self.stream.try_clone()?,
+            write: Arc::clone(&self.write),
+        }))
     }
 
     /// The userfaultfd, for arming write-protection.
@@ -164,6 +208,10 @@ impl FaultSession {
     /// connection (see [`Self::wait_done`]).
     pub(crate) fn send_capture(&self, ranges: Vec<CaptureRange>, out: &File) -> io::Result<()> {
         let body = serde_json::to_vec(&Capture { ranges })?;
+        let _write = self
+            .write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         send_message(&self.stream, MSG_CAPTURE, &body, &[out.as_raw_fd()])
     }
 
@@ -200,6 +248,44 @@ impl FaultSession {
             CaptureOutcome::Success => Ok(Ok(())),
             CaptureOutcome::Failure { error } => Ok(Err(error)),
         }
+    }
+}
+
+/// Relays the userfaultfds of vhost-user backends to a demand-paged VM's
+/// fault handler, over the VM's fault session.
+pub(crate) struct BackendFaultRelay {
+    stream: UnixStream,
+    write: Arc<Mutex<()>>,
+}
+
+impl BackendFaultHandler for BackendFaultRelay {
+    fn adopt(
+        &self,
+        device: &str,
+        mappings: &[BackendMapping],
+        uffd: BorrowedFd<'_>,
+    ) -> io::Result<()> {
+        let body = serde_json::to_vec(&BackendHandoff {
+            device: device.to_owned(),
+            regions: mappings
+                .iter()
+                .map(|mapping| BackendRegion {
+                    backend_addr: mapping.backend_addr,
+                    vmm_addr: mapping.vmm_addr,
+                    length: mapping.length,
+                })
+                .collect(),
+        })?;
+        let _write = self
+            .write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        send_message(
+            &self.stream,
+            MSG_BACKEND_HANDOFF,
+            &body,
+            &[uffd.as_raw_fd()],
+        )
     }
 }
 

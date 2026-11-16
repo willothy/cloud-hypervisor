@@ -98,6 +98,7 @@ impl Blk {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        faults: Option<super::BackendFaults>,
     ) -> Result<Blk> {
         let num_queues = vu_cfg.num_queues;
 
@@ -107,6 +108,7 @@ impl Blk {
             num_queues as u64,
             false,
             &exit_evt,
+            faults.as_ref(),
             |_| Ok(()),
         )?;
 
@@ -218,6 +220,7 @@ impl Blk {
                     ..Default::default()
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
+                faults,
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,

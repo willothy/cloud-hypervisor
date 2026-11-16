@@ -33,6 +33,7 @@ use thiserror::Error;
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
 use virtio_devices::mem::Error as VirtioMemError;
+use virtio_devices::vhost_user::BackendFaultHandler;
 #[cfg(target_arch = "x86_64")]
 use vm_allocator::GsiApic;
 use vm_allocator::page_size::get_page_size;
@@ -1194,6 +1195,18 @@ impl MemoryManager {
         self.fault_session = Some(session);
         info!("UFFD restore: demand-paged restore handed to the fault handler");
         Ok(())
+    }
+
+    /// The fault handler vhost-user devices hand their backends'
+    /// userfaultfds to: `Some` while guest RAM is demand-paged through a
+    /// fault session, so every backend mapping guest RAM faults through the
+    /// handler as this process does.
+    pub fn backend_fault_handler(&self) -> Result<Option<Arc<dyn BackendFaultHandler>>, Error> {
+        let Some(session) = &self.fault_session else {
+            return Ok(None);
+        };
+        let relay = session.backend_fault_relay().map_err(Error::FaultSession)?;
+        Ok(relay.map(|relay| Arc::new(relay) as Arc<dyn BackendFaultHandler>))
     }
 
     /// Describe registered ranges for a userfaultfd handoff: each range's

@@ -85,6 +85,7 @@ impl Net {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        faults: Option<super::BackendFaults>,
         offload_tso: bool,
         offload_ufo: bool,
         offload_csum: bool,
@@ -97,6 +98,7 @@ impl Net {
             num_queues as u64,
             false,
             &exit_evt,
+            faults.as_ref(),
             |_| Ok(()),
         )?;
 
@@ -279,6 +281,7 @@ impl Net {
                     ..Default::default()
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
+                faults,
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,

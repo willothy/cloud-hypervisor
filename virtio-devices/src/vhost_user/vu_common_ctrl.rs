@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
-use super::{Error, Result, VhostUserState};
+use super::{BackendFaults, BackendMapping, Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
     GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
@@ -68,6 +69,16 @@ pub struct VhostUserHandle {
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<u16>,
     vring_bases: Option<Vec<u64>>,
+    /// Set while guest RAM is demand-paged: the backend must negotiate
+    /// `PAGEFAULT`, and every memory table it maps is registered with its
+    /// postcopy userfaultfd and handed to the fault handler before it can
+    /// touch guest RAM.
+    faults: Option<BackendFaults>,
+    /// Whether the backend negotiated `PAGEFAULT`.
+    serves_faults: bool,
+    /// The backend's postcopy userfaultfd on this connection, once advised
+    /// and listening.
+    postcopy_uffd: Option<Arc<File>>,
 }
 
 impl VhostUserHandle {
@@ -94,11 +105,62 @@ impl VhostUserHandle {
             regions.push(vhost_user_net_reg);
         }
 
+        if self.faults.is_some() {
+            return self.set_mem_table_postcopy(&regions);
+        }
+
         self.vu
             .set_mem_table(regions.as_slice())
             .map_err(Error::VhostUserSetMemTable)?;
 
         Ok(())
+    }
+
+    /// Give a backend serving faults its memory table the postcopy way: on
+    /// the connection's first table, open its userfaultfd and have it listen;
+    /// then send the table, hand the userfaultfd and the mappings the backend
+    /// reports to the fault handler, and only then acknowledge, which is
+    /// what lets the backend touch guest RAM.
+    fn set_mem_table_postcopy(&mut self, regions: &[VhostUserMemoryRegionInfo]) -> Result<()> {
+        let faults = self.faults.clone().ok_or(Error::BackendServesNoFaults)?;
+        if !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
+        let uffd = match &self.postcopy_uffd {
+            Some(uffd) => Arc::clone(uffd),
+            None => {
+                let uffd = Arc::new(
+                    self.vu
+                        .postcopy_advise()
+                        .map_err(Error::VhostUserPostcopyAdvise)?,
+                );
+                self.vu
+                    .postcopy_listen()
+                    .map_err(Error::VhostUserPostcopyListen)?;
+                self.postcopy_uffd = Some(Arc::clone(&uffd));
+                uffd
+            }
+        };
+        let bases = self
+            .vu
+            .set_mem_table_postcopy(regions)
+            .map_err(Error::VhostUserSetMemTable)?;
+        let mappings: Vec<BackendMapping> = regions
+            .iter()
+            .zip(bases)
+            .map(|(region, backend_addr)| BackendMapping {
+                backend_addr,
+                vmm_addr: region.userspace_addr,
+                length: region.memory_size,
+            })
+            .collect();
+        faults
+            .handler
+            .adopt(&faults.device, &mappings, uffd.as_fd())
+            .map_err(Error::AdoptBackendFaults)?;
+        self.vu
+            .postcopy_ack_mem_table()
+            .map_err(Error::VhostUserPostcopyAck)
     }
 
     pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {
@@ -126,6 +188,11 @@ impl VhostUserHandle {
         avail_protocol_features: VhostUserProtocolFeatures,
     ) -> Result<(u64, u64)> {
         let acked_features = avail_features & self.backend_features;
+        let avail_protocol_features = if self.faults.is_some() {
+            avail_protocol_features | VhostUserProtocolFeatures::PAGEFAULT
+        } else {
+            avail_protocol_features
+        };
 
         let acked_protocol_features =
             if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
@@ -152,6 +219,9 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features.bits());
+        if self.faults.is_some() && !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
 
         Ok((acked_features, acked_protocol_features.bits()))
     }
@@ -332,7 +402,7 @@ impl VhostUserHandle {
     pub fn set_protocol_features_vhost_user(
         &mut self,
         acked_features: u64,
-        acked_protocol_features: u64,
+        mut acked_protocol_features: u64,
     ) -> Result<()> {
         if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
             let backend_protocol_features = self
@@ -343,14 +413,23 @@ impl VhostUserHandle {
             if unsupported != 0 {
                 return Err(Error::UnsupportedProtocolFeatures(unsupported));
             }
+            // A snapshot taken while guest RAM was not demand-paged did not
+            // negotiate PAGEFAULT; a demand-paged restore needs it of every
+            // backend that offers it, and refuses the rest below.
+            if self.faults.is_some() {
+                acked_protocol_features |=
+                    (backend_protocol_features & VhostUserProtocolFeatures::PAGEFAULT).bits();
+                if acked_protocol_features & VhostUserProtocolFeatures::PAGEFAULT.bits() == 0 {
+                    return Err(Error::BackendServesNoFaults);
+                }
+            }
 
-            let acked_protocol_features =
-                VhostUserProtocolFeatures::from_bits_truncate(acked_protocol_features);
+            let acked = VhostUserProtocolFeatures::from_bits_truncate(acked_protocol_features);
             self.vu
-                .set_protocol_features(acked_protocol_features)
+                .set_protocol_features(acked)
                 .map_err(Error::VhostUserSetProtocolFeatures)?;
 
-            if acked_protocol_features.contains(VhostUserProtocolFeatures::REPLY_ACK) {
+            if acked.contains(VhostUserProtocolFeatures::REPLY_ACK) {
                 self.vu.set_hdr_flags(VhostUserHeaderFlag::NEED_REPLY);
             }
         } else if acked_protocol_features != 0 {
@@ -358,6 +437,9 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features);
+        if self.faults.is_some() && !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
 
         Ok(())
     }
@@ -416,6 +498,7 @@ impl VhostUserHandle {
         num_queues: u64,
         unlink_socket: bool,
         kill_evt: &EventFd,
+        faults: Option<&BackendFaults>,
         mut initialize: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<Self> {
         if server {
@@ -439,6 +522,9 @@ impl VhostUserHandle {
                 vrings_info: None,
                 queue_indexes: Vec::new(),
                 vring_bases: None,
+                faults: faults.cloned(),
+                serves_faults: false,
+                postcopy_uffd: None,
             };
             vhost_user
                 .vu
@@ -498,6 +584,9 @@ impl VhostUserHandle {
                         vrings_info: None,
                         queue_indexes: Vec::new(),
                         vring_bases: None,
+                        faults: faults.cloned(),
+                        serves_faults: false,
+                        postcopy_uffd: None,
                     })
                     .map_err(Error::VhostUserConnect);
 
@@ -607,6 +696,8 @@ impl VhostUserHandle {
             && acked_protocol_features & VhostUserProtocolFeatures::LOG_SHMFD.bits() != 0;
         self.supports_device_state =
             acked_protocol_features & VhostUserProtocolFeatures::DEVICE_STATE.bits() != 0;
+        self.serves_faults =
+            acked_protocol_features & VhostUserProtocolFeatures::PAGEFAULT.bits() != 0;
     }
 
     pub fn supports_device_state(&self) -> bool {
