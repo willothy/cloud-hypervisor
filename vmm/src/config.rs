@@ -427,6 +427,9 @@ pub enum ValidationError {
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
+    /// A fault socket serves pages only to the on-demand restore mode
+    #[error("'memory_fault_socket' requires 'memory_restore_mode=ondemand'")]
+    InvalidRestoreFaultSocketWithoutOnDemand,
     /// Postcopy and on-demand restore are not supported with some devices
     #[error("Postcopy and on-demand restore are not supported with {0} devices")]
     PostcopyIncompatibleDevice(String),
@@ -3129,6 +3132,12 @@ impl RestoreConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode != MemoryRestoreMode::Copy && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
+        }
+
+        if self.memory_restore_mode != MemoryRestoreMode::OnDemand
+            && self.restore_fault_socket.is_some()
+        {
+            return Err(ValidationError::InvalidRestoreFaultSocketWithoutOnDemand);
         }
 
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand {
@@ -5975,6 +5984,25 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_cow_prefault.validate(&snapshot_vm_config),
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
+
+        // A fault socket is only for the on-demand restore mode.
+        for memory_restore_mode in [MemoryRestoreMode::Copy, MemoryRestoreMode::CopyOnWrite] {
+            let invalid_fault_socket = RestoreConfig {
+                restore_fault_socket: Some(PathBuf::from("/path/to/fault.sock")),
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode,
+                net_fds: None,
+                vfio_fds: None,
+                iommufd_fd: None,
+                resume: false,
+                zone_updates: vec![],
+            };
+            assert_eq!(
+                invalid_fault_socket.validate(&snapshot_vm_config),
+                Err(ValidationError::InvalidRestoreFaultSocketWithoutOnDemand)
+            );
+        }
     }
 
     #[test]
