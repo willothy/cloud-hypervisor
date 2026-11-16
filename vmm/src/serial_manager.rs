@@ -89,6 +89,9 @@ pub(crate) enum EpollDispatch {
     File = 0,
     Kill = 1,
     Socket = 2,
+    /// The socket console's client can take more output: its writable fd,
+    /// registered edge-triggered for EPOLLOUT.
+    Writable = 3,
     Unknown,
 }
 const EPOLL_EVENTS_LEN: usize = 4;
@@ -100,6 +103,7 @@ impl From<u64> for EpollDispatch {
             0 => File,
             1 => Kill,
             2 => Socket,
+            3 => Writable,
             _ => Unknown,
         }
     }
@@ -340,6 +344,19 @@ impl SerialManager {
                                                 ),
                                             )
                                             .map_err(Error::Epoll)?;
+                                            if let Some(fd) = console.writable_fd() {
+                                                epoll::ctl(
+                                                    epoll_fd.as_raw_fd(),
+                                                    epoll::ControlOptions::EPOLL_CTL_DEL,
+                                                    fd,
+                                                    epoll::Event::new(
+                                                        epoll::Events::EPOLLOUT
+                                                            | epoll::Events::EPOLLET,
+                                                        EpollDispatch::Writable as u64,
+                                                    ),
+                                                )
+                                                .map_err(Error::Epoll)?;
+                                            }
                                             console
                                                 .shutdown()
                                                 .map_err(Error::ShutdownConnection)?;
@@ -359,6 +376,28 @@ impl SerialManager {
                                             )
                                             .map_err(Error::Epoll)?;
                                         }
+                                        if let Some(fd) = console.writable_fd() {
+                                            epoll::ctl(
+                                                epoll_fd.as_raw_fd(),
+                                                epoll::ControlOptions::EPOLL_CTL_ADD,
+                                                fd,
+                                                epoll::Event::new(
+                                                    epoll::Events::EPOLLOUT
+                                                        | epoll::Events::EPOLLET,
+                                                    EpollDispatch::Writable as u64,
+                                                ),
+                                            )
+                                            .map_err(Error::Epoll)?;
+                                        }
+                                    }
+                                }
+                                EpollDispatch::Writable => {
+                                    if let Some(console) = socket_console.as_ref()
+                                        && let Err(e) = console.flush_output()
+                                    {
+                                        warn!(
+                                            "Error flushing the serial console to its client: {e}"
+                                        );
                                     }
                                 }
                                 EpollDispatch::File => {
