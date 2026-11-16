@@ -102,6 +102,10 @@ pub enum Error {
     VhostUserPostcopyAck(#[source] VhostError),
     #[error("Handing the backend's userfaultfd to the fault handler failed")]
     AdoptBackendFaults(#[source] io::Error),
+    #[error(
+        "Memory cannot be hot-plugged while guest RAM is demand-paged: the backend serves faults only on the memory tables the fault handler adopted"
+    )]
+    MemoryHotplugWhileDemandPaged,
     #[error("Set vring num failed")]
     VhostUserSetVringNum(#[source] VhostError),
     #[error("Set vring addr failed")]
@@ -743,6 +747,12 @@ impl VhostUserCommon {
         &mut self,
         region: &Arc<GuestRegionMmap>,
     ) -> result::Result<(), crate::Error> {
+        // A backend listening for postcopy cannot take ADD_MEM_REG, and
+        // nothing would serve its faults on the region anyway.
+        if self.faults.is_some() {
+            return Err(self.memory_update_error(Error::MemoryHotplugWhileDemandPaged));
+        }
+
         if self.disconnected.load(Ordering::Relaxed) {
             warn!(
                 "Skipping add memory region on disconnected dev with socket: {}",
@@ -1299,6 +1309,52 @@ mod tests {
             }
             drop(vu);
             backend.join().unwrap();
+        }
+    }
+
+    /// Memory hot-plug is refused up front while guest RAM is demand-paged,
+    /// with or without CONFIGURE_MEM_SLOTS, before anything reaches the
+    /// backend.
+    #[test]
+    fn memory_hotplug_is_refused_while_demand_paged() {
+        struct Unused;
+        impl BackendFaultHandler for Unused {
+            fn adopt(
+                &self,
+                _: &str,
+                _: u64,
+                _: &[BackendMapping],
+                _: Option<BorrowedFd<'_>>,
+            ) -> io::Result<()> {
+                Err(io::Error::other("no memory table is sent"))
+            }
+        }
+
+        let region = Arc::new(
+            GuestRegionMmap::new(
+                crate::MmapRegion::new(0x1000).unwrap(),
+                GuestAddress(0x1_0000_0000),
+            )
+            .unwrap(),
+        );
+        for acked_protocol_features in [0, VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits()] {
+            let mut common = VhostUserCommon {
+                acked_protocol_features,
+                faults: Some(BackendFaults {
+                    device: "_disk0".to_owned(),
+                    handler: Arc::new(Unused),
+                }),
+                ..Default::default()
+            };
+            match common.add_memory_region(&region) {
+                Err(crate::Error::VhostUserUpdateMemory(Error::MemoryHotplugWhileDemandPaged)) => {
+                    assert_eq!(acked_protocol_features, 0);
+                }
+                Err(crate::Error::VhostUserAddMemoryRegion(
+                    Error::MemoryHotplugWhileDemandPaged,
+                )) => assert_ne!(acked_protocol_features, 0),
+                other => panic!("unexpected hot-plug result: {other:?}"),
+            }
         }
     }
 
