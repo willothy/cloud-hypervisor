@@ -233,7 +233,7 @@ fn virtio_vhost_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_socket, create_socket_seccomp_rule()),
-        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_socketpair, create_socket_seccomp_rule()),
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
@@ -251,7 +251,7 @@ fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_socket, create_socket_seccomp_rule()),
-        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_socketpair, create_socket_seccomp_rule()),
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
@@ -275,7 +275,7 @@ fn virtio_vhost_net_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_socket, create_socket_seccomp_rule()),
-        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_socketpair, create_socket_seccomp_rule()),
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
         #[cfg(target_arch = "x86_64")]
@@ -294,7 +294,7 @@ fn virtio_vhost_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_recvmsg, vec![]),
         (libc::SYS_sendmsg, vec![]),
         (libc::SYS_socket, create_socket_seccomp_rule()),
-        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_socketpair, create_socket_seccomp_rule()),
         (libc::SYS_timerfd_create, vec![]),
         (libc::SYS_timerfd_settime, vec![]),
     ]
@@ -430,5 +430,42 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every vhost-user worker thread can relay its backend's userfaultfd
+    /// to the fault handler when it reconnects on a demand-paged VM: the
+    /// relay's page-size probe, verdict socketpair, framed sends and reads,
+    /// and closes are all allowed.
+    #[test]
+    fn vhost_user_workers_can_relay_backend_faults() {
+        for (name, thread) in [
+            ("vhost-user-block", Thread::VirtioVhostBlock),
+            ("vhost-user-fs", Thread::VirtioVhostFs),
+            ("generic vhost-user", Thread::VirtioGenericVhostUser),
+            ("vhost-user-net", Thread::VirtioVhostNet),
+        ] {
+            let allowed: Vec<i64> = get_seccomp_rules(thread)
+                .into_iter()
+                .map(|(syscall, _)| syscall)
+                .collect();
+            for syscall in [
+                libc::SYS_close,
+                libc::SYS_fstatfs,
+                libc::SYS_futex,
+                libc::SYS_recvmsg,
+                libc::SYS_sendmsg,
+                libc::SYS_socketpair,
+            ] {
+                assert!(
+                    allowed.contains(&syscall),
+                    "the {name} worker cannot make syscall {syscall} on the backend fault relay"
+                );
+            }
+        }
     }
 }
