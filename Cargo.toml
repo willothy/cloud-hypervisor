@@ -176,4 +176,4 @@ unreachable_pub = "deny"
 # it mapped each region) that demand-paged restores with vhost-user devices
 # need, which upstream vhost does not implement.
 [patch.crates-io]
-vhost = { git = "https://github.com/willothy/vhost", rev = "ec4829405b8964f2b69b312c06fbd603e8f1162e" }
+vhost = { git = "https://github.com/willothy/vhost", rev = "9d6009726459c4c94501d13228ae4dd8681a1bd7" }
