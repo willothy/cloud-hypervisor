@@ -765,6 +765,7 @@ fn vmm_thread_rules(
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_fdatasync, vec![]),
         (libc::SYS_fstat, vec![]),
+        (libc::SYS_fstatfs, vec![]),
         (libc::SYS_fsync, vec![]),
         (libc::SYS_ftruncate, vec![]),
         #[cfg(target_arch = "aarch64")]
