@@ -83,6 +83,7 @@ impl Fs {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        faults: Option<super::BackendFaults>,
     ) -> Result<Fs> {
         // Calculate the actual number of queues needed.
         let num_queues = NUM_QUEUE_OFFSET + req_num_queues;
@@ -94,6 +95,7 @@ impl Fs {
             num_queues as u64,
             false,
             &exit_evt,
+            faults.as_ref(),
             |_| Ok(()),
         )?;
 
@@ -198,6 +200,7 @@ impl Fs {
                     ..Default::default()
                 },
                 vu: Some(Arc::new(Mutex::new(vu))),
+                faults,
                 acked_protocol_features,
                 socket_path: path.to_string(),
                 vu_num_queues,

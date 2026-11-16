@@ -33,6 +33,7 @@ use thiserror::Error;
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
 use virtio_devices::mem::Error as VirtioMemError;
+use virtio_devices::vhost_user::BackendFaultHandler;
 #[cfg(target_arch = "x86_64")]
 use vm_allocator::GsiApic;
 use vm_allocator::page_size::get_page_size;
@@ -406,6 +407,11 @@ pub enum Error {
     /// backed by user defined memory regions.
     #[error("Impossible to resize guest memory if it is backed by user defined memory regions")]
     InvalidResizeWithMemoryZones,
+
+    /// Forbidden operation. ACPI memory hot-plug is not supported while
+    /// guest RAM is demand-paged.
+    #[error("ACPI memory hot-plug is not supported while guest RAM is demand-paged")]
+    HotplugWhileDemandPaged,
 
     /// Forbidden operation. Impossible to resize guest memory below the boot
     /// RAM as it is not removable with virtio-mem.
@@ -1194,6 +1200,18 @@ impl MemoryManager {
         self.fault_session = Some(session);
         info!("UFFD restore: demand-paged restore handed to the fault handler");
         Ok(())
+    }
+
+    /// The fault handler vhost-user devices hand their backends'
+    /// userfaultfds to: `Some` while guest RAM is demand-paged through a
+    /// fault session, so every backend mapping guest RAM faults through the
+    /// handler as this process does.
+    pub fn backend_fault_handler(&self) -> Result<Option<Arc<dyn BackendFaultHandler>>, Error> {
+        let Some(session) = &self.fault_session else {
+            return Ok(None);
+        };
+        let relay = session.backend_fault_relay().map_err(Error::FaultSession)?;
+        Ok(relay.map(|relay| Arc::new(relay) as Arc<dyn BackendFaultHandler>))
     }
 
     /// Describe registered ranges for a userfaultfd handoff: each range's
@@ -3612,6 +3630,20 @@ impl MemoryManager {
                     if !self.dynamic {
                         return Ok(region);
                     }
+                    // Demand paging hands the fault handler a fixed guest
+                    // memory layout, and a hot-plugged region reaches
+                    // vhost-user backends only through a memory update the
+                    // postcopy flow does not serve. So a demand-paged VM
+                    // takes no hot-plug, refused here before the region
+                    // exists: refused by each device afterwards, it would
+                    // leave the VM half-resized.
+                    if self
+                        .fault_session
+                        .as_ref()
+                        .is_some_and(FaultSession::demand_paged)
+                    {
+                        return Err(Error::HotplugWhileDemandPaged);
+                    }
 
                     region =
                         Some(self.hotplug_ram_region((desired_ram - self.current_ram) as usize)?);
@@ -4683,6 +4715,66 @@ mod tests {
     use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
     use super::*;
+
+    /// While guest RAM is demand-paged, an ACPI memory hot-plug is refused
+    /// before any region is created or the RAM size changes.
+    #[test]
+    fn acpi_hotplug_is_refused_while_demand_paged() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        use hypervisor::HypervisorVmConfig;
+        use vmm_sys_util::tempdir::TempDir;
+
+        const MIB: u64 = 1 << 20;
+        // A demand-paged fault session with a stand-in handler. The handler's
+        // end is declared first, so it is dropped last and outlives the
+        // session even when an assertion unwinds: the session's hang-up
+        // watch never fires.
+        let _handler: UnixStream;
+        let dir = TempDir::new_with_prefix("/tmp/fault-session-").unwrap();
+        let socket = dir.as_path().join("fault.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let uffd_stand_in = OwnedFd::from(tempfile::tempfile().unwrap());
+        let session = FaultSession::establish(
+            &socket,
+            handoff::RegistrationMode::MissingAndWriteProtect,
+            Vec::new(),
+            uffd_stand_in,
+            &[],
+        )
+        .unwrap();
+        _handler = listener.accept().unwrap().0;
+
+        let hv = hypervisor::new().unwrap();
+        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let config = MemoryConfig {
+            size: 128 * MIB,
+            hotplug_method: HotplugMethod::Acpi,
+            hotplug_size: Some(128 * MIB),
+            ..Default::default()
+        };
+        let mm = MemoryManager::new(
+            vm,
+            &config,
+            None,
+            40,
+            #[cfg(feature = "tdx")]
+            false,
+            None,
+            Default::default(),
+        )
+        .unwrap();
+
+        let mut mm = mm.lock().unwrap();
+        mm.fault_session = Some(session);
+        let regions = mm.guest_memory().memory().num_regions();
+        assert!(matches!(
+            mm.resize(256 * MIB),
+            Err(Error::HotplugWhileDemandPaged)
+        ));
+        assert_eq!(mm.guest_memory().memory().num_regions(), regions);
+        assert_eq!(mm.current_ram, 128 * MIB);
+    }
 
     struct RecordingUffdMemorySource {
         attempts: Arc<Mutex<Vec<(u64, u64)>>>,

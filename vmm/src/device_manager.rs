@@ -2822,6 +2822,25 @@ impl DeviceManager {
 
         Ok(())
     }
+    /// How the backend of vhost-user device `id` serves faults: through the
+    /// VM's fault handler while guest RAM is demand-paged, so a backend
+    /// touching a page not yet served faults instead of reading zeros.
+    fn vhost_user_backend_faults(
+        &self,
+        id: &str,
+    ) -> DeviceManagerResult<Option<vhost_user::BackendFaults>> {
+        let handler = self
+            .memory_manager
+            .lock()
+            .unwrap()
+            .backend_fault_handler()
+            .map_err(DeviceManagerError::MemoryManager)?;
+        Ok(handler.map(|handler| vhost_user::BackendFaults {
+            device: id.to_owned(),
+            handler,
+        }))
+    }
+
     /// Creates a [`MetaVirtioDevice`] from the provided [`DiskConfig`].
     ///
     /// Depending on the config, this is a [`vhost_user::Blk`] device or a [`virtio_devices::Block`]
@@ -2870,6 +2889,7 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    self.vhost_user_backend_faults(&id)?,
                 ) {
                     Ok(vub_device) => vub_device,
                     Err(e) => {
@@ -3076,6 +3096,7 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    self.vhost_user_backend_faults(&id)?,
                     net_cfg.offload_tso,
                     net_cfg.offload_ufo,
                     net_cfg.offload_csum,
@@ -3337,6 +3358,7 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    self.vhost_user_backend_faults(&id)?,
                 )
                 .map_err(DeviceManagerError::CreateGenericVhostUser)?,
             ));
@@ -3408,6 +3430,7 @@ impl DeviceManager {
                     self.force_access_platform,
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    self.vhost_user_backend_faults(&id)?,
                 )
                 .map_err(DeviceManagerError::CreateVirtioFs)?,
             ));

@@ -3,10 +3,12 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
+use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{ffi, fs, io, slice};
 
@@ -33,7 +35,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
-use super::{Error, Result, VhostUserState};
+use super::{BackendFaults, BackendMapping, Error, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
     GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
@@ -42,6 +44,11 @@ use crate::{
 
 // Size of a dirty page for vhost-user.
 const VHOST_LOG_PAGE: u64 = 0x1000;
+
+/// The id the next vhost-user connection to open a postcopy userfaultfd
+/// takes, naming it to the [`super::BackendFaultHandler`] for the life of
+/// the process.
+static NEXT_POSTCOPY_CONNECTION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
@@ -68,6 +75,17 @@ pub struct VhostUserHandle {
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<u16>,
     vring_bases: Option<Vec<u64>>,
+    /// Set while guest RAM is demand-paged: the backend must negotiate
+    /// `PAGEFAULT`, and every memory table it maps is registered with its
+    /// postcopy userfaultfd and handed to the fault handler before it can
+    /// touch guest RAM.
+    faults: Option<BackendFaults>,
+    /// Whether the backend negotiated `PAGEFAULT`.
+    serves_faults: bool,
+    /// The id this connection's backend userfaultfd was handed to the fault
+    /// handler under, once the backend advised it, listens, and the handler
+    /// adopted its first memory table.
+    postcopy_connection: Option<u64>,
 }
 
 impl VhostUserHandle {
@@ -94,11 +112,101 @@ impl VhostUserHandle {
             regions.push(vhost_user_net_reg);
         }
 
+        if let Some(faults) = self.faults.clone() {
+            return self.set_mem_table_postcopy(&faults, &regions);
+        }
+
         self.vu
             .set_mem_table(regions.as_slice())
             .map_err(Error::VhostUserSetMemTable)?;
 
         Ok(())
+    }
+
+    /// Give a backend serving faults its memory table the postcopy way: on
+    /// the connection's first table, open its userfaultfd and have it listen;
+    /// then send the table, hand the mappings the backend reports (and, the
+    /// first time, its userfaultfd) to the fault handler, and only once the
+    /// handler has adopted them acknowledge, which is what lets the backend
+    /// touch guest RAM. A table the handler refuses fails the connection.
+    fn set_mem_table_postcopy(
+        &mut self,
+        faults: &BackendFaults,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<()> {
+        if !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
+        let uffd = match self.postcopy_connection {
+            Some(_) => None,
+            None => {
+                let uffd = self
+                    .vu
+                    .postcopy_advise()
+                    .map_err(Error::VhostUserPostcopyAdvise)?;
+                self.vu
+                    .postcopy_listen()
+                    .map_err(Error::VhostUserPostcopyListen)?;
+                Some(uffd)
+            }
+        };
+        let bases = self
+            .vu
+            .set_mem_table_postcopy(regions)
+            .map_err(Error::VhostUserSetMemTable)?;
+        let mappings = regions
+            .iter()
+            .zip(bases)
+            .map(|(region, backend_addr)| {
+                Ok(BackendMapping {
+                    backend_addr,
+                    vmm_addr: region.userspace_addr,
+                    length: region.memory_size,
+                    page_size: Self::backing_page_size(region.mmap_handle)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let connection = self
+            .postcopy_connection
+            .unwrap_or_else(|| NEXT_POSTCOPY_CONNECTION.fetch_add(1, Ordering::Relaxed));
+        faults
+            .handler
+            .adopt(
+                &faults.device,
+                connection,
+                &mappings,
+                uffd.as_ref().map(|uffd| uffd.as_fd()),
+            )
+            .map_err(Error::AdoptBackendFaults)?;
+        self.postcopy_connection = Some(connection);
+        self.vu
+            .postcopy_ack_mem_table()
+            .map_err(Error::VhostUserPostcopyAck)
+    }
+
+    /// The page size of the guest memory backed by the file `fd`: the huge
+    /// page size on hugetlbfs, which reports it as the block size, else the
+    /// base page size.
+    fn backing_page_size(fd: RawFd) -> Result<u64> {
+        /// `HUGETLBFS_MAGIC` from linux/magic.h.
+        const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
+        let mut statfs = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fstatfs fills the statfs it is given for a valid fd.
+        if unsafe { libc::fstatfs(fd, statfs.as_mut_ptr()) } != 0 {
+            return Err(Error::BackingPageSize(io::Error::last_os_error()));
+        }
+        // SAFETY: fstatfs succeeded, so it initialized the struct.
+        let statfs = unsafe { statfs.assume_init() };
+        // The field types differ between glibc and musl.
+        #[allow(clippy::unnecessary_cast)]
+        if statfs.f_type as u64 == HUGETLBFS_MAGIC {
+            return Ok(statfs.f_bsize as u64);
+        }
+        // SAFETY: sysconf reads a system constant.
+        match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            size if size > 0 => Ok(size as u64),
+            _ => Err(Error::BackingPageSize(io::Error::last_os_error())),
+        }
     }
 
     pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {
@@ -126,6 +234,11 @@ impl VhostUserHandle {
         avail_protocol_features: VhostUserProtocolFeatures,
     ) -> Result<(u64, u64)> {
         let acked_features = avail_features & self.backend_features;
+        let avail_protocol_features = if self.faults.is_some() {
+            avail_protocol_features | VhostUserProtocolFeatures::PAGEFAULT
+        } else {
+            avail_protocol_features
+        };
 
         let acked_protocol_features =
             if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
@@ -152,8 +265,17 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features.bits());
+        if self.faults.is_some() && !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
 
-        Ok((acked_features, acked_protocol_features.bits()))
+        // PAGEFAULT belongs to this connection, not the device: a snapshot
+        // that carried it would require it of every backend the device is
+        // restored with, demand-paged or not.
+        Ok((
+            acked_features,
+            (acked_protocol_features - VhostUserProtocolFeatures::PAGEFAULT).bits(),
+        ))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -332,8 +454,12 @@ impl VhostUserHandle {
     pub fn set_protocol_features_vhost_user(
         &mut self,
         acked_features: u64,
-        acked_protocol_features: u64,
+        mut acked_protocol_features: u64,
     ) -> Result<()> {
+        // PAGEFAULT is negotiated per connection, from whether guest RAM is
+        // demand-paged now, never from what was saved: a device hot-plugged
+        // while guest RAM was demand-paged by an earlier build saved it.
+        acked_protocol_features &= !VhostUserProtocolFeatures::PAGEFAULT.bits();
         if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
             let backend_protocol_features = self
                 .vu
@@ -343,14 +469,22 @@ impl VhostUserHandle {
             if unsupported != 0 {
                 return Err(Error::UnsupportedProtocolFeatures(unsupported));
             }
+            // A demand-paged restore needs PAGEFAULT of every backend that
+            // offers it, and refuses the rest below.
+            if self.faults.is_some() {
+                acked_protocol_features |=
+                    (backend_protocol_features & VhostUserProtocolFeatures::PAGEFAULT).bits();
+                if acked_protocol_features & VhostUserProtocolFeatures::PAGEFAULT.bits() == 0 {
+                    return Err(Error::BackendServesNoFaults);
+                }
+            }
 
-            let acked_protocol_features =
-                VhostUserProtocolFeatures::from_bits_truncate(acked_protocol_features);
+            let acked = VhostUserProtocolFeatures::from_bits_truncate(acked_protocol_features);
             self.vu
-                .set_protocol_features(acked_protocol_features)
+                .set_protocol_features(acked)
                 .map_err(Error::VhostUserSetProtocolFeatures)?;
 
-            if acked_protocol_features.contains(VhostUserProtocolFeatures::REPLY_ACK) {
+            if acked.contains(VhostUserProtocolFeatures::REPLY_ACK) {
                 self.vu.set_hdr_flags(VhostUserHeaderFlag::NEED_REPLY);
             }
         } else if acked_protocol_features != 0 {
@@ -358,6 +492,9 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features);
+        if self.faults.is_some() && !self.serves_faults {
+            return Err(Error::BackendServesNoFaults);
+        }
 
         Ok(())
     }
@@ -416,6 +553,7 @@ impl VhostUserHandle {
         num_queues: u64,
         unlink_socket: bool,
         kill_evt: &EventFd,
+        faults: Option<&BackendFaults>,
         mut initialize: impl FnMut(&mut Self) -> Result<()>,
     ) -> Result<Self> {
         if server {
@@ -439,6 +577,9 @@ impl VhostUserHandle {
                 vrings_info: None,
                 queue_indexes: Vec::new(),
                 vring_bases: None,
+                faults: faults.cloned(),
+                serves_faults: false,
+                postcopy_connection: None,
             };
             vhost_user
                 .vu
@@ -498,6 +639,9 @@ impl VhostUserHandle {
                         vrings_info: None,
                         queue_indexes: Vec::new(),
                         vring_bases: None,
+                        faults: faults.cloned(),
+                        serves_faults: false,
+                        postcopy_connection: None,
                     })
                     .map_err(Error::VhostUserConnect);
 
@@ -607,6 +751,8 @@ impl VhostUserHandle {
             && acked_protocol_features & VhostUserProtocolFeatures::LOG_SHMFD.bits() != 0;
         self.supports_device_state =
             acked_protocol_features & VhostUserProtocolFeatures::DEVICE_STATE.bits() != 0;
+        self.serves_faults =
+            acked_protocol_features & VhostUserProtocolFeatures::PAGEFAULT.bits() != 0;
     }
 
     pub fn supports_device_state(&self) -> bool {

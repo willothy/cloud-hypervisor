@@ -4,6 +4,7 @@
 use std::fs::{File, remove_file};
 use std::io::ErrorKind;
 use std::ops::Deref;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -89,6 +90,24 @@ pub enum Error {
     VhostUserSetProtocolFeatures(#[source] VhostError),
     #[error("Set mem table failed")]
     VhostUserSetMemTable(#[source] VhostError),
+    #[error(
+        "Guest RAM is demand-paged, but the backend did not negotiate PAGEFAULT, so its accesses would bypass the fault handler"
+    )]
+    BackendServesNoFaults,
+    #[error("Opening the backend's postcopy userfaultfd failed")]
+    VhostUserPostcopyAdvise(#[source] VhostError),
+    #[error("Telling the backend to register guest RAM with its userfaultfd failed")]
+    VhostUserPostcopyListen(#[source] VhostError),
+    #[error("Acknowledging the backend's postcopy memory table failed")]
+    VhostUserPostcopyAck(#[source] VhostError),
+    #[error("Handing the backend's userfaultfd to the fault handler failed")]
+    AdoptBackendFaults(#[source] io::Error),
+    #[error("Reading the page size of a guest memory region's backing failed")]
+    BackingPageSize(#[source] io::Error),
+    #[error(
+        "Memory cannot be hot-plugged while guest RAM is demand-paged: the backend serves faults only on the memory tables the fault handler adopted"
+    )]
+    MemoryHotplugWhileDemandPaged,
     #[error("Set vring num failed")]
     VhostUserSetVringNum(#[source] VhostError),
     #[error("Set vring addr failed")]
@@ -226,11 +245,64 @@ impl Error {
             | Error::VhostUserSetInflight(e)
             | Error::VhostUserSetLogBase(e)
             | Error::VhostUserSetDeviceStateFd(e)
-            | Error::VhostUserCheckDeviceState(e) => vhost_error_is_transport_lost(e),
+            | Error::VhostUserCheckDeviceState(e)
+            | Error::VhostUserPostcopyAdvise(e)
+            | Error::VhostUserPostcopyListen(e)
+            | Error::VhostUserPostcopyAck(e) => vhost_error_is_transport_lost(e),
             Error::FrontendReqHandlerCreation(e) => vhost_user_error_is_transport_lost(e),
             _ => false,
         }
     }
+}
+
+/// One of a vhost-user backend's mappings of guest RAM, as its postcopy
+/// memory table reply reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendMapping {
+    /// Where the backend mapped the region, in its address space.
+    pub backend_addr: u64,
+    /// Where this process maps the same region.
+    pub vmm_addr: u64,
+    /// The region's length in bytes.
+    pub length: u64,
+    /// The page size of the region's backing: a huge page size on
+    /// hugetlbfs, else the base page size.
+    pub page_size: u64,
+}
+
+/// Serves the faults vhost-user backends take on their own mappings of guest
+/// RAM while it is demand-paged. A backend maps guest RAM outside the
+/// VMM's userfaultfd, and its first touch of a page not yet served would
+/// land a zero page in guest RAM that no later fault replaces, so each
+/// backend registers its mappings with a userfaultfd of its own (the
+/// vhost-user postcopy `PAGEFAULT` flow) and that userfaultfd is handed here.
+pub trait BackendFaultHandler: Send + Sync {
+    /// Serve the faults `device`'s backend takes on `mappings`, the
+    /// memory table it mapped on vhost-user connection `connection`, an id
+    /// unique within this process. `uffd`, the userfaultfd the backend
+    /// registers every mapping on that connection with, is passed with the
+    /// connection's first table only; a later table on the same connection
+    /// adds its mappings to that userfaultfd's. Returns once the handler
+    /// serves the mappings, or with its reason for refusing them, before
+    /// which the backend must not be let touch guest RAM.
+    fn adopt(
+        &self,
+        device: &str,
+        connection: u64,
+        mappings: &[BackendMapping],
+        uffd: Option<BorrowedFd<'_>>,
+    ) -> io::Result<()>;
+}
+
+/// A vhost-user device's backend faulting through a [`BackendFaultHandler`]:
+/// set while guest RAM is demand-paged, for the device's whole life, since
+/// every reconnect maps guest RAM afresh.
+#[derive(Clone)]
+pub struct BackendFaults {
+    /// The device id the handler names the backend by.
+    pub device: String,
+    /// The handler the backend's memory tables are handed to.
+    pub handler: Arc<dyn BackendFaultHandler>,
 }
 
 pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
@@ -268,6 +340,8 @@ pub struct VhostUserEpollHandler<S: VhostUserFrontendReqHandler> {
     /// Flag set by the worker when the vhost-user backend is no longer reachable.
     pub disconnected: Arc<AtomicBool>,
     pub resume_evt: EventFd,
+    /// Carried to every reconnection: see [`VhostUserCommon::faults`].
+    pub faults: Option<BackendFaults>,
 }
 
 impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
@@ -325,6 +399,7 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             self.queues.len() as u64,
             true,
             &self.kill_evt,
+            self.faults.as_ref(),
             |vhost_user| {
                 vhost_user.reinitialize_vhost_user(
                     self.mem.memory().deref(),
@@ -474,6 +549,9 @@ pub struct VhostUserCommon {
     saved_dirty_log: Option<MemoryRangeTable>,
     dirty_logging: bool,
     resume_evt: Option<EventFd>,
+    /// Set while guest RAM is demand-paged: the backend faults through the
+    /// handler, on every connection.
+    pub faults: Option<BackendFaults>,
 }
 
 impl VhostUserCommon {
@@ -561,6 +639,7 @@ impl VhostUserCommon {
             inflight,
             disconnected: Arc::clone(&self.disconnected),
             resume_evt,
+            faults: self.faults.clone(),
         })
     }
 
@@ -674,6 +753,12 @@ impl VhostUserCommon {
         &mut self,
         region: &Arc<GuestRegionMmap>,
     ) -> result::Result<(), crate::Error> {
+        // A backend listening for postcopy cannot take ADD_MEM_REG, and
+        // nothing would serve its faults on the region anyway.
+        if self.faults.is_some() {
+            return Err(self.memory_update_error(Error::MemoryHotplugWhileDemandPaged));
+        }
+
         if self.disconnected.load(Ordering::Relaxed) {
             warn!(
                 "Skipping add memory region on disconnected dev with socket: {}",
@@ -912,6 +997,21 @@ mod tests {
     use crate::vsock::tests::NoopVirtioInterrupt;
     use crate::{VIRTIO_F_ACCESS_PLATFORM, VirtioDevice};
 
+    /// A fault handler for tests whose backends never get a memory table.
+    struct Unused;
+
+    impl BackendFaultHandler for Unused {
+        fn adopt(
+            &self,
+            _: &str,
+            _: u64,
+            _: &[BackendMapping],
+            _: Option<BorrowedFd<'_>>,
+        ) -> io::Result<()> {
+            Err(io::Error::other("no memory table is sent"))
+        }
+    }
+
     fn read_request(stream: &mut UnixStream, expected_request: FrontendReq) -> Vec<u8> {
         let mut header = [0u8; 12];
         stream.read_exact(&mut header).unwrap();
@@ -955,6 +1055,7 @@ mod tests {
             1,
             false,
             &kill_evt,
+            None,
             |_| Ok(()),
         )
         .unwrap();
@@ -993,6 +1094,7 @@ mod tests {
                     SeccompAction::Allow,
                     EventFd::new(libc::EFD_NONBLOCK).unwrap(),
                     enabled,
+                    None,
                     None,
                 )
                 .unwrap();
@@ -1054,6 +1156,7 @@ mod tests {
             1,
             false,
             &kill_evt,
+            None,
             |_| Ok(()),
         )
         .unwrap();
@@ -1070,6 +1173,171 @@ mod tests {
         )
         .unwrap();
         backend.join().unwrap();
+    }
+
+    /// A demand-paged restore requires PAGEFAULT of every backend: it is
+    /// added for a backend that offers it, though the snapshot predates it,
+    /// and a backend that does not offer it is refused before any protocol
+    /// settings are sent.
+    #[test]
+    fn demand_paged_restore_requires_pagefault() {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let mq = VhostUserProtocolFeatures::MQ.bits();
+        let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
+        for available in [mq | pagefault, mq] {
+            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-pagefault-").unwrap();
+            let socket_path = temp_dir.as_path().join("backend.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let backend = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                for (request, value) in [
+                    (FrontendReq::GET_FEATURES, protocol_features),
+                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
+                ] {
+                    assert!(read_request(&mut stream, request).is_empty());
+                    for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+                        stream.write_all(&field.to_ne_bytes()).unwrap();
+                    }
+                    stream.write_all(&value.to_ne_bytes()).unwrap();
+                }
+                if available & pagefault != 0 {
+                    assert_eq!(
+                        read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                        (mq | pagefault).to_ne_bytes()
+                    );
+                }
+                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+            });
+
+            let faults = BackendFaults {
+                device: "_disk0".to_owned(),
+                handler: Arc::new(Unused),
+            };
+            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let result = VhostUserHandle::connect_vhost_user(
+                false,
+                socket_path.to_str().unwrap(),
+                1,
+                false,
+                &kill_evt,
+                Some(&faults),
+                |vu| vu.set_protocol_features_vhost_user(protocol_features, mq),
+            );
+            match result {
+                Ok(vu) => {
+                    assert_ne!(available & pagefault, 0);
+                    drop(vu);
+                }
+                Err(Error::BackendServesNoFaults) => assert_eq!(available & pagefault, 0),
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+            backend.join().unwrap();
+        }
+    }
+
+    /// PAGEFAULT is sent to a backend only while guest RAM is demand-paged
+    /// and never kept in the protocol features a device saves: a negotiation
+    /// that sent it returns the features without it, and a restore of saved
+    /// features carrying it neither sends it nor requires it of a backend
+    /// when guest RAM is not demand-paged.
+    #[test]
+    fn pagefault_is_negotiated_per_connection_and_never_saved() {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let mq = VhostUserProtocolFeatures::MQ.bits();
+        let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
+        // (demand-paged, offered by the backend, sent to it)
+        for (demand_paged, available, sent) in
+            [(true, mq | pagefault, mq | pagefault), (false, mq, mq)]
+        {
+            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-pagefault-").unwrap();
+            let socket_path = temp_dir.as_path().join("backend.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let backend = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                for (request, value) in [
+                    (FrontendReq::GET_FEATURES, protocol_features),
+                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
+                ] {
+                    assert!(read_request(&mut stream, request).is_empty());
+                    for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+                        stream.write_all(&field.to_ne_bytes()).unwrap();
+                    }
+                    stream.write_all(&value.to_ne_bytes()).unwrap();
+                }
+                assert_eq!(
+                    read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                    sent.to_ne_bytes()
+                );
+                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+            });
+
+            let faults = demand_paged.then(|| BackendFaults {
+                device: "_disk0".to_owned(),
+                handler: Arc::new(Unused),
+            });
+            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let mut negotiated = None;
+            let vu = VhostUserHandle::connect_vhost_user(
+                false,
+                socket_path.to_str().unwrap(),
+                1,
+                false,
+                &kill_evt,
+                faults.as_ref(),
+                |vu| {
+                    if demand_paged {
+                        negotiated = Some(vu.negotiate_features_vhost_user(
+                            protocol_features,
+                            VhostUserProtocolFeatures::MQ,
+                        )?);
+                        Ok(())
+                    } else {
+                        vu.set_protocol_features_vhost_user(protocol_features, mq | pagefault)
+                    }
+                },
+            )
+            .unwrap();
+            if demand_paged {
+                assert_eq!(negotiated, Some((protocol_features, mq)));
+            }
+            drop(vu);
+            backend.join().unwrap();
+        }
+    }
+
+    /// Memory hot-plug is refused up front while guest RAM is demand-paged,
+    /// with or without CONFIGURE_MEM_SLOTS, before anything reaches the
+    /// backend.
+    #[test]
+    fn memory_hotplug_is_refused_while_demand_paged() {
+        let region = Arc::new(
+            GuestRegionMmap::new(
+                crate::MmapRegion::new(0x1000).unwrap(),
+                GuestAddress(0x1_0000_0000),
+            )
+            .unwrap(),
+        );
+        for acked_protocol_features in [0, VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits()] {
+            let mut common = VhostUserCommon {
+                acked_protocol_features,
+                faults: Some(BackendFaults {
+                    device: "_disk0".to_owned(),
+                    handler: Arc::new(Unused),
+                }),
+                ..Default::default()
+            };
+            match common.add_memory_region(&region) {
+                Err(crate::Error::VhostUserUpdateMemory(Error::MemoryHotplugWhileDemandPaged)) => {
+                    assert_eq!(acked_protocol_features, 0);
+                }
+                Err(crate::Error::VhostUserAddMemoryRegion(
+                    Error::MemoryHotplugWhileDemandPaged,
+                )) => assert_ne!(acked_protocol_features, 0),
+                other => panic!("unexpected hot-plug result: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1113,6 +1381,7 @@ mod tests {
                 1,
                 false,
                 &kill_evt,
+                None,
                 |vu| vu.set_protocol_features_vhost_user(protocol_features, saved),
             );
             match result {
@@ -1159,6 +1428,7 @@ mod tests {
                 1,
                 false,
                 &kill_evt,
+                None,
                 |vu| vu.set_protocol_features_vhost_user(0, saved),
             );
             match result {

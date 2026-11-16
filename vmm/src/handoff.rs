@@ -19,18 +19,28 @@
 //! bytes of JSON, with file descriptors attached to the header bytes as
 //! `SCM_RIGHTS`. The VMM sends `Handoff` (type 1, at startup) and `Capture`
 //! (type 2, during a live checkpoint's paused phase) and reads
-//! `CaptureDone` (type 3) back.
+//! `CaptureDone` (type 3) back. While guest RAM is demand-paged, it also
+//! relays `BackendHandoff` (type 4): each memory table a vhost-user backend
+//! mapped and registered with its own userfaultfd, through the vhost-user
+//! postcopy flow, so that backend's first touch of a page not yet served
+//! faults to the handler instead of landing a zero page in guest RAM. The
+//! first handoff of a vhost-user connection carries its userfaultfd, and
+//! later ones on the same connection name it by the connection's id. Each
+//! handoff carries one end of a socket pair, on which the handler answers
+//! with `BackendVerdict` (type 5) once it has adopted the table or refused
+//! it.
 
 use std::fs::File;
-use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process;
+use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
+use std::{io, process};
 
 use log::error;
 use serde::{Deserialize, Serialize};
+use virtio_devices::vhost_user::{BackendFaultHandler, BackendMapping};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -40,18 +50,22 @@ const MSG_HANDOFF: u32 = 1;
 const MSG_CAPTURE: u32 = 2;
 /// Header discriminant of a capture-done message.
 const MSG_CAPTURE_DONE: u32 = 3;
+/// Header discriminant of a backend-handoff message.
+const MSG_BACKEND_HANDOFF: u32 = 4;
+/// Header discriminant of a backend-verdict message.
+const MSG_BACKEND_VERDICT: u32 = 5;
 
 /// Wire size of the fixed message header.
 const HEADER_LEN: usize = 8;
 
-/// Upper bound accepted for a capture-done body, defending the
-/// length-prefixed read against a corrupt peer. Done messages carry at most
-/// an error string.
-const MAX_DONE_LEN: u32 = 1024 * 1024;
+/// Upper bound accepted for the body of a message from the fault handler,
+/// defending the length-prefixed read against a corrupt peer. Its messages
+/// carry at most an error string.
+const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
 
 /// The fault-handling modes guest RAM was registered with before the
 /// handoff.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RegistrationMode {
     /// Missing + write-protect: a demand-paged restore.
     MissingAndWriteProtect,
@@ -108,6 +122,40 @@ struct Capture {
     ranges: Vec<CaptureRange>,
 }
 
+/// One of a vhost-user backend's mappings of guest RAM: where it sits in the
+/// backend's address space and the range of this process's it maps.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendRegion {
+    /// Start of the mapping in the backend's address space.
+    backend_addr: u64,
+    /// Where this process maps the mapping's first byte.
+    vmm_addr: u64,
+    /// Length of the mapping in bytes.
+    length: u64,
+    /// The page size of the mapping's backing.
+    page_size: u64,
+}
+
+/// The backend-handoff body: which device's backend, on which connection,
+/// and the mappings of its memory table. Its descriptors are the verdict
+/// socket, then the connection's userfaultfd on its first handoff only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BackendHandoff {
+    device: String,
+    connection: u64,
+    regions: Vec<BackendRegion>,
+}
+
+/// The handler's answer to a backend handoff, on the handoff's verdict
+/// socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BackendVerdict {
+    /// The handler serves the table's faults.
+    Adopted,
+    /// The handler refused the table, so the backend must not touch it.
+    Rejected { error: String },
+}
+
 /// How a capture ended, reported by the peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum CaptureOutcome {
@@ -125,6 +173,11 @@ pub(crate) struct FaultSession {
     _hangup: HangupWatch,
     stream: UnixStream,
     uffd: OwnedFd,
+    mode: RegistrationMode,
+    /// Serializes whole messages onto the connection: captures are sent from
+    /// here, and backend handoffs from the [`BackendFaultRelay`]s of
+    /// vhost-user devices, which can connect at any time.
+    write: Arc<Mutex<()>>,
 }
 
 impl FaultSession {
@@ -150,7 +203,28 @@ impl FaultSession {
             _hangup: hangup,
             stream,
             uffd,
+            mode,
+            write: Arc::new(Mutex::new(())),
         })
+    }
+
+    /// Whether guest RAM is demand-paged through this session, as opposed to
+    /// only write-protected for captures.
+    pub(crate) fn demand_paged(&self) -> bool {
+        self.mode == RegistrationMode::MissingAndWriteProtect
+    }
+
+    /// The relay vhost-user devices hand their backends' userfaultfds to,
+    /// when guest RAM is demand-paged through this session; `None` for a
+    /// write-protect-only session, whose guest RAM has nothing to serve.
+    pub(crate) fn backend_fault_relay(&self) -> io::Result<Option<BackendFaultRelay>> {
+        if !self.demand_paged() {
+            return Ok(None);
+        }
+        Ok(Some(BackendFaultRelay {
+            stream: self.stream.try_clone()?,
+            write: Arc::clone(&self.write),
+        }))
     }
 
     /// The userfaultfd, for arming write-protection.
@@ -164,6 +238,10 @@ impl FaultSession {
     /// connection (see [`Self::wait_done`]).
     pub(crate) fn send_capture(&self, ranges: Vec<CaptureRange>, out: &File) -> io::Result<()> {
         let body = serde_json::to_vec(&Capture { ranges })?;
+        let _write = self
+            .write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         send_message(&self.stream, MSG_CAPTURE, &body, &[out.as_raw_fd()])
     }
 
@@ -178,27 +256,61 @@ impl FaultSession {
     /// the peer's outcome: `Ok` when every armed page was captured, or the
     /// error that aborted the capture.
     pub(crate) fn wait_done(stream: &UnixStream) -> io::Result<Result<(), String>> {
-        let mut header = [0u8; HEADER_LEN];
-        (&mut &*stream).read_exact(&mut header)?;
-        let message_type = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice"));
-        let body_len = u32::from_le_bytes(header[4..8].try_into().expect("4-byte slice"));
-        if message_type != MSG_CAPTURE_DONE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected message type {message_type} from the fault handler"),
-            ));
-        }
-        if body_len > MAX_DONE_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("capture-done body of {body_len} bytes exceeds the bound"),
-            ));
-        }
-        let mut body = vec![0u8; body_len as usize];
-        (&mut &*stream).read_exact(&mut body)?;
+        let body = receive_message(stream, MSG_CAPTURE_DONE)?;
         match serde_json::from_slice(&body)? {
             CaptureOutcome::Success => Ok(Ok(())),
             CaptureOutcome::Failure { error } => Ok(Err(error)),
+        }
+    }
+}
+
+/// Relays the userfaultfds of vhost-user backends to a demand-paged VM's
+/// fault handler, over the VM's fault session.
+pub(crate) struct BackendFaultRelay {
+    stream: UnixStream,
+    write: Arc<Mutex<()>>,
+}
+
+impl BackendFaultHandler for BackendFaultRelay {
+    fn adopt(
+        &self,
+        device: &str,
+        connection: u64,
+        mappings: &[BackendMapping],
+        uffd: Option<BorrowedFd<'_>>,
+    ) -> io::Result<()> {
+        let body = serde_json::to_vec(&BackendHandoff {
+            device: device.to_owned(),
+            connection,
+            regions: mappings
+                .iter()
+                .map(|mapping| BackendRegion {
+                    backend_addr: mapping.backend_addr,
+                    vmm_addr: mapping.vmm_addr,
+                    length: mapping.length,
+                    page_size: mapping.page_size,
+                })
+                .collect(),
+        })?;
+        let (verdict, handler_end) = UnixStream::pair()?;
+        let mut fds = vec![handler_end.as_raw_fd()];
+        fds.extend(uffd.map(|uffd| uffd.as_raw_fd()));
+        {
+            let _write = self
+                .write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            send_message(&self.stream, MSG_BACKEND_HANDOFF, &body, &fds)?;
+        }
+        // Only the handler holds the other end now, so the read below ends
+        // with an error rather than blocking forever if the handler goes
+        // away without answering.
+        drop(handler_end);
+        match serde_json::from_slice(&receive_message(&verdict, MSG_BACKEND_VERDICT)?)? {
+            BackendVerdict::Adopted => Ok(()),
+            BackendVerdict::Rejected { error } => Err(io::Error::other(format!(
+                "the fault handler refused the memory table of {device}'s backend: {error}"
+            ))),
         }
     }
 }
@@ -319,6 +431,74 @@ fn send_message(
             "short header write on the fault-handler connection",
         ));
     }
-    use std::io::Write;
-    (&mut &*stream).write_all(&body[sent - HEADER_LEN..])
+    // The rest of a body a signal cut short goes through sendmsg too, with no
+    // descriptors: the vhost-user worker threads that relay backend handoffs
+    // on reconnect are allowed sendmsg, not every other send.
+    let mut sent = sent - HEADER_LEN;
+    while sent < body.len() {
+        match stream.send_with_fds(&[&body[sent..]], &[]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the fault-handler connection accepted no more of a message",
+                ));
+            }
+            Ok(more) => sent += more,
+            Err(e) if e.errno() == libc::EINTR => {}
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "sendmsg to the fault handler: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read one message from the fault handler on `stream`, blocking, and
+/// return its body, which must be of type `expected`.
+fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
+    // Read through recvmsg, which every thread that waits on the handler
+    // (the vmm thread, and the vhost-user workers on reconnect) is allowed,
+    // unlike the recvfrom a plain read of a socket makes.
+    let read_exact = |buf: &mut [u8]| -> io::Result<()> {
+        let mut read = 0;
+        while read < buf.len() {
+            match stream.recv_with_fd(&mut buf[read..]) {
+                Ok((0, _)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the fault handler closed the connection mid-message",
+                    ));
+                }
+                Ok((more, _)) => read += more,
+                Err(e) if e.errno() == libc::EINTR => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "recvmsg from the fault handler: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
+    let mut header = [0u8; HEADER_LEN];
+    read_exact(&mut header)?;
+    let message_type = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice"));
+    let body_len = u32::from_le_bytes(header[4..8].try_into().expect("4-byte slice"));
+    if message_type != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected message type {message_type} from the fault handler"),
+        ));
+    }
+    if body_len > MAX_RECEIVED_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message body of {body_len} bytes from the fault handler exceeds the bound"),
+        ));
+    }
+    let mut body = vec![0u8; body_len as usize];
+    read_exact(&mut body)?;
+    Ok(body)
 }
