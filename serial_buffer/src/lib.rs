@@ -99,16 +99,24 @@ impl Write for SerialBuffer {
     }
 
     // This function flushes the content of the buffer to the out device if
-    // it is allowed to, otherwise this is a no-op.
+    // it is allowed to, otherwise this is a no-op. It writes the buffer's
+    // contiguous runs whole, and stops at the first write that would block
+    // or fails, keeping every byte not yet written for the next flush.
     fn flush(&mut self) -> io::Result<()> {
         if !self.write_out.load(Ordering::Acquire) {
             return Ok(());
         }
 
-        while let Some(byte) = self.buffer.pop_front() {
-            if self.out.write_all(&[byte]).is_err() {
-                self.buffer.push_front(byte);
-                break;
+        while !self.buffer.is_empty() {
+            let (front, _) = self.buffer.as_slices();
+            match self.out.write(front) {
+                // The out device takes nothing more for now.
+                Ok(0) => break,
+                Ok(written) => {
+                    self.buffer.drain(..written);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
             }
         }
         self.out.flush()
@@ -141,6 +149,116 @@ mod tests {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(buf);
             Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A writer that refuses with WouldBlock until `accept` is set, as a
+    // non-blocking socket does while its send buffer is full, then takes at
+    // most `limit` bytes per write, counting its writes.
+    #[derive(Clone)]
+    struct FullSink {
+        taken: Arc<Mutex<Vec<u8>>>,
+        accept: Arc<AtomicBool>,
+        limit: usize,
+        writes: Arc<Mutex<usize>>,
+    }
+
+    impl FullSink {
+        fn new(limit: usize) -> Self {
+            FullSink {
+                taken: Arc::new(Mutex::new(Vec::new())),
+                accept: Arc::new(AtomicBool::new(false)),
+                limit,
+                writes: Arc::new(Mutex::new(0)),
+            }
+        }
+        fn taken(&self) -> Vec<u8> {
+            self.taken.lock().unwrap().clone()
+        }
+        fn writes(&self) -> usize {
+            *self.writes.lock().unwrap()
+        }
+    }
+
+    impl Write for FullSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.accept.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            *self.writes.lock().unwrap() += 1;
+            let taken = buf.len().min(self.limit);
+            self.taken.lock().unwrap().extend_from_slice(&buf[..taken]);
+            Ok(taken)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Bytes a full out device refuses are kept, in order, and leave on the
+    // next flush once it takes them: in one write per contiguous run of the
+    // buffer, not one per byte.
+    #[test]
+    fn bytes_refused_while_full_leave_in_order_on_flush() {
+        let write_out = Arc::new(AtomicBool::new(true));
+        let sink = FullSink::new(usize::MAX);
+        let mut buf = SerialBuffer::new(Box::new(sink.clone()), write_out);
+
+        buf.write_all(b"the tail of a line").unwrap();
+        buf.write_all(b" and more").unwrap();
+        assert!(sink.taken().is_empty());
+
+        sink.accept.store(true, Ordering::Release);
+        buf.flush().unwrap();
+        assert_eq!(sink.taken(), b"the tail of a line and more");
+        assert!(sink.writes() <= 2, "{} writes", sink.writes());
+
+        buf.flush().unwrap();
+        assert_eq!(sink.taken(), b"the tail of a line and more");
+    }
+
+    // A write that takes only part of what is buffered keeps the rest for
+    // the next flush.
+    #[test]
+    fn a_partial_write_keeps_the_rest() {
+        let write_out = Arc::new(AtomicBool::new(true));
+        let full = FullSink::new(usize::MAX);
+        let mut buf = SerialBuffer::new(Box::new(full.clone()), write_out);
+        buf.write_all(b"0123456789").unwrap();
+
+        let partial = FullSink::new(4);
+        partial.accept.store(true, Ordering::Release);
+        buf.set_out(Box::new(OnceThenFull {
+            sink: partial.clone(),
+            writes_left: 1,
+        }));
+        buf.flush().unwrap();
+        assert_eq!(partial.taken(), b"0123");
+
+        let rest = FullSink::new(usize::MAX);
+        rest.accept.store(true, Ordering::Release);
+        buf.set_out(Box::new(rest.clone()));
+        buf.flush().unwrap();
+        assert_eq!(rest.taken(), b"456789");
+    }
+
+    // Writes through `sink` `writes_left` times, then refuses with
+    // WouldBlock.
+    struct OnceThenFull {
+        sink: FullSink,
+        writes_left: usize,
+    }
+
+    impl Write for OnceThenFull {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.writes_left == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.writes_left -= 1;
+            self.sink.write(buf)
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
