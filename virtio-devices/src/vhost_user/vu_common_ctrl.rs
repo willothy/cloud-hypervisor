@@ -7,7 +7,7 @@ use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::{ffi, fs, io, slice};
 
@@ -44,6 +44,11 @@ use crate::{
 // Size of a dirty page for vhost-user.
 const VHOST_LOG_PAGE: u64 = 0x1000;
 
+/// The id the next vhost-user connection to open a postcopy userfaultfd
+/// takes, naming it to the [`super::BackendFaultHandler`] for the life of
+/// the process.
+static NEXT_POSTCOPY_CONNECTION: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
     pub socket: String,
@@ -76,9 +81,10 @@ pub struct VhostUserHandle {
     faults: Option<BackendFaults>,
     /// Whether the backend negotiated `PAGEFAULT`.
     serves_faults: bool,
-    /// The backend's postcopy userfaultfd on this connection, once advised
-    /// and listening.
-    postcopy_uffd: Option<Arc<File>>,
+    /// The id this connection's backend userfaultfd was handed to the fault
+    /// handler under, once the backend advised it, listens, and the handler
+    /// adopted its first memory table.
+    postcopy_connection: Option<u64>,
 }
 
 impl VhostUserHandle {
@@ -105,8 +111,8 @@ impl VhostUserHandle {
             regions.push(vhost_user_net_reg);
         }
 
-        if self.faults.is_some() {
-            return self.set_mem_table_postcopy(&regions);
+        if let Some(faults) = self.faults.clone() {
+            return self.set_mem_table_postcopy(&faults, &regions);
         }
 
         self.vu
@@ -118,27 +124,29 @@ impl VhostUserHandle {
 
     /// Give a backend serving faults its memory table the postcopy way: on
     /// the connection's first table, open its userfaultfd and have it listen;
-    /// then send the table, hand the userfaultfd and the mappings the backend
-    /// reports to the fault handler, and only then acknowledge, which is
-    /// what lets the backend touch guest RAM.
-    fn set_mem_table_postcopy(&mut self, regions: &[VhostUserMemoryRegionInfo]) -> Result<()> {
-        let faults = self.faults.clone().ok_or(Error::BackendServesNoFaults)?;
+    /// then send the table, hand the mappings the backend reports (and, the
+    /// first time, its userfaultfd) to the fault handler, and only once the
+    /// handler has adopted them acknowledge, which is what lets the backend
+    /// touch guest RAM. A table the handler refuses fails the connection.
+    fn set_mem_table_postcopy(
+        &mut self,
+        faults: &BackendFaults,
+        regions: &[VhostUserMemoryRegionInfo],
+    ) -> Result<()> {
         if !self.serves_faults {
             return Err(Error::BackendServesNoFaults);
         }
-        let uffd = match &self.postcopy_uffd {
-            Some(uffd) => Arc::clone(uffd),
+        let uffd = match self.postcopy_connection {
+            Some(_) => None,
             None => {
-                let uffd = Arc::new(
-                    self.vu
-                        .postcopy_advise()
-                        .map_err(Error::VhostUserPostcopyAdvise)?,
-                );
+                let uffd = self
+                    .vu
+                    .postcopy_advise()
+                    .map_err(Error::VhostUserPostcopyAdvise)?;
                 self.vu
                     .postcopy_listen()
                     .map_err(Error::VhostUserPostcopyListen)?;
-                self.postcopy_uffd = Some(Arc::clone(&uffd));
-                uffd
+                Some(uffd)
             }
         };
         let bases = self
@@ -154,10 +162,19 @@ impl VhostUserHandle {
                 length: region.memory_size,
             })
             .collect();
+        let connection = self
+            .postcopy_connection
+            .unwrap_or_else(|| NEXT_POSTCOPY_CONNECTION.fetch_add(1, Ordering::Relaxed));
         faults
             .handler
-            .adopt(&faults.device, &mappings, uffd.as_fd())
+            .adopt(
+                &faults.device,
+                connection,
+                &mappings,
+                uffd.as_ref().map(|uffd| uffd.as_fd()),
+            )
             .map_err(Error::AdoptBackendFaults)?;
+        self.postcopy_connection = Some(connection);
         self.vu
             .postcopy_ack_mem_table()
             .map_err(Error::VhostUserPostcopyAck)
@@ -524,7 +541,7 @@ impl VhostUserHandle {
                 vring_bases: None,
                 faults: faults.cloned(),
                 serves_faults: false,
-                postcopy_uffd: None,
+                postcopy_connection: None,
             };
             vhost_user
                 .vu
@@ -586,7 +603,7 @@ impl VhostUserHandle {
                         vring_bases: None,
                         faults: faults.cloned(),
                         serves_faults: false,
-                        postcopy_uffd: None,
+                        postcopy_connection: None,
                     })
                     .map_err(Error::VhostUserConnect);
 

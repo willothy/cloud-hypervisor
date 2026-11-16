@@ -20,10 +20,15 @@
 //! `SCM_RIGHTS`. The VMM sends `Handoff` (type 1, at startup) and `Capture`
 //! (type 2, during a live checkpoint's paused phase) and reads
 //! `CaptureDone` (type 3) back. While guest RAM is demand-paged, it also
-//! relays `BackendHandoff` (type 4): the userfaultfd a vhost-user backend
-//! registered over its own mapping of guest RAM, through the vhost-user
+//! relays `BackendHandoff` (type 4): each memory table a vhost-user backend
+//! mapped and registered with its own userfaultfd, through the vhost-user
 //! postcopy flow, so that backend's first touch of a page not yet served
-//! faults to the handler instead of landing a zero page in guest RAM.
+//! faults to the handler instead of landing a zero page in guest RAM. The
+//! first handoff of a vhost-user connection carries its userfaultfd, and
+//! later ones on the same connection name it by the connection's id. Each
+//! handoff carries one end of a socket pair, on which the handler answers
+//! with `BackendVerdict` (type 5) once it has adopted the table or refused
+//! it.
 
 use std::fs::File;
 use std::io::{self, Read};
@@ -48,6 +53,8 @@ const MSG_CAPTURE: u32 = 2;
 const MSG_CAPTURE_DONE: u32 = 3;
 /// Header discriminant of a backend-handoff message.
 const MSG_BACKEND_HANDOFF: u32 = 4;
+/// Header discriminant of a backend-verdict message.
+const MSG_BACKEND_VERDICT: u32 = 5;
 
 /// Wire size of the fixed message header.
 const HEADER_LEN: usize = 8;
@@ -125,11 +132,24 @@ struct BackendRegion {
     length: u64,
 }
 
-/// The backend-handoff body: which device's backend, and its mappings.
+/// The backend-handoff body: which device's backend, on which connection,
+/// and the mappings of its memory table. Its descriptors are the verdict
+/// socket, then the connection's userfaultfd on its first handoff only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackendHandoff {
     device: String,
+    connection: u64,
     regions: Vec<BackendRegion>,
+}
+
+/// The handler's answer to a backend handoff, on the handoff's verdict
+/// socket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum BackendVerdict {
+    /// The handler serves the table's faults.
+    Adopted,
+    /// The handler refused the table, so the backend must not touch it.
+    Rejected { error: String },
 }
 
 /// How a capture ended, reported by the peer.
@@ -245,11 +265,13 @@ impl BackendFaultHandler for BackendFaultRelay {
     fn adopt(
         &self,
         device: &str,
+        connection: u64,
         mappings: &[BackendMapping],
-        uffd: BorrowedFd<'_>,
+        uffd: Option<BorrowedFd<'_>>,
     ) -> io::Result<()> {
         let body = serde_json::to_vec(&BackendHandoff {
             device: device.to_owned(),
+            connection,
             regions: mappings
                 .iter()
                 .map(|mapping| BackendRegion {
@@ -259,16 +281,26 @@ impl BackendFaultHandler for BackendFaultRelay {
                 })
                 .collect(),
         })?;
-        let _write = self
-            .write
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        send_message(
-            &self.stream,
-            MSG_BACKEND_HANDOFF,
-            &body,
-            &[uffd.as_raw_fd()],
-        )
+        let (verdict, handler_end) = UnixStream::pair()?;
+        let mut fds = vec![handler_end.as_raw_fd()];
+        fds.extend(uffd.map(|uffd| uffd.as_raw_fd()));
+        {
+            let _write = self
+                .write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            send_message(&self.stream, MSG_BACKEND_HANDOFF, &body, &fds)?;
+        }
+        // Only the handler holds the other end now, so the read below ends
+        // with an error rather than blocking forever if the handler goes
+        // away without answering.
+        drop(handler_end);
+        match serde_json::from_slice(&receive_message(&verdict, MSG_BACKEND_VERDICT)?)? {
+            BackendVerdict::Adopted => Ok(()),
+            BackendVerdict::Rejected { error } => Err(io::Error::other(format!(
+                "the fault handler refused the memory table of {device}'s backend: {error}"
+            ))),
+        }
     }
 }
 

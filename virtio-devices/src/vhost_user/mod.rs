@@ -268,13 +268,20 @@ pub struct BackendMapping {
 /// backend registers its mappings with a userfaultfd of its own (the
 /// vhost-user postcopy `PAGEFAULT` flow) and that userfaultfd is handed here.
 pub trait BackendFaultHandler: Send + Sync {
-    /// Serve the faults `device`'s backend takes on `mappings`, registered
-    /// with `uffd`. Returns once the handler owns them.
+    /// Serve the faults `device`'s backend takes on `mappings`, the
+    /// memory table it mapped on vhost-user connection `connection`, an id
+    /// unique within this process. `uffd`, the userfaultfd the backend
+    /// registers every mapping on that connection with, is passed with the
+    /// connection's first table only; a later table on the same connection
+    /// adds its mappings to that userfaultfd's. Returns once the handler
+    /// serves the mappings, or with its reason for refusing them, before
+    /// which the backend must not be let touch guest RAM.
     fn adopt(
         &self,
         device: &str,
+        connection: u64,
         mappings: &[BackendMapping],
-        uffd: BorrowedFd<'_>,
+        uffd: Option<BorrowedFd<'_>>,
     ) -> io::Result<()>;
 }
 
@@ -1145,7 +1152,13 @@ mod tests {
     fn demand_paged_restore_requires_pagefault() {
         struct Unused;
         impl BackendFaultHandler for Unused {
-            fn adopt(&self, _: &str, _: &[BackendMapping], _: BorrowedFd<'_>) -> io::Result<()> {
+            fn adopt(
+                &self,
+                _: &str,
+                _: u64,
+                _: &[BackendMapping],
+                _: Option<BorrowedFd<'_>>,
+            ) -> io::Result<()> {
                 Err(io::Error::other("no memory table is sent"))
             }
         }
