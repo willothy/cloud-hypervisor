@@ -997,6 +997,21 @@ mod tests {
     use crate::vsock::tests::NoopVirtioInterrupt;
     use crate::{VIRTIO_F_ACCESS_PLATFORM, VirtioDevice};
 
+    /// A fault handler for tests whose backends never get a memory table.
+    struct Unused;
+
+    impl BackendFaultHandler for Unused {
+        fn adopt(
+            &self,
+            _: &str,
+            _: u64,
+            _: &[BackendMapping],
+            _: Option<BorrowedFd<'_>>,
+        ) -> io::Result<()> {
+            Err(io::Error::other("no memory table is sent"))
+        }
+    }
+
     fn read_request(stream: &mut UnixStream, expected_request: FrontendReq) -> Vec<u8> {
         let mut header = [0u8; 12];
         stream.read_exact(&mut header).unwrap();
@@ -1166,19 +1181,6 @@ mod tests {
     /// settings are sent.
     #[test]
     fn demand_paged_restore_requires_pagefault() {
-        struct Unused;
-        impl BackendFaultHandler for Unused {
-            fn adopt(
-                &self,
-                _: &str,
-                _: u64,
-                _: &[BackendMapping],
-                _: Option<BorrowedFd<'_>>,
-            ) -> io::Result<()> {
-                Err(io::Error::other("no memory table is sent"))
-            }
-        }
-
         let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let mq = VhostUserProtocolFeatures::MQ.bits();
         let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
@@ -1241,19 +1243,6 @@ mod tests {
     /// when guest RAM is not demand-paged.
     #[test]
     fn pagefault_is_negotiated_per_connection_and_never_saved() {
-        struct Unused;
-        impl BackendFaultHandler for Unused {
-            fn adopt(
-                &self,
-                _: &str,
-                _: u64,
-                _: &[BackendMapping],
-                _: Option<BorrowedFd<'_>>,
-            ) -> io::Result<()> {
-                Err(io::Error::other("no memory table is sent"))
-            }
-        }
-
         let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let mq = VhostUserProtocolFeatures::MQ.bits();
         let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
@@ -1323,19 +1312,6 @@ mod tests {
     /// backend.
     #[test]
     fn memory_hotplug_is_refused_while_demand_paged() {
-        struct Unused;
-        impl BackendFaultHandler for Unused {
-            fn adopt(
-                &self,
-                _: &str,
-                _: u64,
-                _: &[BackendMapping],
-                _: Option<BorrowedFd<'_>>,
-            ) -> io::Result<()> {
-                Err(io::Error::other("no memory table is sent"))
-            }
-        }
-
         let region = Arc::new(
             GuestRegionMmap::new(
                 crate::MmapRegion::new(0x1000).unwrap(),
