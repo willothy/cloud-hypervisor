@@ -207,11 +207,17 @@ impl FaultSession {
         })
     }
 
+    /// Whether guest RAM is demand-paged through this session, as opposed to
+    /// only write-protected for captures.
+    pub(crate) fn demand_paged(&self) -> bool {
+        self.mode == RegistrationMode::MissingAndWriteProtect
+    }
+
     /// The relay vhost-user devices hand their backends' userfaultfds to,
     /// when guest RAM is demand-paged through this session; `None` for a
     /// write-protect-only session, whose guest RAM has nothing to serve.
     pub(crate) fn backend_fault_relay(&self) -> io::Result<Option<BackendFaultRelay>> {
-        if self.mode != RegistrationMode::MissingAndWriteProtect {
+        if !self.demand_paged() {
             return Ok(None);
         }
         Ok(Some(BackendFaultRelay {

@@ -408,6 +408,12 @@ pub enum Error {
     #[error("Impossible to resize guest memory if it is backed by user defined memory regions")]
     InvalidResizeWithMemoryZones,
 
+    /// Forbidden operation. Memory cannot be hot-plugged while guest RAM is
+    /// demand-paged: the vhost-user backends fault only on the memory
+    /// tables the fault handler adopted, and refuse a new region.
+    #[error("Memory cannot be hot-plugged while guest RAM is demand-paged")]
+    HotplugWhileDemandPaged,
+
     /// Forbidden operation. Impossible to resize guest memory below the boot
     /// RAM as it is not removable with virtio-mem.
     #[error("Invalid resize request: desired_size = {0} below boot size = {1}")]
@@ -3624,6 +3630,16 @@ impl MemoryManager {
                 if desired_ram > self.current_ram {
                     if !self.dynamic {
                         return Ok(region);
+                    }
+                    // Refused before the region exists: every vhost-user
+                    // device would refuse it once created, leaving the VM
+                    // half-resized.
+                    if self
+                        .fault_session
+                        .as_ref()
+                        .is_some_and(FaultSession::demand_paged)
+                    {
+                        return Err(Error::HotplugWhileDemandPaged);
                     }
 
                     region =
