@@ -3132,7 +3132,11 @@ impl RestoreConfig {
         }
 
         if self.memory_restore_mode == MemoryRestoreMode::OnDemand {
-            vm_config.check_postcopy_incompatible_device()?;
+            if self.restore_fault_socket.is_some() {
+                vm_config.check_fault_handler_restore_incompatible_device()?;
+            } else {
+                vm_config.check_postcopy_incompatible_device()?;
+            }
         }
 
         let mut restored_net_with_fds = HashMap::new();
@@ -3380,6 +3384,42 @@ impl VmConfig {
     }
 
     pub fn check_postcopy_incompatible_device(&self) -> ValidationResult<()> {
+        self.check_postcopy_incompatible_passthrough_device()?;
+        if self.disks.iter().flatten().any(|disk| disk.vhost_user)
+            || self.has_non_disk_vhost_user_device()
+        {
+            return Err(ValidationError::PostcopyIncompatibleDevice(
+                "vhost-user".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The devices an on-demand restore through an external fault handler
+    /// (`memory_fault_socket`) refuses: those
+    /// [`Self::check_postcopy_incompatible_device`] refuses, except vhost-user
+    /// block devices, which every demand-paged restore of a crucible VM has.
+    ///
+    /// This admits the hazard the general check refuses them for (WIL-279):
+    /// a vhost-user backend maps guest RAM in its own process, outside the
+    /// userfaultfd the fault handler serves, so a backend access to a page
+    /// the handler has not served yet reads zeros, or instantiates a zero
+    /// page the guest later sees instead of its own memory. Once backends
+    /// register their own userfaultfd with the fault handler, this exemption
+    /// narrows to the devices whose backend did.
+    pub fn check_fault_handler_restore_incompatible_device(&self) -> ValidationResult<()> {
+        self.check_postcopy_incompatible_passthrough_device()?;
+        if self.has_non_disk_vhost_user_device() {
+            return Err(ValidationError::PostcopyIncompatibleDevice(
+                "vhost-user".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses the passthrough devices (VFIO, vDPA, vfio-user) whose DMA
+    /// into guest RAM no userfaultfd can intercept.
+    fn check_postcopy_incompatible_passthrough_device(&self) -> ValidationResult<()> {
         if self.devices.as_ref().is_some_and(|d| !d.is_empty()) {
             return Err(ValidationError::PostcopyIncompatibleDevice(
                 "VFIO".to_owned(),
@@ -3395,19 +3435,17 @@ impl VmConfig {
                 "vfio-user".to_owned(),
             ));
         }
-        if self.disks.iter().flatten().any(|disk| disk.vhost_user)
-            || self.net.iter().flatten().any(|net| net.vhost_user)
+        Ok(())
+    }
+
+    /// Whether any vhost-user device other than a block device is attached.
+    fn has_non_disk_vhost_user_device(&self) -> bool {
+        self.net.iter().flatten().any(|net| net.vhost_user)
             || self.fs.as_ref().is_some_and(|fs| !fs.is_empty())
             || self
                 .generic_vhost_user
                 .as_ref()
                 .is_some_and(|d| !d.is_empty())
-        {
-            return Err(ValidationError::PostcopyIncompatibleDevice(
-                "vhost-user".to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     /// Identify if an emulated SMMUv3 is required based on configuration from every device
@@ -5947,6 +5985,81 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_cow_prefault.validate(&snapshot_vm_config),
             Err(ValidationError::InvalidRestorePrefaultWithOnDemand)
         );
+    }
+
+    #[test]
+    fn test_restore_fault_handler_vhost_user_validation() {
+        let vm_config = |disk_vhost_user: bool, net_vhost_user: bool| VmConfig {
+            cpus: CpusConfig::default(),
+            memory: MemoryConfig::default(),
+            payload: None,
+            rate_limit_groups: None,
+            disks: Some(vec![DiskConfig {
+                vhost_user: disk_vhost_user,
+                ..disk_fixture()
+            }]),
+            rng: RngConfig::default(),
+            generic_vhost_user: None,
+            balloon: None,
+            fs: None,
+            pmem: None,
+            serial: SerialConfig::default(),
+            console: ConsoleConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            debug_console: DebugConsoleConfig::default(),
+            devices: None,
+            user_devices: None,
+            vdpa: None,
+            vsock: None,
+            #[cfg(feature = "pvmemcontrol")]
+            pvmemcontrol: None,
+            pvpanic: false,
+            iommu: false,
+            numa: None,
+            watchdog: false,
+            rtc: None,
+            #[cfg(feature = "guest_debug")]
+            gdb: false,
+            pci_segments: None,
+            platform: None,
+            tpm: None,
+            preserved_fds: None,
+            net: Some(vec![NetConfig {
+                vhost_user: net_vhost_user,
+                ..net_fixture()
+            }]),
+            landlock_enable: false,
+            landlock_rules: None,
+            #[cfg(feature = "ivshmem")]
+            ivshmem: None,
+        };
+        let restore = |restore_fault_socket: Option<PathBuf>| RestoreConfig {
+            source_url: PathBuf::from("/path/to/snapshot"),
+            prefault: false,
+            memory_restore_mode: MemoryRestoreMode::OnDemand,
+            restore_fault_socket,
+            net_fds: None,
+            vfio_fds: None,
+            iommufd_fd: None,
+            resume: false,
+            zone_updates: Vec::new(),
+        };
+        let fault_socket = Some(PathBuf::from("/path/to/fault.sock"));
+
+        // The fault handler path admits vhost-user block devices only.
+        restore(fault_socket.clone())
+            .validate(&vm_config(true, false))
+            .unwrap();
+        assert!(matches!(
+            restore(fault_socket).validate(&vm_config(true, true)),
+            Err(ValidationError::PostcopyIncompatibleDevice(_))
+        ));
+        // Reading pages from the snapshot file still refuses every vhost-user
+        // device.
+        assert!(matches!(
+            restore(None).validate(&vm_config(true, false)),
+            Err(ValidationError::PostcopyIncompatibleDevice(_))
+        ));
     }
 
     #[test]
