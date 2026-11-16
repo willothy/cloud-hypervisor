@@ -104,6 +104,9 @@ pub enum EpollDispatch {
     File = 0,
     Kill = 1,
     Socket = 2,
+    /// The socket console's client can take more output: a dup of its fd,
+    /// registered edge-triggered for EPOLLOUT.
+    Writable = 3,
     Unknown,
 }
 const EPOLL_EVENTS_LEN: usize = 4;
@@ -115,6 +118,7 @@ impl From<u64> for EpollDispatch {
             0 => File,
             1 => Kill,
             2 => Socket,
+            3 => Writable,
             _ => Unknown,
         }
     }
@@ -167,6 +171,15 @@ impl SocketConsole {
     fn detach_client(&self) {
         self.write_out.store(false, Ordering::Release);
         self.buffer.lock().unwrap().set_out(Box::new(io::sink()));
+    }
+
+    /// Flush what the client's socket refused earlier, now that it can
+    /// take more. Without this, bytes buffered on WouldBlock would wait for
+    /// the guest's next write, which may never come.
+    fn flush_client(&self) {
+        if let Err(e) = self.buffer.lock().unwrap().flush() {
+            warn!("Error flushing the serial console to its client: {e}");
+        }
     }
 }
 
@@ -321,6 +334,23 @@ impl SerialManager {
         Ok(())
     }
 
+    /// Stop watching a client's fd for EPOLLOUT, then close it. The epoll
+    /// entry is removed first: it belongs to the open file, not the fd, and
+    /// would outlive this fd while the reader and writer share the file.
+    fn unwatch_writable(epoll_fd: &OwnedFd, writable: Option<UnixStream>) {
+        let Some(writable) = writable else {
+            return;
+        };
+        if let Err(e) = epoll::ctl(
+            epoll_fd.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_DEL,
+            writable.as_raw_fd(),
+            epoll::Event::new(epoll::Events::empty(), 0),
+        ) {
+            warn!("Error removing the serial console client from epoll: {e}");
+        }
+    }
+
     pub fn start_thread(
         &mut self,
         exit_evt: EventFd,
@@ -341,6 +371,10 @@ impl SerialManager {
         let pty_write_out = self.pty_write_out.clone();
         let socket_console = self.socket_console.clone();
         let mut reader: Option<UnixStream> = None;
+        // A dup of the client's fd, registered for EPOLLOUT apart from the
+        // reader's EPOLLIN, so the console's buffer is flushed whenever the
+        // client's socket can take more.
+        let mut writable: Option<UnixStream> = None;
 
         // In case of PTY, we want to be able to detect a connection on the
         // other end of the PTY. This is done by detecting there's no event
@@ -400,6 +434,7 @@ impl SerialManager {
                                 EpollDispatch::Socket => {
                                     // New connection request arrived.
                                     // Shutdown the previous connection, if any
+                                    Self::unwatch_writable(&epoll_fd, writable.take());
                                     if let Some(previous_reader) = reader {
                                         previous_reader
                                             .shutdown(Shutdown::Both)
@@ -433,10 +468,32 @@ impl SerialManager {
                                     )
                                     .map_err(Error::Epoll)?;
 
+                                    if socket_console.is_some() {
+                                        let dup = unix_stream
+                                            .try_clone()
+                                            .map_err(Error::CloneUnixStream)?;
+                                        epoll::ctl(
+                                            epoll_fd.as_raw_fd(),
+                                            epoll::ControlOptions::EPOLL_CTL_ADD,
+                                            dup.as_raw_fd(),
+                                            epoll::Event::new(
+                                                epoll::Events::EPOLLOUT | epoll::Events::EPOLLET,
+                                                EpollDispatch::Writable as u64,
+                                            ),
+                                        )
+                                        .map_err(Error::Epoll)?;
+                                        writable = Some(dup);
+                                    }
+
                                     reader = Some(unix_stream);
 
                                     if let Some(ref socket_console) = socket_console {
                                         socket_console.attach_client(writer)?;
+                                    }
+                                }
+                                EpollDispatch::Writable => {
+                                    if let Some(ref socket_console) = socket_console {
+                                        socket_console.flush_client();
                                     }
                                 }
                                 EpollDispatch::File => {
@@ -456,6 +513,10 @@ impl SerialManager {
                                                                     Error::ShutdownConnection,
                                                                 )?;
                                                             reader = None;
+                                                            Self::unwatch_writable(
+                                                                &epoll_fd,
+                                                                writable.take(),
+                                                            );
                                                             if let Some(ref socket_console) =
                                                                 socket_console
                                                             {
