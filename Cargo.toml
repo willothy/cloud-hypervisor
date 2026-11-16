@@ -171,3 +171,9 @@ unnecessary_semicolon = "deny"
 # `level = warn` is irrelevant here but mandatory for rustc/cargo
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(devcli_testenv)'] }
 unreachable_pub = "deny"
+
+# The vhost-user postcopy memory table exchange (the back-end reporting where
+# it mapped each region) that demand-paged restores with vhost-user devices
+# need, which upstream vhost does not implement.
+[patch.crates-io]
+vhost = { git = "https://github.com/willothy/vhost", rev = "ec4829405b8964f2b69b312c06fbd603e8f1162e" }

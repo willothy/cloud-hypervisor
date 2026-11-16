@@ -207,3 +207,6 @@ name = "x86emul"
 path = "fuzz_targets/x86emul.rs"
 required-features = ["mshv_emulator"]
 test = false
+
+[patch.crates-io]
+vhost = { git = "https://github.com/willothy/vhost", rev = "ec4829405b8964f2b69b312c06fbd603e8f1162e" }

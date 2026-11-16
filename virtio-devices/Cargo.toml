@@ -33,6 +33,7 @@ serial_buffer = { path = "../serial_buffer" }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 vhost = { workspace = true, features = [
+  "postcopy",
   "vhost-kern",
   "vhost-user-backend",
   "vhost-user-frontend",
