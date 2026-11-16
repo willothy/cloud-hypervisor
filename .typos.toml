@@ -6,6 +6,11 @@ extend-exclude = [
   "resources/linux-config-*",
 ]
 
+[default]
+extend-ignore-re = [
+  "\\bWIL-[0-9]+\\b", # crucible issue keys
+]
+
 [default.extend-words]
 AER = "AER" # PCI capability Advanced Error Reporting
 CLASSE = "CLASSE"
