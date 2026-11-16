@@ -31,13 +31,12 @@
 //! it.
 
 use std::fs::File;
-use std::io::{self, Read};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process;
 use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
+use std::{io, process};
 
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -432,15 +431,59 @@ fn send_message(
             "short header write on the fault-handler connection",
         ));
     }
-    use std::io::Write;
-    (&mut &*stream).write_all(&body[sent - HEADER_LEN..])
+    // The rest of a body a signal cut short goes through sendmsg too, with no
+    // descriptors: the vhost-user worker threads that relay backend handoffs
+    // on reconnect are allowed sendmsg, not every other send.
+    let mut sent = sent - HEADER_LEN;
+    while sent < body.len() {
+        match stream.send_with_fds(&[&body[sent..]], &[]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the fault-handler connection accepted no more of a message",
+                ));
+            }
+            Ok(more) => sent += more,
+            Err(e) if e.errno() == libc::EINTR => {}
+            Err(e) => {
+                return Err(io::Error::other(format!(
+                    "sendmsg to the fault handler: {e}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read one message from the fault handler on `stream`, blocking, and
 /// return its body, which must be of type `expected`.
 fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
+    // Read through recvmsg, which every thread that waits on the handler
+    // (the vmm thread, and the vhost-user workers on reconnect) is allowed,
+    // unlike the recvfrom a plain read of a socket makes.
+    let read_exact = |buf: &mut [u8]| -> io::Result<()> {
+        let mut read = 0;
+        while read < buf.len() {
+            match stream.recv_with_fd(&mut buf[read..]) {
+                Ok((0, _)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the fault handler closed the connection mid-message",
+                    ));
+                }
+                Ok((more, _)) => read += more,
+                Err(e) if e.errno() == libc::EINTR => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "recvmsg from the fault handler: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    };
     let mut header = [0u8; HEADER_LEN];
-    (&mut &*stream).read_exact(&mut header)?;
+    read_exact(&mut header)?;
     let message_type = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice"));
     let body_len = u32::from_le_bytes(header[4..8].try_into().expect("4-byte slice"));
     if message_type != expected {
@@ -456,6 +499,6 @@ fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
         ));
     }
     let mut body = vec![0u8; body_len as usize];
-    (&mut &*stream).read_exact(&mut body)?;
+    read_exact(&mut body)?;
     Ok(body)
 }
