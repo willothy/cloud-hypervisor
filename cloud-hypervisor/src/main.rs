@@ -9,8 +9,7 @@ mod test_util;
 
 use std::fs::{self, File};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::from_ref;
 use std::sync::mpsc::channel;
 use std::{any, cmp, env, io, num, process, str};
