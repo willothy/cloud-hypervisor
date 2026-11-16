@@ -296,6 +296,7 @@ pub trait BackendFaultHandler: Send + Sync {
 pub struct BackendFaults {
     /// The device id the handler names the backend by.
     pub device: String,
+    /// The handler the backend's memory tables are handed to.
     pub handler: Arc<dyn BackendFaultHandler>,
 }
 

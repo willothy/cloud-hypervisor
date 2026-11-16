@@ -127,8 +127,11 @@ struct Capture {
 /// backend's address space and the range of this process's it maps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BackendRegion {
+    /// Start of the mapping in the backend's address space.
     backend_addr: u64,
+    /// Where this process maps the mapping's first byte.
     vmm_addr: u64,
+    /// Length of the mapping in bytes.
     length: u64,
 }
 
