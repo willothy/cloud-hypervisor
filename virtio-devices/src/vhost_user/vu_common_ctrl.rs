@@ -3,6 +3,7 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
+use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -153,15 +154,18 @@ impl VhostUserHandle {
             .vu
             .set_mem_table_postcopy(regions)
             .map_err(Error::VhostUserSetMemTable)?;
-        let mappings: Vec<BackendMapping> = regions
+        let mappings = regions
             .iter()
             .zip(bases)
-            .map(|(region, backend_addr)| BackendMapping {
-                backend_addr,
-                vmm_addr: region.userspace_addr,
-                length: region.memory_size,
+            .map(|(region, backend_addr)| {
+                Ok(BackendMapping {
+                    backend_addr,
+                    vmm_addr: region.userspace_addr,
+                    length: region.memory_size,
+                    page_size: Self::backing_page_size(region.mmap_handle)?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let connection = self
             .postcopy_connection
             .unwrap_or_else(|| NEXT_POSTCOPY_CONNECTION.fetch_add(1, Ordering::Relaxed));
@@ -178,6 +182,31 @@ impl VhostUserHandle {
         self.vu
             .postcopy_ack_mem_table()
             .map_err(Error::VhostUserPostcopyAck)
+    }
+
+    /// The page size of the guest memory backed by the file `fd`: the huge
+    /// page size on hugetlbfs, which reports it as the block size, else the
+    /// base page size.
+    fn backing_page_size(fd: RawFd) -> Result<u64> {
+        /// `HUGETLBFS_MAGIC` from linux/magic.h.
+        const HUGETLBFS_MAGIC: u64 = 0x9584_58f6;
+        let mut statfs = MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fstatfs fills the statfs it is given for a valid fd.
+        if unsafe { libc::fstatfs(fd, statfs.as_mut_ptr()) } != 0 {
+            return Err(Error::BackingPageSize(io::Error::last_os_error()));
+        }
+        // SAFETY: fstatfs succeeded, so it initialized the struct.
+        let statfs = unsafe { statfs.assume_init() };
+        // The field types differ between glibc and musl.
+        #[allow(clippy::unnecessary_cast)]
+        if statfs.f_type as u64 == HUGETLBFS_MAGIC {
+            return Ok(statfs.f_bsize as u64);
+        }
+        // SAFETY: sysconf reads a system constant.
+        match unsafe { libc::sysconf(libc::_SC_PAGESIZE) } {
+            size if size > 0 => Ok(size as u64),
+            _ => Err(Error::BackingPageSize(io::Error::last_os_error())),
+        }
     }
 
     pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {

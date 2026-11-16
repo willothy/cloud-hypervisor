@@ -133,6 +133,8 @@ struct BackendRegion {
     vmm_addr: u64,
     /// Length of the mapping in bytes.
     length: u64,
+    /// The page size of the mapping's backing.
+    page_size: u64,
 }
 
 /// The backend-handoff body: which device's backend, on which connection,
@@ -287,6 +289,7 @@ impl BackendFaultHandler for BackendFaultRelay {
                     backend_addr: mapping.backend_addr,
                     vmm_addr: mapping.vmm_addr,
                     length: mapping.length,
+                    page_size: mapping.page_size,
                 })
                 .collect(),
         })?;

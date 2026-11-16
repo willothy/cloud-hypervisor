@@ -102,6 +102,8 @@ pub enum Error {
     VhostUserPostcopyAck(#[source] VhostError),
     #[error("Handing the backend's userfaultfd to the fault handler failed")]
     AdoptBackendFaults(#[source] io::Error),
+    #[error("Reading the page size of a guest memory region's backing failed")]
+    BackingPageSize(#[source] io::Error),
     #[error(
         "Memory cannot be hot-plugged while guest RAM is demand-paged: the backend serves faults only on the memory tables the fault handler adopted"
     )]
@@ -263,6 +265,9 @@ pub struct BackendMapping {
     pub vmm_addr: u64,
     /// The region's length in bytes.
     pub length: u64,
+    /// The page size of the region's backing: a huge page size on
+    /// hugetlbfs, else the base page size.
+    pub page_size: u64,
 }
 
 /// Serves the faults vhost-user backends take on their own mappings of guest
