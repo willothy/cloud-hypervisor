@@ -14,12 +14,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 #[cfg(feature = "fw_cfg")]
 use std::ffi;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "riscv64"))]
@@ -89,6 +90,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::api::CaptureScope;
 use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -1385,7 +1387,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
-        restore_fault_socket: Option<std::path::PathBuf>,
+        restore_fault_socket: Option<&Path>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1451,7 +1453,7 @@ impl Vm {
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode,
-                    restore_fault_socket.as_deref(),
+                    restore_fault_socket,
                     phys_bits,
                     &exit_evt,
                 )
@@ -3054,7 +3056,7 @@ impl Vm {
     /// The number of guest pages dirtied since the last checkpoint, read
     /// without consuming the dirty set so checkpoint cadence can poll it
     /// between checkpoints.
-    pub fn dirty_page_count(&self) -> std::result::Result<u64, MigratableError> {
+    pub fn dirty_page_count(&self) -> result::Result<u64, MigratableError> {
         self.memory_manager
             .lock()
             .map_err(|e| {
@@ -3070,7 +3072,7 @@ impl Vm {
     /// untracked interval before it needs no tracking, and by the time any
     /// capture can run the guest is booted and its devices activated — which
     /// the log start requires.
-    fn device_dirty_ranges(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+    fn device_dirty_ranges(&mut self) -> result::Result<MemoryRangeTable, MigratableError> {
         if self.device_log_active {
             self.device_manager.lock().unwrap().dirty_log()
         } else {
@@ -3084,19 +3086,16 @@ impl Vm {
     /// consistently and without pausing the VM, writing the captured range
     /// table to a `<out_path>.ranges` sidecar so a caller can map the captured
     /// bytes back to guest-physical addresses.
-    pub fn capture_dirty_memory(
-        &mut self,
-        out_path: &str,
-    ) -> std::result::Result<(), MigratableError> {
+    pub fn capture_dirty_memory(&mut self, out_path: &str) -> result::Result<(), MigratableError> {
         let device_dirty = self.device_dirty_ranges()?;
         let table = self
             .memory_manager
             .lock()
             .unwrap()
-            .capture_dirty_background(std::path::Path::new(out_path), device_dirty)?;
+            .capture_dirty_background(Path::new(out_path), device_dirty)?;
         let json = serde_json::to_vec(&table)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("serializing range table: {e}")))?;
-        std::fs::write(format!("{out_path}.ranges"), json)
+        fs::write(format!("{out_path}.ranges"), json)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("writing range table: {e}")))?;
         Ok(())
     }
@@ -3117,9 +3116,9 @@ impl Vm {
     pub fn live_checkpoint(
         &mut self,
         destination_url: &str,
-        scope: crate::api::CaptureScope,
+        scope: CaptureScope,
         leave_paused: bool,
-    ) -> std::result::Result<(), MigratableError> {
+    ) -> result::Result<(), MigratableError> {
         // Brief pause to capture config + CPU/device state and arm write-protect
         // at a consistent point. If any of the paused-phase work fails, resume
         // before returning so a failed checkpoint never leaves the VM paused —
@@ -3166,23 +3165,22 @@ impl Vm {
     fn checkpoint_paused_phase(
         &mut self,
         destination_url: &str,
-        scope: crate::api::CaptureScope,
-    ) -> std::result::Result<Option<std::os::unix::net::UnixStream>, MigratableError> {
+        scope: CaptureScope,
+    ) -> result::Result<Option<UnixStream>, MigratableError> {
         let snapshot = self.snapshot()?;
 
         let mut config_path = url_to_path(destination_url)?;
         config_path.push(SNAPSHOT_CONFIG_FILE);
         let vm_config = serde_json::to_string(self.config.lock().unwrap().deref())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
-        std::fs::write(&config_path, vm_config.as_bytes())
+        fs::write(&config_path, vm_config.as_bytes())
             .map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         let mut state_path = url_to_path(destination_url)?;
         state_path.push(SNAPSHOT_STATE_FILE);
         let vm_state =
             serde_json::to_vec(&snapshot).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-        std::fs::write(&state_path, &vm_state)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        fs::write(&state_path, &vm_state).map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         // Arm the capture and record which bytes of the dense memory image
         // changed since the last checkpoint (as offsets into the memory-ranges
@@ -3200,8 +3198,7 @@ impl Vm {
         dirty_path.push("memory-dirty.ranges");
         let dirty_json =
             serde_json::to_vec(&dirty).map_err(|e| MigratableError::MigrateSend(e.into()))?;
-        std::fs::write(&dirty_path, &dirty_json)
-            .map_err(|e| MigratableError::MigrateSend(e.into()))?;
+        fs::write(&dirty_path, &dirty_json).map_err(|e| MigratableError::MigrateSend(e.into()))?;
 
         let mut memory_path = url_to_path(destination_url)?;
         // Matches MemoryManager's SNAPSHOT_FILENAME, which the restore reads.

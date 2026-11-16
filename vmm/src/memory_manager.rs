@@ -52,6 +52,7 @@ use vm_migration::{
 };
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::api::CaptureScope;
 use crate::config::MemoryRestoreMode;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -66,6 +67,11 @@ use crate::uffd::{
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, userfaultfd};
+
+/// What [`MemoryManager::arm_session_capture`] armed: the dirty ranges the
+/// capture's sidecar records, as `(offset, length)`, and the ranges handed to the
+/// fault handler to copy out.
+type ArmedCapture = (Vec<(u64, u64)>, Vec<handoff::CaptureRange>);
 
 struct UffdHandler {
     stop_event: EventFd,
@@ -1433,7 +1439,7 @@ impl MemoryManager {
                 uffd_fd.as_fd(),
                 host_addr,
                 range.length,
-                crate::userfaultfd::UFFDIO_REGISTER_MODE_WP,
+                userfaultfd::UFFDIO_REGISTER_MODE_WP,
             )
             .map_err(|e| UffdError::Register {
                 addr: host_addr,
@@ -1576,7 +1582,7 @@ impl MemoryManager {
         device_dirty: MemoryRangeTable,
     ) -> Result<MemoryRangeTable, MigratableError> {
         let layout = self.capture_layout()?;
-        let dirty = Self::coalesce_dirty(vec![self.dirty_log()?, device_dirty], &layout);
+        let dirty = Self::coalesce_dirty(&[self.dirty_log()?, device_dirty], &layout);
         let out = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1635,10 +1641,7 @@ impl MemoryManager {
     /// abutting RAM regions, whose host mappings need not abut — every
     /// consumer of the result translates a range through the region
     /// containing its start.
-    fn coalesce_dirty(
-        tables: Vec<MemoryRangeTable>,
-        layout: &MemoryRangeTable,
-    ) -> MemoryRangeTable {
+    fn coalesce_dirty(tables: &[MemoryRangeTable], layout: &MemoryRangeTable) -> MemoryRangeTable {
         let mut ranges: Vec<MemoryRange> = tables
             .iter()
             .flat_map(|table| table.ranges().iter().cloned())
@@ -1694,10 +1697,9 @@ impl MemoryManager {
     /// page (there is no active capture to own it).
     pub(crate) fn arm_session_capture(
         &mut self,
-        scope: crate::api::CaptureScope,
+        scope: CaptureScope,
         device_dirty: MemoryRangeTable,
-    ) -> Result<(Vec<(u64, u64)>, Vec<handoff::CaptureRange>), MigratableError> {
-        use crate::api::CaptureScope;
+    ) -> Result<ArmedCapture, MigratableError> {
         if self.fault_session.is_none() {
             return Err(MigratableError::MigrateSend(anyhow!(
                 "no fault handler owns guest RAM; was register_capture_uffd skipped?"
@@ -1732,7 +1734,7 @@ impl MemoryManager {
             )));
         }
 
-        let dirty = Self::coalesce_dirty(vec![self.dirty_log()?, device_dirty], &layout);
+        let dirty = Self::coalesce_dirty(&[self.dirty_log()?, device_dirty], &layout);
 
         // Dense base offset of each guest-RAM region, in capture order — the
         // layout the capture file uses, so offsets line up full or not.
@@ -1833,7 +1835,7 @@ impl MemoryManager {
                 // no memory passed in.
                 let data = unsafe { libc::lseek64(fd, cursor as i64, libc::SEEK_DATA) };
                 if data < 0 {
-                    let error = std::io::Error::last_os_error();
+                    let error = io::Error::last_os_error();
                     if error.raw_os_error() == Some(libc::ENXIO) {
                         break;
                     }
@@ -1850,7 +1852,7 @@ impl MemoryManager {
                 if hole < 0 {
                     return Err(MigratableError::MigrateSend(anyhow!(
                         "finding resident guest RAM: {}",
-                        std::io::Error::last_os_error()
+                        io::Error::last_os_error()
                     )));
                 }
                 let hole = (hole as u64).min(end);
@@ -1934,7 +1936,7 @@ impl MemoryManager {
     /// Counts KVM-tracked guest writes. VMM-side (device DMA) dirty pages are
     /// folded into the capture itself, not counted here — reading them would
     /// reset their software bitmap — and are negligible next to guest writes.
-    pub(crate) fn dirty_page_count(&self) -> std::result::Result<u64, MigratableError> {
+    pub(crate) fn dirty_page_count(&self) -> result::Result<u64, MigratableError> {
         let mut count = 0u64;
         for r in &self.guest_ram_mappings {
             let bitmap = self.vm.get_dirty_log(r.slot, r.gpa, r.size).map_err(|e| {

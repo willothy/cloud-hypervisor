@@ -15,7 +15,7 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, RecvError, SendError, Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
-use std::{any, io, mem, panic, path, process, result, thread};
+use std::{any, fs, io, mem, panic, path, process, result, thread};
 
 use anyhow::{Context, anyhow};
 #[cfg(feature = "dbus_api")]
@@ -974,7 +974,7 @@ impl Vmm {
     /// reason reads as an exit with no reason given.
     fn record_exit_reason(&self, reason: &str) {
         if let Some(path) = &self.exit_reason
-            && let Err(e) = std::fs::write(path, reason)
+            && let Err(e) = fs::write(path, reason)
         {
             error!("Error recording the exit reason at {}: {e}", path.display());
         }
@@ -2102,7 +2102,7 @@ impl Vmm {
         vm_config: Arc<Mutex<VmConfig>>,
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
-        restore_fault_socket: Option<std::path::PathBuf>,
+        restore_fault_socket: Option<&path::Path>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2782,7 +2782,7 @@ impl RequestHandler for Vmm {
                     vm_config,
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
-                    restore_cfg.restore_fault_socket,
+                    restore_cfg.restore_fault_socket.as_deref(),
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {

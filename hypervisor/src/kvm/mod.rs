@@ -1530,7 +1530,7 @@ impl vm::Vm for KvmVm {
         let ret = unsafe { ioctl_with_ref(&self.fd, KVM_CLEAR_DIRTY_LOG(), &clear) };
         if ret != 0 {
             return Err(vm::HypervisorVmError::ClearDirtyLog(
-                std::io::Error::last_os_error().into(),
+                io::Error::last_os_error().into(),
             ));
         }
         Ok(())
@@ -1815,7 +1815,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             ) <= 0
             {
                 return Err(hypervisor::HypervisorError::VmCreate(
-                    std::io::Error::other(
+                    io::Error::other(
                         "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is required but unsupported by this kernel",
                     )
                     .into(),
