@@ -3386,7 +3386,12 @@ impl VmConfig {
     pub fn check_postcopy_incompatible_device(&self) -> ValidationResult<()> {
         self.check_postcopy_incompatible_passthrough_device()?;
         if self.disks.iter().flatten().any(|disk| disk.vhost_user)
-            || self.has_non_disk_vhost_user_device()
+            || self.net.iter().flatten().any(|net| net.vhost_user)
+            || self.fs.as_ref().is_some_and(|fs| !fs.is_empty())
+            || self
+                .generic_vhost_user
+                .as_ref()
+                .is_some_and(|d| !d.is_empty())
         {
             return Err(ValidationError::PostcopyIncompatibleDevice(
                 "vhost-user".to_owned(),
@@ -3396,25 +3401,20 @@ impl VmConfig {
     }
 
     /// The devices an on-demand restore through an external fault handler
-    /// (`memory_fault_socket`) refuses: those
-    /// [`Self::check_postcopy_incompatible_device`] refuses, except vhost-user
-    /// block devices, which every demand-paged restore of a crucible VM has.
+    /// (`memory_fault_socket`) refuses: the passthrough devices
+    /// [`Self::check_postcopy_incompatible_device`] refuses.
     ///
-    /// This admits the hazard the general check refuses them for (WIL-279):
-    /// a vhost-user backend maps guest RAM in its own process, outside the
-    /// userfaultfd the fault handler serves, so a backend access to a page
-    /// the handler has not served yet reads zeros, or instantiates a zero
-    /// page the guest later sees instead of its own memory. Once backends
-    /// register their own userfaultfd with the fault handler, this exemption
-    /// narrows to the devices whose backend did.
+    /// vhost-user devices are admitted here because the gate on them is per
+    /// device, when it connects: a vhost-user backend maps guest RAM in its
+    /// own process, outside the userfaultfd the fault handler serves, so a
+    /// demand-paged VM requires every backend to negotiate the vhost-user
+    /// `PAGEFAULT` protocol feature and register its mappings with a
+    /// userfaultfd of its own, which is handed to the fault handler before
+    /// the backend can touch guest RAM. A backend that does not negotiate
+    /// it fails the restore, or the device's hot-plug, with
+    /// `BackendServesNoFaults`.
     pub fn check_fault_handler_restore_incompatible_device(&self) -> ValidationResult<()> {
-        self.check_postcopy_incompatible_passthrough_device()?;
-        if self.has_non_disk_vhost_user_device() {
-            return Err(ValidationError::PostcopyIncompatibleDevice(
-                "vhost-user".to_owned(),
-            ));
-        }
-        Ok(())
+        self.check_postcopy_incompatible_passthrough_device()
     }
 
     /// Refuses the passthrough devices (VFIO, vDPA, vfio-user) whose DMA
@@ -3436,16 +3436,6 @@ impl VmConfig {
             ));
         }
         Ok(())
-    }
-
-    /// Whether any vhost-user device other than a block device is attached.
-    fn has_non_disk_vhost_user_device(&self) -> bool {
-        self.net.iter().flatten().any(|net| net.vhost_user)
-            || self.fs.as_ref().is_some_and(|fs| !fs.is_empty())
-            || self
-                .generic_vhost_user
-                .as_ref()
-                .is_some_and(|d| !d.is_empty())
     }
 
     /// Identify if an emulated SMMUv3 is required based on configuration from every device
@@ -6046,14 +6036,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         };
         let fault_socket = Some(PathBuf::from("/path/to/fault.sock"));
 
-        // The fault handler path admits vhost-user block devices only.
+        // The fault handler path admits vhost-user devices of every kind:
+        // each must negotiate PAGEFAULT when it connects instead.
         restore(fault_socket.clone())
             .validate(&vm_config(true, false))
             .unwrap();
-        assert!(matches!(
-            restore(fault_socket).validate(&vm_config(true, true)),
-            Err(ValidationError::PostcopyIncompatibleDevice(_))
-        ));
+        restore(fault_socket)
+            .validate(&vm_config(true, true))
+            .unwrap();
         // Reading pages from the snapshot file still refuses every vhost-user
         // device.
         assert!(matches!(
