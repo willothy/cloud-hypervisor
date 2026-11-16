@@ -52,10 +52,10 @@ const MSG_BACKEND_HANDOFF: u32 = 4;
 /// Wire size of the fixed message header.
 const HEADER_LEN: usize = 8;
 
-/// Upper bound accepted for a capture-done body, defending the
-/// length-prefixed read against a corrupt peer. Done messages carry at most
-/// an error string.
-const MAX_DONE_LEN: u32 = 1024 * 1024;
+/// Upper bound accepted for the body of a message from the fault handler,
+/// defending the length-prefixed read against a corrupt peer. Its messages
+/// carry at most an error string.
+const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
 
 /// The fault-handling modes guest RAM was registered with before the
 /// handoff.
@@ -226,24 +226,7 @@ impl FaultSession {
     /// the peer's outcome: `Ok` when every armed page was captured, or the
     /// error that aborted the capture.
     pub(crate) fn wait_done(stream: &UnixStream) -> io::Result<Result<(), String>> {
-        let mut header = [0u8; HEADER_LEN];
-        (&mut &*stream).read_exact(&mut header)?;
-        let message_type = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice"));
-        let body_len = u32::from_le_bytes(header[4..8].try_into().expect("4-byte slice"));
-        if message_type != MSG_CAPTURE_DONE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected message type {message_type} from the fault handler"),
-            ));
-        }
-        if body_len > MAX_DONE_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("capture-done body of {body_len} bytes exceeds the bound"),
-            ));
-        }
-        let mut body = vec![0u8; body_len as usize];
-        (&mut &*stream).read_exact(&mut body)?;
+        let body = receive_message(stream, MSG_CAPTURE_DONE)?;
         match serde_json::from_slice(&body)? {
             CaptureOutcome::Success => Ok(Ok(())),
             CaptureOutcome::Failure { error } => Ok(Err(error)),
@@ -407,4 +390,28 @@ fn send_message(
     }
     use std::io::Write;
     (&mut &*stream).write_all(&body[sent - HEADER_LEN..])
+}
+
+/// Read one message from the fault handler on `stream`, blocking, and
+/// return its body, which must be of type `expected`.
+fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
+    let mut header = [0u8; HEADER_LEN];
+    (&mut &*stream).read_exact(&mut header)?;
+    let message_type = u32::from_le_bytes(header[0..4].try_into().expect("4-byte slice"));
+    let body_len = u32::from_le_bytes(header[4..8].try_into().expect("4-byte slice"));
+    if message_type != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected message type {message_type} from the fault handler"),
+        ));
+    }
+    if body_len > MAX_RECEIVED_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message body of {body_len} bytes from the fault handler exceeds the bound"),
+        ));
+    }
+    let mut body = vec![0u8; body_len as usize];
+    (&mut &*stream).read_exact(&mut body)?;
+    Ok(body)
 }
