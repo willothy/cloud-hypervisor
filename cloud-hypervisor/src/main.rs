@@ -642,7 +642,7 @@ fn start_vmm(
     api_socket_path: &Option<String>,
     api_socket_fd: Option<RawFd>,
 ) -> Result<(), Error> {
-    let log_level = log_level(cmd_arguments);
+    let level = log_level(cmd_arguments);
 
     let log_file: Box<dyn io::Write + Send> =
         if let Some(ref file) = cmd_arguments.get_one::<String>("log-file") {
@@ -654,7 +654,7 @@ fn start_vmm(
     let format = cmd_arguments.get_one::<String>("log-format").unwrap();
     let logger = Logger::new(log_file, format).map_err(Error::LoggerFormat)?;
     log::set_boxed_logger(Box::new(logger))
-        .map(|()| log::set_max_level(log_level))
+        .map(|()| log::set_max_level(level))
         .map_err(Error::LoggerSetup)?;
 
     let (api_request_sender, api_request_receiver) = channel();
@@ -1100,7 +1100,10 @@ mod tests {
     #[test]
     fn test_log_level() {
         let (default_vcpus, default_memory, default_rng) = prepare_default_values();
-        let level = |args: &[&str]| {
+        let level = |logging: &[&str]| {
+            let args = ["cloud-hypervisor", "--api-socket", "path=/run/api.sock"]
+                .iter()
+                .chain(logging);
             create_app(
                 default_vcpus.clone(),
                 default_memory.clone(),
@@ -1109,23 +1112,16 @@ mod tests {
             .try_get_matches_from(args)
             .map(|matches| log_level(&matches))
         };
+        assert_eq!(level(&[]).unwrap(), log::LevelFilter::Warn);
+        assert_eq!(level(&["-q"]).unwrap(), log::LevelFilter::Error);
+        assert_eq!(level(&["--quiet"]).unwrap(), log::LevelFilter::Error);
+        assert_eq!(level(&["-v"]).unwrap(), log::LevelFilter::Info);
+        assert_eq!(level(&["-vv"]).unwrap(), log::LevelFilter::Debug);
+        assert_eq!(level(&["-vvv"]).unwrap(), log::LevelFilter::Trace);
         assert_eq!(
-            level(&["cloud-hypervisor"]).unwrap(),
-            log::LevelFilter::Warn
+            level(&["-q", "-v"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
         );
-        assert_eq!(
-            level(&["cloud-hypervisor", "-q"]).unwrap(),
-            log::LevelFilter::Error
-        );
-        assert_eq!(
-            level(&["cloud-hypervisor", "--quiet"]).unwrap(),
-            log::LevelFilter::Error
-        );
-        assert_eq!(
-            level(&["cloud-hypervisor", "-vv"]).unwrap(),
-            log::LevelFilter::Debug
-        );
-        level(&["cloud-hypervisor", "-q", "-v"]).unwrap_err();
     }
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
