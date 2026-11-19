@@ -88,10 +88,12 @@ impl SocketConsole {
     /// job, and the deadline bounds what a client that stopped reading can
     /// cost the caller.
     ///
-    /// Returns once the buffer is empty, or at once when no client is
-    /// attached, since the bytes then have nowhere to go. Fails with
-    /// `TimedOut` when bytes are still buffered at the deadline, and with
-    /// `BrokenPipe` when the client hangs up first.
+    /// Returns once the client's socket has taken every buffered byte, or at
+    /// once when no client is attached, since the bytes then have nowhere to
+    /// go. Fails with `TimedOut` when bytes are still buffered at the
+    /// deadline. A client that hangs up or shuts down its reading side ends
+    /// the drain early: with the failed write's own error, such as EPIPE or
+    /// ECONNRESET, or with `BrokenPipe` when ppoll reports the hang-up first.
     pub fn drain_output(&self, timeout: Duration) -> io::Result<()> {
         let Some(writable) = self.writable.as_ref() else {
             return Ok(());
@@ -105,7 +107,7 @@ impl SocketConsole {
         loop {
             let pending = {
                 let mut buffer = self.buffer.lock().unwrap();
-                buffer.flush()?;
+                buffer.write_buffered()?;
                 buffer.pending_len()
             };
             if pending == 0 {
@@ -115,7 +117,7 @@ impl SocketConsole {
             if remaining.is_zero() {
                 return Err(io::Error::new(
                     ErrorKind::TimedOut,
-                    format!("{pending} byte(s) still unread by the client"),
+                    format!("{pending} byte(s) not taken by the client's socket"),
                 ));
             }
             let mut pollfd = libc::pollfd {
@@ -128,8 +130,10 @@ impl SocketConsole {
                 tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
             };
             // SAFETY: `pollfd` and `wait` are locals that outlive the call,
-            // the count of 1 matches the single pollfd, and a null signal mask
-            // leaves the thread's mask as it is.
+            // the count of 1 matches the single pollfd, whose fd `writable`
+            // keeps open throughout, `tv_nsec` is below one second as ppoll
+            // requires, and a null signal mask leaves the thread's mask as it
+            // is.
             let ret = unsafe { libc::ppoll(&mut pollfd, 1, &wait, ptr::null()) };
             if ret < 0 {
                 let e = io::Error::last_os_error();
@@ -141,7 +145,7 @@ impl SocketConsole {
             if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
                 return Err(io::Error::new(
                     ErrorKind::BrokenPipe,
-                    format!("the client hung up with {pending} byte(s) unread"),
+                    format!("the client hung up with {pending} byte(s) not delivered"),
                 ));
             }
         }
@@ -202,6 +206,7 @@ impl Read for SocketConsole {
 #[cfg(test)]
 mod tests {
     use std::io::{self, ErrorKind, Read, Write};
+    use std::net::Shutdown;
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::time::{Duration, Instant};
@@ -490,6 +495,35 @@ mod tests {
         console.out_sink().write_all(&backlog()).unwrap();
         drop(client);
 
+        // The client left output unread, so the kernel may report the
+        // hang-up to the next write as a reset rather than a broken pipe.
+        let start = Instant::now();
+        let err = console.drain_output(Duration::from_secs(30)).unwrap_err();
+        assert!(
+            matches!(
+                err.kind(),
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn drain_output_stops_when_the_client_stops_reading() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut console = SocketConsole::new();
+
+        let client = UnixStream::connect(&path).unwrap();
+        console.accept(&listener).unwrap();
+        shrink_send_buffer(&console);
+        console.out_sink().write_all(&backlog()).unwrap();
+        client.shutdown(Shutdown::Read).unwrap();
+
+        // The console's socket still polls writable, but every write to it
+        // fails, so the drain must not wait for the deadline.
         let start = Instant::now();
         let err = console.drain_output(Duration::from_secs(30)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::BrokenPipe);
