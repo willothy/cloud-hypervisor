@@ -192,6 +192,54 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   page-cache sharing is lost for that VM and host memory use grows to the
   eager-copy level. The same applies to `ondemand` restores.
 
+### The guest clock after a restore
+
+By default a restore advances the guest clock by the wall time that passed
+since the snapshot (`clock_restore_mode=advance`). That suits a VM that was
+suspended and is being brought back: its wall clock is right again without
+help from the guest.
+
+With `clock_restore_mode=hold` the guest resumes with its clocks where the
+snapshot left them, as if no time had passed:
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,clock_restore_mode=hold
+```
+
+This is meant for starting fresh guests from one snapshot of any age. Uptime
+and the monotonic clocks continue from the snapshot and no timer fires early.
+The guest's wall clock is behind by the snapshot's age until the guest sets
+it.
+
+What the modes do depends on the architecture and the hypervisor:
+
+- x86_64 with KVM: `advance` sets kvmclock back together with the wall time
+  captured at the snapshot, so KVM adds the time that passed since. The TSC
+  continues from the value saved with each vCPU in both modes. A guest whose
+  clocksource is `tsc` therefore keeps its monotonic clock under `advance`
+  too, and only its scheduler clock, which reads kvmclock, moves forward.
+  `hold` sets kvmclock to its saved value plus what the TSC has counted since
+  that value was captured: the few milliseconds the TSC ran while the
+  snapshot was written and the restore got this far. kvmclock and the TSC
+  then agree in the guest as they did before the snapshot, which a guest's
+  clocksource watchdog checks.
+- aarch64 with KVM: `advance` adds the time that passed to the virtual
+  counter; `hold` writes the saved counter back unadvanced. `hold` has not
+  been tested on aarch64.
+- MSHV: the partition reference time is restored as saved in both modes.
+
+On x86_64 with KVM, `hold` needs a snapshot that recorded the guest TSC beside
+its clock. Every pause records it, in the snapshot state's `clock_tsc` field.
+A snapshot without the field, written by a version that did not record it or
+by a pause that could not sample the two closely enough, restores with
+`advance` as before and is refused with `hold`.
+
+The mode governs the first resume after the restore. Pausing and resuming the
+restored VM later behaves like any other pause and resume, and a migrated VM's
+clock always advances.
+
 ## Restore a VM with new Net FDs
 For a VM created with FDs explicitly passed to NetConfig, a set of valid FDs
 need to be provided along with the VM restore command in the following syntax:
