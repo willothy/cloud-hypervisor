@@ -490,6 +490,14 @@ fn get_cli_options_sorted(
             .num_args(0)
             .action(ArgAction::SetTrue)
             .group("vm-config"),
+        Arg::new("quiet")
+            .short('q')
+            .long("quiet")
+            .help("Log errors only")
+            .num_args(0)
+            .action(ArgAction::SetTrue)
+            .conflicts_with("v")
+            .group("logging"),
         Arg::new("rate-limit-group")
             .long("rate-limit-group")
             .help(RateLimiterGroupConfig::SYNTAX)
@@ -615,17 +623,26 @@ fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Optio
     }
 }
 
+/// The most verbose level the VMM logs at: errors only with `-q`, warnings by
+/// default, and more for each `-v`.
+fn log_level(cmd_arguments: &ArgMatches) -> LevelFilter {
+    if cmd_arguments.get_flag("quiet") {
+        return LevelFilter::Error;
+    }
+    match cmd_arguments.get_count("v") {
+        0 => LevelFilter::Warn,
+        1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    }
+}
+
 fn start_vmm(
     cmd_arguments: &ArgMatches,
     api_socket_path: &Option<String>,
     api_socket_fd: Option<RawFd>,
 ) -> Result<(), Error> {
-    let log_level = match cmd_arguments.get_count("v") {
-        0 => LevelFilter::Warn,
-        1 => LevelFilter::Info,
-        2 => LevelFilter::Debug,
-        _ => LevelFilter::Trace,
-    };
+    let level = log_level(cmd_arguments);
 
     let log_file: Box<dyn io::Write + Send> =
         if let Some(ref file) = cmd_arguments.get_one::<String>("log-file") {
@@ -637,7 +654,7 @@ fn start_vmm(
     let format = cmd_arguments.get_one::<String>("log-format").unwrap();
     let logger = Logger::new(log_file, format).map_err(Error::LoggerFormat)?;
     log::set_boxed_logger(Box::new(logger))
-        .map(|()| log::set_max_level(log_level))
+        .map(|()| log::set_max_level(level))
         .map_err(Error::LoggerSetup)?;
 
     let (api_request_sender, api_request_receiver) = channel();
@@ -1050,7 +1067,9 @@ mod tests {
     };
 
     use crate::test_util::assert_args_sorted;
-    use crate::{SeccompSiginfo, create_app, get_cli_options_sorted, prepare_default_values};
+    use crate::{
+        SeccompSiginfo, create_app, get_cli_options_sorted, log_level, prepare_default_values,
+    };
 
     #[test]
     fn test_seccomp_siginfo_output() {
@@ -1076,6 +1095,33 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn test_log_level() {
+        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+        let level = |logging: &[&str]| {
+            let args = ["cloud-hypervisor", "--api-socket", "path=/run/api.sock"]
+                .iter()
+                .chain(logging);
+            create_app(
+                default_vcpus.clone(),
+                default_memory.clone(),
+                default_rng.clone(),
+            )
+            .try_get_matches_from(args)
+            .map(|matches| log_level(&matches))
+        };
+        assert_eq!(level(&[]).unwrap(), log::LevelFilter::Warn);
+        assert_eq!(level(&["-q"]).unwrap(), log::LevelFilter::Error);
+        assert_eq!(level(&["--quiet"]).unwrap(), log::LevelFilter::Error);
+        assert_eq!(level(&["-v"]).unwrap(), log::LevelFilter::Info);
+        assert_eq!(level(&["-vv"]).unwrap(), log::LevelFilter::Debug);
+        assert_eq!(level(&["-vvv"]).unwrap(), log::LevelFilter::Trace);
+        assert_eq!(
+            level(&["-q", "-v"]).unwrap_err().kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
     }
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
