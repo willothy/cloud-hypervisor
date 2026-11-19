@@ -1392,6 +1392,7 @@ impl Vmm {
             false,
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
+            self.exit_reason.as_deref(),
         )
         .context("Error creating MemoryManager from snapshot")
         .map_err(MigratableError::MigrateReceive)?;
@@ -2156,6 +2157,7 @@ impl Vmm {
                     Some(prefault),
                     Some(memory_restore_mode),
                     restore_fault_socket,
+                    self.exit_reason.as_deref(),
                 )?;
 
                 if self
@@ -2600,6 +2602,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            self.exit_reason.as_deref(),
                         )?;
 
                         let r = vm.boot();
@@ -2889,6 +2892,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            self.exit_reason.as_deref(),
         )?;
 
         // And we boot it

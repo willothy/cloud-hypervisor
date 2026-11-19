@@ -289,6 +289,10 @@ pub struct MemoryManager {
     /// path. Live checkpoints arm on it and delegate their copy-out to the
     /// peer.
     fault_session: Option<FaultSession>,
+    /// Where the VMM records why it exits, when it was asked to. A fault
+    /// session that is lost ends the process, and a reason recorded there is
+    /// what keeps that exit from reading as a crash.
+    exit_reason: Option<PathBuf>,
     /// The guest-RAM layout `(gpa, length)` the session's uffd registration
     /// covers. Registration happens once at VM startup, so a checkpoint's arm
     /// verifies the layout has not changed since — hotplugged regions would
@@ -1195,6 +1199,7 @@ impl MemoryManager {
             regions,
             uffd.into_fd(),
             &memfds,
+            self.exit_reason.as_deref(),
         )
         .map_err(Error::FaultSession)?;
         self.fault_session = Some(session);
@@ -1482,6 +1487,7 @@ impl MemoryManager {
             regions,
             uffd_fd,
             &memfds,
+            self.exit_reason.as_deref(),
         )
         .map_err(Error::FaultSession)?;
         self.fault_session = Some(session);
@@ -2608,6 +2614,7 @@ impl MemoryManager {
         Ok(())
     }
 
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         vm: Arc<dyn hypervisor::Vm>,
         config: &MemoryConfig,
@@ -2616,6 +2623,7 @@ impl MemoryManager {
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
+        exit_reason: Option<&Path>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
@@ -2862,6 +2870,7 @@ impl MemoryManager {
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
             fault_session: None,
+            exit_reason: exit_reason.map(Path::to_path_buf),
             uffd_registered_layout: Vec::new(),
             demand_paged: false,
 
@@ -2889,6 +2898,7 @@ impl MemoryManager {
         restore_fault_socket: Option<&Path>,
         phys_bits: u8,
         exit_evt: &EventFd,
+        exit_reason: Option<&Path>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
@@ -2906,6 +2916,7 @@ impl MemoryManager {
                 false,
                 Some(&mem_snapshot),
                 Default::default(),
+                exit_reason,
             )?;
 
             if !mem_snapshot.memory_ranges.is_empty() {
@@ -4741,6 +4752,7 @@ mod tests {
             Vec::new(),
             uffd_stand_in,
             &[],
+            None,
         )
         .unwrap();
         _handler = listener.accept().unwrap().0;
@@ -4762,6 +4774,7 @@ mod tests {
             false,
             None,
             Default::default(),
+            None,
         )
         .unwrap();
 

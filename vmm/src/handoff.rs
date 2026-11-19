@@ -30,10 +30,10 @@
 //! with `BackendVerdict` (type 5) once it has adopted the table or refused
 //! it.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
 use std::{io, process};
@@ -70,6 +70,11 @@ const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
 /// body past the bound is refused here, failing that one checkpoint with a
 /// reason: sending it would end the session, which the VM cannot survive.
 const MAX_CAPTURE_BODY_LEN: usize = 1 << 30;
+
+/// The reason the VMM records when it exits because its fault session is gone.
+/// Its manager settles a VMM that recorded this as failed, rather than as one
+/// that crashed and is restored from its latest checkpoint.
+const SESSION_LOST: &str = "session-lost";
 
 /// The fault-handling modes guest RAM was registered with before the
 /// handoff.
@@ -192,13 +197,15 @@ impl FaultSession {
     /// Connect to the fault handler listening on `socket` and hand it the
     /// registered userfaultfd with the guest-RAM layout. `memfds` are the
     /// files backing the regions, in the order `HandoffRegion::memfd`
-    /// indexes.
+    /// indexes. `exit_reason` is where the VMM records why it exits, which a
+    /// lost session's hangup watch writes before ending the process.
     pub(crate) fn establish(
         socket: &Path,
         mode: RegistrationMode,
         regions: Vec<HandoffRegion>,
         uffd: OwnedFd,
         memfds: &[RawFd],
+        exit_reason: Option<&Path>,
     ) -> io::Result<Self> {
         let stream = UnixStream::connect(socket)?;
         let body = serde_json::to_vec(&Handoff { mode, regions })?;
@@ -206,7 +213,7 @@ impl FaultSession {
         fds.push(uffd.as_raw_fd());
         fds.extend_from_slice(memfds);
         send_message(&stream, MSG_HANDOFF, &body, &fds)?;
-        let hangup = HangupWatch::spawn(stream.try_clone()?)?;
+        let hangup = HangupWatch::spawn(stream.try_clone()?, exit_reason)?;
         Ok(Self {
             _hangup: hangup,
             stream,
@@ -338,9 +345,11 @@ impl BackendFaultHandler for BackendFaultRelay {
 /// The handler owns every fault on guest RAM. Once it is gone, a vCPU that
 /// touches a missing or write-protected page sleeps in the kernel until a
 /// fatal signal, so the VM can neither run nor shut down. On a hangup the
-/// watch logs it and exits the process without recording an exit reason:
-/// the VMM can no longer run the VM, and its manager restores the VM from
-/// its last checkpoint.
+/// watch logs it, records [`SESSION_LOST`] where the VMM was asked to record
+/// why it exits, and ends the process: the VMM can no longer run the VM, and
+/// its manager reads the recorded reason — that the fault session was lost,
+/// not that the VMM crashed — as a VM failure to report rather than as a
+/// checkpoint to rewind to.
 ///
 /// Only `POLLRDHUP` is polled for, so capture-done messages stay queued for
 /// [`FaultSession::wait_done`].
@@ -350,13 +359,15 @@ struct HangupWatch {
 }
 
 impl HangupWatch {
-    /// Start watching `stream`, a clone of the session's connection.
-    fn spawn(stream: UnixStream) -> io::Result<Self> {
+    /// Start watching `stream`, a clone of the session's connection, and
+    /// record [`SESSION_LOST`] at `exit_reason` should it hang up.
+    fn spawn(stream: UnixStream, exit_reason: Option<&Path>) -> io::Result<Self> {
         let stop = EventFd::new(0)?;
         let stopped = stop.try_clone()?;
+        let exit_reason: Option<PathBuf> = exit_reason.map(Path::to_path_buf);
         let thread = Builder::new()
             .name("fault_hangup".to_string())
-            .spawn(move || Self::watch(&stream, &stopped))?;
+            .spawn(move || Self::watch(&stream, &stopped, exit_reason.as_deref()))?;
         Ok(Self {
             stop,
             thread: Some(thread),
@@ -365,7 +376,7 @@ impl HangupWatch {
 
     /// Block until `stop` is signalled, returning, or the peer hangs up,
     /// ending the process.
-    fn watch(stream: &UnixStream, stop: &EventFd) {
+    fn watch(stream: &UnixStream, stop: &EventFd, exit_reason: Option<&Path>) {
         let mut fds = [
             libc::pollfd {
                 fd: stream.as_raw_fd(),
@@ -390,7 +401,7 @@ impl HangupWatch {
                 // An unwatched session would leave a hangup to wedge the
                 // VM, so losing the watch ends the VM as a hangup does.
                 error!("watching the fault-handler connection failed: {error}");
-                Self::exit();
+                Self::exit(exit_reason);
             }
             if fds[1].revents != 0 {
                 return;
@@ -399,13 +410,21 @@ impl HangupWatch {
                 error!(
                     "the fault handler closed the VM's fault session; guest memory can no longer be served"
                 );
-                Self::exit();
+                Self::exit(exit_reason);
             }
         }
     }
 
-    /// End the process, flushing the log first.
-    fn exit() -> ! {
+    /// Record why the VMM is exiting, at the path it was given when it has
+    /// one, then end the process, flushing the log first. A failure to write
+    /// is logged: the VMM exits either way, and a missing reason reads as an
+    /// exit with no reason given.
+    fn exit(exit_reason: Option<&Path>) -> ! {
+        if let Some(path) = exit_reason
+            && let Err(error) = fs::write(path, SESSION_LOST)
+        {
+            error!("recording the exit reason at {}: {error}", path.display());
+        }
         log::logger().flush();
         process::exit(1)
     }
