@@ -50,6 +50,12 @@ impl SerialBuffer {
     pub fn set_out(&mut self, out: Box<dyn Write + Send>) {
         self.out = out;
     }
+
+    /// Returns how many bytes are buffered, not yet written to the out
+    /// device.
+    fn pending_len(&self) -> usize {
+        self.buffer.len()
+    }
 }
 
 impl Write for SerialBuffer {

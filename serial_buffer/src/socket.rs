@@ -7,8 +7,10 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::Shutdown;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::SerialBuffer;
 
@@ -80,6 +82,71 @@ impl SocketConsole {
         self.buffer.lock().unwrap().flush()
     }
 
+    /// Writes out everything still buffered for the client, waiting at most
+    /// `timeout` for the client to read it. This is the final flush before
+    /// the console goes away, when no later EPOLLOUT edge will finish the
+    /// job, and the deadline bounds what a client that stopped reading can
+    /// cost the caller.
+    ///
+    /// Returns once the buffer is empty, or at once when no client is
+    /// attached, since the bytes then have nowhere to go. Fails with
+    /// `TimedOut` when bytes are still buffered at the deadline, and with
+    /// `BrokenPipe` when the client hangs up first.
+    pub fn drain_output(&self, timeout: Duration) -> io::Result<()> {
+        let Some(writable) = self.writable.as_ref() else {
+            return Ok(());
+        };
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("drain timeout {timeout:?} is out of range"),
+            )
+        })?;
+        loop {
+            let pending = {
+                let mut buffer = self.buffer.lock().unwrap();
+                buffer.flush()?;
+                buffer.pending_len()
+            };
+            if pending == 0 {
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("{pending} byte(s) still unread by the client"),
+                ));
+            }
+            let mut pollfd = libc::pollfd {
+                fd: writable.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let wait = libc::timespec {
+                tv_sec: libc::time_t::try_from(remaining.as_secs()).unwrap_or(libc::time_t::MAX),
+                tv_nsec: libc::c_long::from(remaining.subsec_nanos()),
+            };
+            // SAFETY: `pollfd` and `wait` are locals that outlive the call,
+            // the count of 1 matches the single pollfd, and a null signal mask
+            // leaves the thread's mask as it is.
+            let ret = unsafe { libc::ppoll(&mut pollfd, 1, &wait, ptr::null()) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if pollfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                return Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    format!("the client hung up with {pending} byte(s) unread"),
+                ));
+            }
+        }
+    }
+
     pub fn shutdown(&mut self) -> io::Result<()> {
         if let Some(stream) = self.reader.take() {
             let res = stream.shutdown(Shutdown::Both);
@@ -137,7 +204,7 @@ mod tests {
     use std::io::{self, ErrorKind, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use std::{fs, thread};
 
     use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
@@ -355,6 +422,88 @@ mod tests {
         }
         assert!(flushes > 0, "no byte waited for an EPOLLOUT edge");
         assert!(got == data, "bytes arrived out of order");
+    }
+
+    /// Output far larger than the client's socket takes at once, so most of
+    /// it stays buffered in the console, as the tail of the guest's output
+    /// does when its reader lags.
+    fn backlog() -> Vec<u8> {
+        (0..512 * 1024).map(|i: usize| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn drain_output_delivers_the_backlog_to_a_slow_client() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut console = SocketConsole::new();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        console.accept(&listener).unwrap();
+        shrink_send_buffer(&console);
+
+        let data = backlog();
+        console.out_sink().write_all(&data).unwrap();
+
+        let len = data.len();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            let mut got = vec![0u8; len];
+            client.read_exact(&mut got).unwrap();
+            got
+        });
+        console.drain_output(Duration::from_secs(30)).unwrap();
+        assert!(reader.join().unwrap() == data, "bytes arrived out of order");
+    }
+
+    #[test]
+    fn drain_output_gives_up_on_a_stuck_client_at_its_deadline() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut console = SocketConsole::new();
+
+        let _client = UnixStream::connect(&path).unwrap();
+        console.accept(&listener).unwrap();
+        shrink_send_buffer(&console);
+        console.out_sink().write_all(&backlog()).unwrap();
+
+        let timeout = Duration::from_millis(200);
+        let start = Instant::now();
+        let err = console.drain_output(timeout).unwrap_err();
+        let waited = start.elapsed();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        assert!(waited >= timeout, "gave up after {waited:?}");
+        assert!(waited < Duration::from_secs(10), "waited {waited:?}");
+    }
+
+    #[test]
+    fn drain_output_stops_when_the_client_hangs_up() {
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut console = SocketConsole::new();
+
+        let client = UnixStream::connect(&path).unwrap();
+        console.accept(&listener).unwrap();
+        shrink_send_buffer(&console);
+        console.out_sink().write_all(&backlog()).unwrap();
+        drop(client);
+
+        let start = Instant::now();
+        let err = console.drain_output(Duration::from_secs(30)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::BrokenPipe);
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn drain_output_without_a_client_returns_at_once() {
+        let console = SocketConsole::new();
+        console
+            .out_sink()
+            .write_all(b"no one is listening\n")
+            .unwrap();
+        console.drain_output(Duration::from_secs(30)).unwrap();
     }
 
     #[test]
