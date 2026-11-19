@@ -250,6 +250,26 @@ mod tests {
         assert!(console.writable_fd().is_none());
     }
 
+    /// Shrinks the console's send buffer well below what the tests write. A
+    /// Unix stream socket's sender is limited by its own send buffer, so
+    /// this is what makes the client's socket refuse output with
+    /// WouldBlock.
+    fn shrink_send_buffer(console: &SocketConsole) {
+        let sndbuf: libc::c_int = 64 * 1024;
+        // SAFETY: the fd is the console's open socket, and the option value
+        // points at a c_int that outlives the call, with its size passed.
+        let ret = unsafe {
+            libc::setsockopt(
+                console.writable_fd().unwrap(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const sndbuf).cast(),
+                libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap(),
+            )
+        };
+        assert_eq!(ret, 0, "setsockopt: {}", io::Error::last_os_error());
+    }
+
     /// Counts the fds `epoll` watches, as the kernel lists them in its
     /// fdinfo: an entry stays listed until its open file is released.
     fn watched_fds(epoll: &Epoll) -> usize {
@@ -292,22 +312,7 @@ mod tests {
         let mut client = UnixStream::connect(&path).unwrap();
         console.accept(&listener).unwrap();
         client.set_nonblocking(true).unwrap();
-
-        // A Unix stream socket's sender is limited by its own send buffer,
-        // so shrink the console's well below what the test writes.
-        let sndbuf: libc::c_int = 64 * 1024;
-        // SAFETY: the fd is the console's open socket, and the option value
-        // points at a c_int that outlives the call, with its size passed.
-        let ret = unsafe {
-            libc::setsockopt(
-                console.writable_fd().unwrap(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const sndbuf).cast(),
-                libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap(),
-            )
-        };
-        assert_eq!(ret, 0, "setsockopt: {}", io::Error::last_os_error());
+        shrink_send_buffer(&console);
 
         let epoll = watch_like_the_serial_manager(&console);
         let mut events = [EpollEvent::default(); 4];
