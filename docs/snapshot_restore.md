@@ -220,11 +220,18 @@ What the modes do depends on the architecture and the hypervisor:
   continues from the value saved with each vCPU in both modes. A guest whose
   clocksource is `tsc` therefore keeps its monotonic clock under `advance`
   too, and only its scheduler clock, which reads kvmclock, moves forward.
-  `hold` sets kvmclock to its saved value plus what the TSC has counted since
-  that value was captured: the few milliseconds the TSC ran while the
-  snapshot was written and the restore got this far. kvmclock and the TSC
-  then agree in the guest as they did before the snapshot, which a guest's
-  clocksource watchdog checks.
+  `hold` sets kvmclock to its saved value plus exactly what the guest TSC has
+  counted since that value was captured. The TSC runs whether or not the
+  vCPUs do, and each vCPU resumes from the value saved with it, so by the
+  time the clock is set the TSC has counted through the gap between the
+  clock's capture and the vCPU's own and through the restore up to that
+  point: none of it is time the guest ran, and on a guest of many gigabytes
+  it is seconds rather than milliseconds. Setting kvmclock back to its saved
+  value alone would leave it behind the TSC by that much, and a guest whose
+  clocksource watchdog compares the two marks the TSC unstable for it;
+  adding the count back leaves kvmclock and the TSC agreeing in the guest as
+  they did before the snapshot. Neither the snapshot's write time nor its
+  age enters this.
 - aarch64 with KVM: `advance` adds the time that passed to the virtual
   counter; `hold` writes the saved counter back unadvanced. `hold` has not
   been tested on aarch64.

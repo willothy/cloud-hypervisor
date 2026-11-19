@@ -682,11 +682,20 @@ pub struct KvmVm {
 }
 
 impl KvmVm {
-    /// How long the guest TSC takes to count `ticks` at `tsc_khz`.
+    /// How many nanoseconds the guest TSC takes to count `ticks` at
+    /// `tsc_khz`.
+    ///
+    /// A count too large for a nanosecond value to hold is an error, not
+    /// something to clamp: the TSC deltas here are a pairing bracket and the
+    /// time a restore took, so one that does not fit means the counters being
+    /// subtracted are not the ones intended, and a restore that resumed a
+    /// guest with its clock a counter-width away from where it was would be
+    /// worse than one that refuses.
     #[cfg(target_arch = "x86_64")]
-    fn tsc_ticks_duration(ticks: u64, tsc_khz: u32) -> Duration {
+    fn tsc_ticks_nanos(ticks: u64, tsc_khz: u32) -> anyhow::Result<u64> {
         let nanos = u128::from(ticks) * 1_000_000 / u128::from(tsc_khz);
-        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+        u64::try_from(nanos)
+            .with_context(|| format!("A count of {ticks} TSC ticks is not a nanosecond value"))
     }
 
     /// Sample kvmclock between two reads of the boot vCPU's TSC and return it
@@ -710,7 +719,7 @@ impl KvmVm {
             let before = boot_vcpu.tsc()?;
             let state = vm::Vm::get_clock(self)?;
             let bracket = boot_vcpu.tsc()?.wrapping_sub(before);
-            let width = Self::tsc_ticks_duration(bracket, tsc_khz);
+            let width = Duration::from_nanos(Self::tsc_ticks_nanos(bracket, tsc_khz)?);
             if width <= CLOCK_TSC_PAIRING_BOUND {
                 debug!("Guest clock paired with the TSC within {width:?}");
                 return Ok(Some((state, before.wrapping_add(bracket / 2))));
@@ -744,6 +753,11 @@ impl KvmVm {
     /// bound, 150 us, against the watchdog margin given there. Once set,
     /// kvmclock and the TSC both count with the host, so the time left until
     /// the vCPUs enter the guest moves them alike and adds nothing.
+    ///
+    /// A count too large to be a nanosecond value, or one that would carry
+    /// the captured value past what kvmclock holds, is refused: the counters
+    /// a restore reads are supposed to be the guest's, and one that says
+    /// otherwise is not something to resume a guest on.
     #[cfg(target_arch = "x86_64")]
     fn hold_clock(&self, vcpus: &[&dyn cpu::Vcpu], clock: &CapturedClock) -> anyhow::Result<()> {
         let boot_vcpu = vcpus
@@ -765,15 +779,21 @@ impl KvmVm {
                     "The guest TSC ({before}) is behind where the clock was captured ({saved_tsc})"
                 )
             })?;
-            let ran = Self::tsc_ticks_duration(counted, tsc_khz);
-            let ran_ns = u64::try_from(ran.as_nanos()).unwrap_or(u64::MAX);
+            let ran_ns = Self::tsc_ticks_nanos(counted, tsc_khz)?;
+            let ran = Duration::from_nanos(ran_ns);
+            let clock = held.clock.checked_add(ran_ns).with_context(|| {
+                format!(
+                    "Holding the clock {ran:?} past its captured value ({}) would pass what kvmclock holds",
+                    held.clock
+                )
+            })?;
             self.fd
-                .set_clock(&kvm_clock_data {
-                    clock: held.clock.wrapping_add(ran_ns),
-                    ..held
-                })
+                .set_clock(&kvm_clock_data { clock, ..held })
                 .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
-            let width = Self::tsc_ticks_duration(boot_vcpu.tsc()?.wrapping_sub(before), tsc_khz);
+            let width = Duration::from_nanos(Self::tsc_ticks_nanos(
+                boot_vcpu.tsc()?.wrapping_sub(before),
+                tsc_khz,
+            )?);
             if width <= CLOCK_TSC_PAIRING_BOUND {
                 debug!(
                     "Guest clock held {ran:?} past its captured value, within {width:?} of the TSC"
@@ -4471,7 +4491,10 @@ mod tests {
         let clock_ran = Duration::from_nanos(
             kvm_clock_data::from(second.state).clock - kvm_clock_data::from(first.state).clock,
         );
-        let tsc_ran = KvmVm::tsc_ticks_duration(second.tsc.unwrap() - first.tsc.unwrap(), tsc_khz);
+        let tsc_ran = Duration::from_nanos(
+            KvmVm::tsc_ticks_nanos(second.tsc.unwrap() - first.tsc.unwrap(), tsc_khz)
+                .expect("a plausible TSC delta"),
+        );
         assert!(clock_ran >= Duration::from_millis(20));
         assert!(
             clock_ran.abs_diff(tsc_ran) <= CLOCK_TSC_PAIRING_BOUND,
@@ -4519,7 +4542,10 @@ mod tests {
         for vcpu in vcpus {
             let held = vm.snapshot_clock(vcpu).unwrap().unwrap();
             let clock_ran = Duration::from_nanos(kvm_clock_data::from(held.state).clock - saved_ns);
-            let tsc_ran = KvmVm::tsc_ticks_duration(held.tsc.unwrap() - saved_tsc, tsc_khz);
+            let tsc_ran = Duration::from_nanos(
+                KvmVm::tsc_ticks_nanos(held.tsc.unwrap() - saved_tsc, tsc_khz)
+                    .expect("a plausible TSC delta"),
+            );
             assert!(clock_ran >= Duration::from_millis(20));
             assert!(
                 clock_ran.abs_diff(tsc_ran) <= 2 * CLOCK_TSC_PAIRING_BOUND,
