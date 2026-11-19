@@ -418,9 +418,11 @@ impl HangupWatch {
     }
 
     /// Record why the VMM is exiting, at the path it was given when it has
-    /// one, then end the process, flushing the log first. A failure to write
-    /// is logged: the VMM exits either way, and a missing reason reads as an
-    /// exit with no reason given.
+    /// one, then end the process, flushing the log first. The record is whole
+    /// before the process ends, and its reader is the manager settling the
+    /// exit, which only looks once the process is gone: no reader can see a
+    /// partial one. A failure to write is logged: the VMM exits either way,
+    /// and a missing reason reads as an exit with no reason given.
     fn exit(exit_reason: Option<&Path>) -> ! {
         if let Some(path) = exit_reason
             && let Err(error) = fs::write(path, SESSION_LOST)
