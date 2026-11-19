@@ -252,22 +252,24 @@ impl FaultSession {
     /// returns; completion arrives as a capture-done message on the
     /// connection (see [`Self::wait_done`]).
     pub(crate) fn send_capture(&self, ranges: Vec<CaptureRange>, out: &File) -> io::Result<()> {
-        let body = serde_json::to_vec(&Capture { ranges })?;
-        if body.len() > MAX_CAPTURE_BODY_LEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "a capture body of {} bytes exceeds the {MAX_CAPTURE_BODY_LEN} the fault \
-                     handler reads",
-                    body.len()
-                ),
-            ));
+        let mut body = CaptureBody::default();
+        if let Err(error) = serde_json::to_writer(&mut body, &Capture { ranges }) {
+            return Err(if body.over_bound {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "a capture body exceeds the {MAX_CAPTURE_BODY_LEN} the fault handler reads"
+                    ),
+                )
+            } else {
+                error.into()
+            });
         }
         let _write = self
             .write
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        send_message(&self.stream, MSG_CAPTURE, &body, &[out.as_raw_fd()])
+        send_message(&self.stream, MSG_CAPTURE, &body.bytes, &[out.as_raw_fd()])
     }
 
     /// A duplicate of the connection for waiting on a capture-done message
@@ -441,6 +443,32 @@ impl Drop for HangupWatch {
         {
             error!("the fault-handler hangup watch panicked");
         }
+    }
+}
+
+/// A capture body as it is serialised, refusing to grow past
+/// [`MAX_CAPTURE_BODY_LEN`]. An over-bound body is refused where it crosses the
+/// bound rather than once the whole frame is built, so the VMM never holds one
+/// the fault handler would refuse unread.
+#[derive(Default)]
+struct CaptureBody {
+    bytes: Vec<u8>,
+    /// The serialisation was cut short for its size, not for another failure.
+    over_bound: bool,
+}
+
+impl io::Write for CaptureBody {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.bytes.len() + bytes.len() > MAX_CAPTURE_BODY_LEN {
+            self.over_bound = true;
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
