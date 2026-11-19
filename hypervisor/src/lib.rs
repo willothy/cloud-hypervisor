@@ -250,6 +250,21 @@ pub struct CapturedClock {
     pub tsc: Option<u64>,
 }
 
+impl CapturedClock {
+    /// Whether a [`ClockRestoreMode::HeldSnapshotRestore`] can re-establish
+    /// this clock. kvmclock on x86_64 is held by the guest TSC it was sampled
+    /// at, so a clock captured without one cannot be; every other clock is
+    /// restored as saved and needs nothing more.
+    pub fn can_be_held(&self) -> bool {
+        match self.state {
+            #[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+            ClockData::Kvm(_) => self.tsc.is_some(),
+            #[allow(unreachable_patterns)]
+            _ => true,
+        }
+    }
+}
+
 /// Guest timer state captured on aarch64 for snapshot/migration: the guest
 /// virtual counter (`CNTVCT_EL0`) plus the host wall clock and counter
 /// frequency needed to advance it to current wall time on restore. aarch64 has
@@ -265,13 +280,27 @@ pub struct TimerState {
 
 /// How the guest clock is re-established when the vCPUs resume: a same-host
 /// pause/resume left it running, whereas a snapshot restore / migration-receive
-/// means the guest was off-host and the clock must catch up to wall time.
+/// means the guest was off-host and the clock must catch up to wall time,
+/// unless the restore asked for the clock to be held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClockRestoreMode {
     /// Same-host pause -> resume; the clock kept running, nothing to advance.
     SameHostResume,
     /// Restored from a snapshot or migrated in; advance to current wall time.
     SnapshotRestore,
+    /// Restored from a snapshot whose age the guest must not see; resume the
+    /// clock where the snapshot left it, as if no time had passed since. On
+    /// x86_64 with KVM that is the saved kvmclock plus what the guest TSC has
+    /// counted since it was captured, so the two stay in step; see
+    /// [`CapturedClock::can_be_held`] for what it takes.
+    ///
+    /// The guest-paused notification sent when the vCPUs pause is not part of
+    /// this mode and is left as it is. It is requested at pause, before any
+    /// restore mode is known, and KVM delivers it on the next guest entry of
+    /// the VM that was paused, so a VM restored from a snapshot never
+    /// receives it. Where it is delivered it only touches the guest's
+    /// watchdogs, which is harmless with a clock that shows no gap.
+    HeldSnapshotRestore,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

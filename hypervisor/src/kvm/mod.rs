@@ -719,6 +719,73 @@ impl KvmVm {
         Ok(None)
     }
 
+    /// Re-establish kvmclock for a restore that holds the guest clock: the
+    /// captured value plus the time the guest TSC has counted since it was
+    /// captured, and none of the wall time the snapshot sat for.
+    ///
+    /// The TSC itself is left alone. Each vCPU resumed counting from its saved
+    /// value when its state was restored, and the vCPUs are restored onto the
+    /// boot vCPU's offset, so the boot vCPU's TSC stands for the guest's. By
+    /// now it has counted through the gap between the clock's capture and the
+    /// vCPU's own, and through the restore so far. Setting kvmclock back to
+    /// its captured value would leave it behind the TSC by that much, and a
+    /// guest whose clocksource watchdog compares the two marks the TSC
+    /// unstable for it. Setting it forward by exactly what the TSC counted
+    /// leaves the two agreeing as they did when the clock was captured. The
+    /// count is converted at the frequency KVM reports for the guest TSC,
+    /// which is rounded to a kHz: under a part in a million of the gap.
+    ///
+    /// What remains is how far apart the samples are taken. The capture
+    /// paired the clock with the TSC to within half of
+    /// [`CLOCK_TSC_PAIRING_BOUND`]. Here the TSC is read, the clock is set
+    /// from that reading, and the TSC is read again: the clock ends up behind
+    /// the TSC by no more than that bracket, which is retried until it is
+    /// within the bound. The two add up to at most one and a half times the
+    /// bound, 150 us, against the watchdog margin given there. Once set,
+    /// kvmclock and the TSC both count with the host, so the time left until
+    /// the vCPUs enter the guest moves them alike and adds nothing.
+    #[cfg(target_arch = "x86_64")]
+    fn hold_clock(&self, vcpus: &[&dyn cpu::Vcpu], clock: &CapturedClock) -> anyhow::Result<()> {
+        let boot_vcpu = vcpus
+            .first()
+            .context("No vCPU to read the guest TSC from")?;
+        let saved_tsc = clock
+            .tsc
+            .context("The clock was captured without the guest TSC")?;
+        let tsc_khz = boot_vcpu
+            .tsc_khz()?
+            .filter(|tsc_khz| *tsc_khz != 0)
+            .context("The guest TSC frequency is unknown")?;
+        let mut held: kvm_clock_data = clock.state.into();
+        held.flags &= !kvm_bindings::KVM_CLOCK_REALTIME;
+        for _ in 0..CLOCK_TSC_PAIRING_ATTEMPTS {
+            let before = boot_vcpu.tsc()?;
+            let counted = before.checked_sub(saved_tsc).with_context(|| {
+                format!(
+                    "The guest TSC ({before}) is behind where the clock was captured ({saved_tsc})"
+                )
+            })?;
+            let ran = Self::tsc_ticks_duration(counted, tsc_khz);
+            let ran_ns = u64::try_from(ran.as_nanos()).unwrap_or(u64::MAX);
+            self.fd
+                .set_clock(&kvm_clock_data {
+                    clock: held.clock.wrapping_add(ran_ns),
+                    ..held
+                })
+                .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+            let width = Self::tsc_ticks_duration(boot_vcpu.tsc()?.wrapping_sub(before), tsc_khz);
+            if width <= CLOCK_TSC_PAIRING_BOUND {
+                debug!(
+                    "Guest clock held {ran:?} past its captured value, within {width:?} of the TSC"
+                );
+                return Ok(());
+            }
+        }
+        Err(anyhow!(
+            "Could not set the clock within {CLOCK_TSC_PAIRING_BOUND:?} of a guest TSC read"
+        ))
+    }
+
     ///
     /// Creates an emulated device in the kernel.
     ///
@@ -1447,20 +1514,35 @@ impl vm::Vm for KvmVm {
         }))
     }
 
-    /// Restore kvmclock before the vCPUs resume.
+    /// Restore kvmclock before the vCPUs resume. KVM advances it by the wall
+    /// time elapsed since the captured `CLOCK_REALTIME`, which is what a
+    /// same-host resume and an ordinary restore want; a `HeldSnapshotRestore`
+    /// goes through [`KvmVm::hold_clock`] instead. The TSC is not touched
+    /// here: it continues from the value restored with each vCPU's state in
+    /// every mode.
     #[cfg(target_arch = "x86_64")]
     fn restore_clock(
         &self,
-        _vcpus: &[&dyn cpu::Vcpu],
+        vcpus: &[&dyn cpu::Vcpu],
         clock: &CapturedClock,
-        _mode: ClockRestoreMode,
+        mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        self.set_clock(&clock.state)
+        match mode {
+            ClockRestoreMode::SameHostResume | ClockRestoreMode::SnapshotRestore => {
+                self.set_clock(&clock.state)
+            }
+            ClockRestoreMode::HeldSnapshotRestore => self
+                .hold_clock(vcpus, clock)
+                .map_err(vm::HypervisorVmError::HoldClock),
+        }
     }
 
     /// Advance the guest virtual counter to current wall time before the vCPUs
     /// resume. A no-op for a `SameHostResume` (the counter free-ran across the
-    /// pause); on `SnapshotRestore`/migration-receive it must catch up.
+    /// pause); on `SnapshotRestore`/migration-receive it must catch up. A
+    /// `HeldSnapshotRestore` writes the saved counter back unadvanced, and is
+    /// refused on a host with another counter frequency like any other
+    /// restore, since the guest would run its clock at the wrong rate.
     #[cfg(target_arch = "aarch64")]
     fn restore_clock(
         &self,
@@ -1482,12 +1564,16 @@ impl vm::Vm for KvmVm {
                 host: host_cntfrq,
             });
         }
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| vm::HypervisorVmError::RestoreTimerState(e.into()))?
-            .as_nanos() as u64;
-        let elapsed_ns = now_ns.saturating_sub(saved.host_realtime_ns);
-        let elapsed_ticks = (elapsed_ns as u128 * saved.cntfrq as u128 / NANOS_PER_SECOND) as u64;
+        let elapsed_ticks = if mode == ClockRestoreMode::HeldSnapshotRestore {
+            0
+        } else {
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| vm::HypervisorVmError::RestoreTimerState(e.into()))?
+                .as_nanos() as u64;
+            let elapsed_ns = now_ns.saturating_sub(saved.host_realtime_ns);
+            (elapsed_ns as u128 * saved.cntfrq as u128 / NANOS_PER_SECOND) as u64
+        };
         let target = saved.cntvct.wrapping_add(elapsed_ticks);
         // Linux >= 6.4 (KVM_CAP_COUNTER_OFFSET) tracks the vtimer offset VM-wide, so one
         // write advances every vCPU; older kernels track it per-vCPU, so program each.
@@ -4391,6 +4477,70 @@ mod tests {
             clock_ran.abs_diff(tsc_ran) <= CLOCK_TSC_PAIRING_BOUND,
             "kvmclock ran {clock_ran:?} while the TSC ran {tsc_ran:?}"
         );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_restore_clock_holds_or_advances_kvmclock() {
+        use std::thread;
+        use std::time::SystemTime;
+
+        use super::*;
+
+        // How long ago the clock below claims to have been captured.
+        const SNAPSHOT_AGE: Duration = Duration::from_secs(3600);
+
+        let hypervisor = KvmHypervisor::new().unwrap();
+        let vm = hypervisor
+            .create_vm(HypervisorVmConfig::default())
+            .expect("new VM fd creation failed");
+        let vcpus = [
+            vm.create_vcpu(0, None, None).unwrap(),
+            vm.create_vcpu(1, None, None).unwrap(),
+        ];
+        let vcpus = [vcpus[0].as_ref(), vcpus[1].as_ref()];
+        let tsc_khz = vcpus[0].tsc_khz().unwrap().unwrap();
+
+        let mut saved = vm.snapshot_clock(vcpus[0]).unwrap().unwrap();
+        saved.state.set_realtime(SystemTime::now() - SNAPSHOT_AGE);
+        let saved_ns = kvm_clock_data::from(saved.state).clock;
+        let saved_tsc = saved.tsc.unwrap();
+        assert!(saved.can_be_held());
+        // The guest TSC counts on while a snapshot is written and restored.
+        thread::sleep(Duration::from_millis(20));
+
+        // A held restore puts kvmclock as far past its saved value as the TSC
+        // has counted, and nowhere near the snapshot's age. Each vCPU's TSC
+        // says so: they count as one. Three pairings stand between the two
+        // figures, the capture's and this check's at half the bound each and
+        // the restore's at all of it.
+        vm.restore_clock(&vcpus, &saved, ClockRestoreMode::HeldSnapshotRestore)
+            .unwrap();
+        for vcpu in vcpus {
+            let held = vm.snapshot_clock(vcpu).unwrap().unwrap();
+            let clock_ran = Duration::from_nanos(kvm_clock_data::from(held.state).clock - saved_ns);
+            let tsc_ran = KvmVm::tsc_ticks_duration(held.tsc.unwrap() - saved_tsc, tsc_khz);
+            assert!(clock_ran >= Duration::from_millis(20));
+            assert!(
+                clock_ran.abs_diff(tsc_ran) <= 2 * CLOCK_TSC_PAIRING_BOUND,
+                "held kvmclock ran {clock_ran:?} while the TSC ran {tsc_ran:?}"
+            );
+        }
+
+        // An ordinary restore advances kvmclock by the snapshot's age.
+        vm.restore_clock(&vcpus, &saved, ClockRestoreMode::SnapshotRestore)
+            .unwrap();
+        let advanced = kvm_clock_data::from(vm.get_clock().unwrap()).clock - saved_ns;
+        assert!(
+            Duration::from_nanos(advanced) >= SNAPSHOT_AGE,
+            "restored kvmclock moved {advanced} ns from the saved value"
+        );
+
+        // A clock captured without the TSC cannot be held.
+        let unpaired = CapturedClock { tsc: None, ..saved };
+        assert!(!unpaired.can_be_held());
+        vm.restore_clock(&vcpus, &unpaired, ClockRestoreMode::HeldSnapshotRestore)
+            .unwrap_err();
     }
 
     #[test]
