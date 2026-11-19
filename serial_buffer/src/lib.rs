@@ -56,6 +56,27 @@ impl SerialBuffer {
     fn pending_len(&self) -> usize {
         self.buffer.len()
     }
+
+    /// Writes the buffer's contiguous runs whole to the out device, until
+    /// the buffer is empty or the out device takes nothing more for now.
+    /// Fails with the first write error other than `WouldBlock` or
+    /// `Interrupted`. Every byte not yet written stays buffered.
+    fn write_buffered(&mut self) -> io::Result<()> {
+        while !self.buffer.is_empty() {
+            let (front, _) = self.buffer.as_slices();
+            match self.out.write(front) {
+                // The out device takes nothing more for now.
+                Ok(0) => break,
+                Ok(written) => {
+                    self.buffer.drain(..written);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Write for SerialBuffer {
@@ -115,18 +136,9 @@ impl Write for SerialBuffer {
             return Ok(());
         }
 
-        while !self.buffer.is_empty() {
-            let (front, _) = self.buffer.as_slices();
-            match self.out.write(front) {
-                // The out device takes nothing more for now.
-                Ok(0) => break,
-                Ok(written) => {
-                    self.buffer.drain(..written);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
-        }
+        // A failed write keeps its bytes for the next flush, as one that
+        // would block does.
+        self.write_buffered().ok();
         self.out.flush()
     }
 }
