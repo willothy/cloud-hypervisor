@@ -9505,6 +9505,66 @@ mod ivshmem {
     }
 
     #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_hold_clock() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_resume_option: true,
+                hold_clock: Some(snapshot_restore_common::HeldClockTest {
+                    clocksource: None,
+                    vcpus: 1,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "mshv"))]
+    fn test_snapshot_restore_hold_clock_two_vcpus() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_resume_option: true,
+                hold_clock: Some(snapshot_restore_common::HeldClockTest {
+                    clocksource: None,
+                    vcpus: 2,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "mshv"), target_arch = "x86_64"))]
+    fn test_snapshot_restore_hold_clock_kvm_clock() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_resume_option: true,
+                hold_clock: Some(snapshot_restore_common::HeldClockTest {
+                    clocksource: Some("kvm-clock"),
+                    vcpus: 1,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "mshv"), target_arch = "x86_64"))]
+    fn test_snapshot_restore_hold_clock_kvm_clock_two_vcpus() {
+        snapshot_restore_common::_test_snapshot_restore(
+            snapshot_restore_common::SnapshotRestoreTest {
+                use_resume_option: true,
+                hold_clock: Some(snapshot_restore_common::HeldClockTest {
+                    clocksource: Some("kvm-clock"),
+                    vcpus: 2,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
     fn test_snapshot_restore_with_resume() {
         snapshot_restore_common::_test_snapshot_restore(
             snapshot_restore_common::SnapshotRestoreTest {
@@ -9646,6 +9706,7 @@ mod ivshmem {
 mod snapshot_restore_common {
     use std::fs::{read_to_string, remove_dir_all};
     use std::process::Command;
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::*;
@@ -9667,6 +9728,21 @@ mod snapshot_restore_common {
     // tolerance so a guest that fails to advance on restore is caught.
     pub(crate) const CLOCK_DOWNTIME_SECS: u64 = 30;
     pub(crate) const CLOCK_SKEW_TOLERANCE_SECS: i64 = 15;
+
+    // How long a guest runs after a held restore before its clocksource is
+    // checked. A guest's clocksource watchdog compares its clocks every half
+    // second, so this covers more than four of its periods.
+    const CLOCKSOURCE_WATCHDOG_SETTLE_SECS: u64 = 3;
+
+    /// The guest a restore with `clock_restore_mode=hold` is checked on.
+    #[derive(Clone, Copy)]
+    pub(crate) struct HeldClockTest {
+        /// The clocksource put on the guest's command line, on x86_64;
+        /// `None` leaves the guest its own choice.
+        pub clocksource: Option<&'static str>,
+        /// How many vCPUs the guest boots with.
+        pub vcpus: u32,
+    }
 
     pub(crate) fn snapshot_and_check_events(
         api_socket: &str,
@@ -9704,6 +9780,10 @@ mod snapshot_restore_common {
         pub memory_restore_mode: Option<&'static str>,
         pub use_prefault: bool,
         pub check_vmgenid: bool,
+        /// Restore with `clock_restore_mode=hold` after the off-host interval
+        /// and check that the guest clock did not move across it and that
+        /// the guest still trusts its clocksource afterwards.
+        pub hold_clock: Option<HeldClockTest>,
     }
 
     pub(crate) fn _test_snapshot_restore(cfg: SnapshotRestoreTest) {
@@ -9714,6 +9794,7 @@ mod snapshot_restore_common {
             memory_restore_mode,
             use_prefault,
             check_vmgenid,
+            hold_clock,
         } = cfg;
         let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(disk_config));
@@ -9747,6 +9828,15 @@ mod snapshot_restore_common {
         if check_clock && cfg!(target_arch = "x86_64") {
             boot_cmdline.push_str(" clocksource=kvm-clock");
         }
+        // A held clock is checked on the guest's own choice of clocksource and
+        // on kvm-clock: the first is where a guest that stops trusting its TSC
+        // shows, the second where a clock that caught up does.
+        if let Some(clocksource) = hold_clock.and_then(|held| held.clocksource)
+            && cfg!(target_arch = "x86_64")
+        {
+            boot_cmdline.push_str(&format!(" clocksource={clocksource}"));
+        }
+        let vcpus = hold_clock.map_or(4, |held| held.vcpus);
         // aarch64 needs acpi=on to reach ACPI over the FDT on a direct boot.
         #[cfg(target_arch = "aarch64")]
         if check_vmgenid {
@@ -9756,7 +9846,7 @@ mod snapshot_restore_common {
         let mut child = GuestCommand::new(&guest)
             .args(["--api-socket", &api_socket_source])
             .args(["--event-monitor", format!("path={event_path}").as_str()])
-            .args(["--cpus", "boot=4"])
+            .args(["--cpus", format!("boot={vcpus}").as_str()])
             .args(["--memory", mem_params])
             .args(["--balloon", "size=0"])
             .args(["--kernel", kernel_path.to_str().unwrap()])
@@ -9782,6 +9872,25 @@ mod snapshot_restore_common {
 
         // AtomicU64 so the baseline crosses the catch_unwind closures below.
         let ged_baseline = AtomicU64::new(0);
+        // Guest uptime and clocksource read just before the snapshot, for the
+        // held-clock check.
+        let uptime_baseline = AtomicU64::new(0);
+        let clocksource_baseline = OnceLock::new();
+        let guest_clocksource = || {
+            guest
+                .ssh_command("cat /sys/devices/system/clocksource/clocksource0/current_clocksource")
+                .unwrap()
+                .trim()
+                .to_owned()
+        };
+        let guest_uptime_secs = || {
+            guest
+                .ssh_command("cut -d. -f1 /proc/uptime")
+                .unwrap()
+                .trim()
+                .parse::<u64>()
+                .unwrap()
+        };
 
         let r = panic::catch_unwind(|| {
             guest.wait_vm_boot().unwrap();
@@ -9791,7 +9900,7 @@ mod snapshot_restore_common {
             }
 
             // Check the number of vCPUs
-            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), vcpus);
             // Check the guest RAM
             let total_memory = guest.get_total_memory().unwrap_or_default();
             if use_hotplug {
@@ -9829,6 +9938,11 @@ mod snapshot_restore_common {
             #[cfg(target_arch = "x86_64")]
             guest.add_test_disk(&api_socket_source);
 
+            if hold_clock.is_some() {
+                clocksource_baseline.set(guest_clocksource()).unwrap();
+                uptime_baseline.store(guest_uptime_secs(), Ordering::Relaxed);
+            }
+
             snapshot_restore_common::snapshot_and_check_events(
                 &api_socket_source,
                 &snapshot_dir,
@@ -9855,8 +9969,9 @@ mod snapshot_restore_common {
             .unwrap();
 
         // Simulate an off-host interval between snapshot and restore so the guest
-        // clock must visibly catch up on restore (asserted after resume below).
-        if check_clock {
+        // clock must visibly catch up on restore, or visibly stay put when it is
+        // held (asserted after resume below).
+        if check_clock || hold_clock.is_some() {
             thread::sleep(Duration::from_secs(CLOCK_DOWNTIME_SECS));
         }
 
@@ -9870,6 +9985,9 @@ mod snapshot_restore_common {
         }
         if use_prefault {
             restore_params.push_str(",prefault=on");
+        }
+        if hold_clock.is_some() {
+            restore_params.push_str(",clock_restore_mode=hold");
         }
 
         // Restore the VM from the snapshot
@@ -9963,8 +10081,60 @@ mod snapshot_restore_common {
                 ));
             }
 
+            if hold_clock.is_some() {
+                // Read before the checks below add their own running time: a
+                // held clock has moved only by the time the guest ran, where
+                // a clock that caught up would show the whole off-host
+                // interval.
+                let before = uptime_baseline.load(Ordering::Relaxed);
+                let after = guest_uptime_secs();
+                assert!(
+                    after >= before && after - before < CLOCK_DOWNTIME_SECS / 2,
+                    "guest uptime went from {before}s to {after}s across a held \
+                     restore; the {CLOCK_DOWNTIME_SECS}s off-host interval leaked in"
+                );
+
+                // The wall clock is held with the rest, so it now trails the
+                // host by the interval. The test network is isolated, so the
+                // guest cannot NTP-correct itself.
+                let host_secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let guest_secs = guest
+                    .ssh_command("date -u +%s")
+                    .unwrap()
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap();
+                assert!(
+                    host_secs - guest_secs
+                        >= CLOCK_DOWNTIME_SECS as i64 - CLOCK_SKEW_TOLERANCE_SECS,
+                    "guest wall clock is only {}s behind the host after a held \
+                     restore (host={host_secs}, guest={guest_secs})",
+                    host_secs - guest_secs
+                );
+
+                // A held clock that left kvmclock and the TSC disagreeing
+                // would have the guest's clocksource watchdog mark the TSC
+                // unstable within a period or two and move a guest off it.
+                thread::sleep(Duration::from_secs(CLOCKSOURCE_WATCHDOG_SETTLE_SECS));
+                assert_eq!(
+                    &guest_clocksource(),
+                    clocksource_baseline.get().unwrap(),
+                    "the guest changed its clocksource after a held restore"
+                );
+                let distrust = guest
+                    .ssh_command("sudo dmesg | grep -iE 'Marking clocksource|TSC unstable' || true")
+                    .unwrap();
+                assert!(
+                    distrust.trim().is_empty(),
+                    "the guest stopped trusting a clocksource after a held restore: {distrust}"
+                );
+            }
+
             // Perform same checks to validate VM has been properly restored
-            assert_eq!(guest.get_cpu_count().unwrap_or_default(), 4);
+            assert_eq!(guest.get_cpu_count().unwrap_or_default(), vcpus);
             let total_memory = guest.get_total_memory().unwrap_or_default();
             if use_hotplug {
                 assert!(total_memory > 4_800_000, "total_memory is {total_memory}");
