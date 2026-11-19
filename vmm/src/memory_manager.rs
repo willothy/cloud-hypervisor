@@ -2614,7 +2614,7 @@ impl MemoryManager {
         Ok(())
     }
 
-    #[expect(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tdx", expect(clippy::too_many_arguments))]
     pub fn new(
         vm: Arc<dyn hypervisor::Vm>,
         config: &MemoryConfig,
