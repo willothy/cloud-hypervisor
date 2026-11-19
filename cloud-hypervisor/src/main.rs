@@ -1057,6 +1057,7 @@ mod tests {
     use std::ptr::from_mut;
     use std::thread;
 
+    use clap::error::ErrorKind;
     use vmm::config::VmParams;
     #[cfg(target_arch = "x86_64")]
     use vmm::vm_config::DebugConsoleConfig;
@@ -1120,7 +1121,7 @@ mod tests {
         assert_eq!(level(&["-vvv"]).unwrap(), log::LevelFilter::Trace);
         assert_eq!(
             level(&["-q", "-v"]).unwrap_err().kind(),
-            clap::error::ErrorKind::ArgumentConflict
+            ErrorKind::ArgumentConflict
         );
     }
 
