@@ -63,6 +63,14 @@ const HEADER_LEN: usize = 8;
 /// carry at most an error string.
 const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
 
+/// The most bytes of a capture body the fault handler reads, mirroring its own
+/// bound (`crucible-pageserver`'s `protocol::MAX_BODY_LEN`, the wire
+/// contract's authority). A capture's body is its armed ranges as JSON, which
+/// a fragmented dirty set of the platform's largest VM brings to 964 MB. A
+/// body past the bound is refused here, failing that one checkpoint with a
+/// reason: sending it would end the session, which the VM cannot survive.
+const MAX_CAPTURE_BODY_LEN: usize = 1 << 30;
+
 /// The fault-handling modes guest RAM was registered with before the
 /// handoff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +246,16 @@ impl FaultSession {
     /// connection (see [`Self::wait_done`]).
     pub(crate) fn send_capture(&self, ranges: Vec<CaptureRange>, out: &File) -> io::Result<()> {
         let body = serde_json::to_vec(&Capture { ranges })?;
+        if body.len() > MAX_CAPTURE_BODY_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "a capture body of {} bytes exceeds the {MAX_CAPTURE_BODY_LEN} the fault \
+                     handler reads",
+                    body.len()
+                ),
+            ));
+        }
         let _write = self
             .write
             .lock()
