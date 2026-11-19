@@ -235,6 +235,21 @@ pub type ClockState = TimerState;
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub enum ClockState {}
 
+/// A guest clock captured for pause/resume or snapshot/restore: the clock as
+/// the hypervisor saves it and, on x86_64, the guest TSC it was sampled at.
+#[derive(Debug, Clone, Copy)]
+pub struct CapturedClock {
+    /// The clock as the hypervisor saves and restores it.
+    pub state: ClockState,
+    /// The boot vCPU's TSC at the moment `state` was sampled, which ties the
+    /// saved clock to the TSC each vCPU is restored with. `None` when the
+    /// hypervisor pairs none (MSHV), when the two could not be sampled close
+    /// enough together, or when the clock comes from a snapshot written
+    /// before the pairing was recorded.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc: Option<u64>,
+}
+
 /// Guest timer state captured on aarch64 for snapshot/migration: the guest
 /// virtual counter (`CNTVCT_EL0`) plus the host wall clock and counter
 /// frequency needed to advance it to current wall time on restore. aarch64 has

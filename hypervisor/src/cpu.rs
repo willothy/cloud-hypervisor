@@ -27,7 +27,7 @@ use crate::VcpuInit;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::ExtendedReg;
 #[cfg(target_arch = "x86_64")]
-use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters};
+use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, msr_index};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
 use crate::{CpuState, HypervisorType, MpState, StandardRegisters};
@@ -436,6 +436,23 @@ pub trait Vcpu: Send + Sync {
     /// Setup the model-specific registers (MSR) for this vCPU.
     ///
     fn set_msrs(&self, msrs: &[MsrEntry]) -> Result<usize>;
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Read the vCPU's TSC as the guest would read it at this moment. The
+    /// counter runs whether or not the vCPU does.
+    ///
+    fn tsc(&self) -> Result<u64> {
+        let mut msrs = vec![MsrEntry {
+            index: msr_index::MSR_IA32_TSC,
+            ..Default::default()
+        }];
+        if self.get_msrs(&mut msrs)? != 1 {
+            return Err(HypervisorCpuError::GetMsrEntries(anyhow!(
+                "The vCPU did not return its TSC"
+            )));
+        }
+        Ok(msrs[0].data)
+    }
     ///
     /// Returns the vcpu's current "multiprocessing state".
     ///

@@ -31,6 +31,8 @@ use std::sync::OnceLock;
 #[cfg(target_arch = "x86_64")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+#[cfg(target_arch = "x86_64")]
+use std::time::Duration;
 #[cfg(target_arch = "aarch64")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io, result};
@@ -43,7 +45,7 @@ use igvm::snp_defs::{SevSelector, SevVmsa};
 use kvm_bindings::fam_wrappers::KvmIrqRouting;
 use kvm_bindings::kvm_create_guest_memfd;
 use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
-#[cfg(feature = "sev_snp")]
+#[cfg(target_arch = "x86_64")]
 use log::debug;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
@@ -94,7 +96,7 @@ use crate::arch::x86::{
     NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
 };
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-use crate::{ClockRestoreMode, ClockState};
+use crate::{CapturedClock, ClockRestoreMode};
 use crate::{
     CpuState, HypervisorType, HypervisorVmConfig, InterruptSourceConfig, IoEventAddress,
     IrqRoutingEntry, MpState, StandardRegisters, USER_MEMORY_REGION_GUEST_MEMFD,
@@ -185,6 +187,21 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[cfg(target_arch = "x86_64")]
 const INVALID_GPA: u64 = u64::MAX;
+
+/// How far apart kvmclock and the guest TSC may be sampled and still count as
+/// one instant. A guest's clocksource watchdog compares the two every half
+/// second and marks the TSC unstable when they disagree by more than its
+/// margin: 500 us with the kernel's default `CLOCKSOURCE_WATCHDOG_MAX_SKEW_US`
+/// of 125, and 200 us at that option's minimum. Whatever pairs the two clocks
+/// has to stay well inside that.
+#[cfg(target_arch = "x86_64")]
+const CLOCK_TSC_PAIRING_BOUND: Duration = Duration::from_micros(100);
+
+/// How many times a pairing of kvmclock and the guest TSC is tried before it
+/// is given up. One attempt is a few microseconds unless the thread is
+/// descheduled in the middle of it.
+#[cfg(target_arch = "x86_64")]
+const CLOCK_TSC_PAIRING_ATTEMPTS: usize = 8;
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
@@ -665,6 +682,43 @@ pub struct KvmVm {
 }
 
 impl KvmVm {
+    /// How long the guest TSC takes to count `ticks` at `tsc_khz`.
+    #[cfg(target_arch = "x86_64")]
+    fn tsc_ticks_duration(ticks: u64, tsc_khz: u32) -> Duration {
+        let nanos = u128::from(ticks) * 1_000_000 / u128::from(tsc_khz);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+
+    /// Sample kvmclock between two reads of the boot vCPU's TSC and return it
+    /// with the TSC at the midpoint, which is within half the bracket of the
+    /// clock's own sample. A bracket wider than [`CLOCK_TSC_PAIRING_BOUND`]
+    /// is retried; `None` after [`CLOCK_TSC_PAIRING_ATTEMPTS`] of them.
+    ///
+    /// `KVM_GET_CLOCK` can report the host TSC it sampled the clock at
+    /// (`KVM_CLOCK_HOST_TSC`), which pairs exactly, but with the host's
+    /// counter: turning that into the guest's takes the vCPU's offset and the
+    /// ratio KVM scales by, which KVM does not export, and the flag is absent
+    /// whenever KVM's master clock is not in use. The bracket needs neither,
+    /// so it is the one way the pairing is made.
+    #[cfg(target_arch = "x86_64")]
+    fn paired_clock(&self, boot_vcpu: &dyn cpu::Vcpu) -> anyhow::Result<Option<(ClockData, u64)>> {
+        let tsc_khz = boot_vcpu
+            .tsc_khz()?
+            .filter(|tsc_khz| *tsc_khz != 0)
+            .context("The guest TSC frequency is unknown")?;
+        for _ in 0..CLOCK_TSC_PAIRING_ATTEMPTS {
+            let before = boot_vcpu.tsc()?;
+            let state = vm::Vm::get_clock(self)?;
+            let bracket = boot_vcpu.tsc()?.wrapping_sub(before);
+            let width = Self::tsc_ticks_duration(bracket, tsc_khz);
+            if width <= CLOCK_TSC_PAIRING_BOUND {
+                debug!("Guest clock paired with the TSC within {width:?}");
+                return Ok(Some((state, before.wrapping_add(bracket / 2))));
+            }
+        }
+        Ok(None)
+    }
+
     ///
     /// Creates an emulated device in the kernel.
     ///
@@ -1344,16 +1398,37 @@ impl vm::Vm for KvmVm {
             .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))
     }
 
-    /// Capture kvmclock (filling realtime) for snapshot/migration.
+    /// Capture kvmclock (filling realtime) for snapshot/migration, paired
+    /// with the boot vCPU's TSC when the two can be sampled within
+    /// [`CLOCK_TSC_PAIRING_BOUND`] of each other. A clock that cannot be
+    /// paired is captured without the TSC rather than failing the pause.
     #[cfg(target_arch = "x86_64")]
-    fn snapshot_clock(&self, _boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<ClockState>> {
-        Ok(Some(self.get_clock()?.with_realtime_filled()))
+    fn snapshot_clock(&self, boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<CapturedClock>> {
+        let (state, tsc) = match self.paired_clock(boot_vcpu) {
+            Ok(Some((state, tsc))) => (state, Some(tsc)),
+            Ok(None) => {
+                warn!(
+                    "Could not sample the guest clock and TSC within {CLOCK_TSC_PAIRING_BOUND:?} of each other; capturing the clock unpaired"
+                );
+                (self.get_clock()?, None)
+            }
+            Err(e) => {
+                warn!(
+                    "Could not pair the guest clock with the TSC: {e:#}; capturing the clock unpaired"
+                );
+                (self.get_clock()?, None)
+            }
+        };
+        Ok(Some(CapturedClock {
+            state: state.with_realtime_filled(),
+            tsc,
+        }))
     }
 
     /// Capture the guest virtual counter and host wall clock for
     /// snapshot/migration. The vCPUs must be paused.
     #[cfg(target_arch = "aarch64")]
-    fn snapshot_clock(&self, boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<ClockState>> {
+    fn snapshot_clock(&self, boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<CapturedClock>> {
         // cntvct and the host wall clock must be sampled back-to-back; cntfrq is
         // static, so read it last.
         let cntvct = boot_vcpu
@@ -1363,10 +1438,12 @@ impl vm::Vm for KvmVm {
             .duration_since(UNIX_EPOCH)
             .map_err(|e| vm::HypervisorVmError::CaptureTimerState(e.into()))?
             .as_nanos() as u64;
-        Ok(Some(TimerState {
-            cntvct,
-            host_realtime_ns,
-            cntfrq: get_cntfrq(),
+        Ok(Some(CapturedClock {
+            state: TimerState {
+                cntvct,
+                host_realtime_ns,
+                cntfrq: get_cntfrq(),
+            },
         }))
     }
 
@@ -1375,10 +1452,10 @@ impl vm::Vm for KvmVm {
     fn restore_clock(
         &self,
         _vcpus: &[&dyn cpu::Vcpu],
-        state: &ClockState,
+        clock: &CapturedClock,
         _mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        self.set_clock(state)
+        self.set_clock(&clock.state)
     }
 
     /// Advance the guest virtual counter to current wall time before the vCPUs
@@ -1388,12 +1465,13 @@ impl vm::Vm for KvmVm {
     fn restore_clock(
         &self,
         vcpus: &[&dyn cpu::Vcpu],
-        saved: &ClockState,
+        clock: &CapturedClock,
         mode: ClockRestoreMode,
     ) -> vm::Result<()> {
         if mode == ClockRestoreMode::SameHostResume {
             return Ok(());
         }
+        let saved = &clock.state;
         // KVM does not rescale the counter frequency across hosts (unlike x86
         // TSC), so a differing destination frequency would scale the elapsed
         // ticks incorrectly. Reject rather than corrupt the guest clock.
@@ -4281,6 +4359,38 @@ mod tests {
         }
         vcpu.memory_slots = None;
         vcpu.validate_gpa_range(0x1000, 1).unwrap_err();
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_snapshot_clock_pairs_kvmclock_with_the_tsc() {
+        use std::thread;
+
+        use super::*;
+
+        let hypervisor = KvmHypervisor::new().unwrap();
+        let vm = hypervisor
+            .create_vm(HypervisorVmConfig::default())
+            .expect("new VM fd creation failed");
+        let vcpu = vm.create_vcpu(0, None, None).unwrap();
+        let tsc_khz = vcpu.tsc_khz().unwrap().unwrap();
+
+        let first = vm.snapshot_clock(vcpu.as_ref()).unwrap().unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let second = vm.snapshot_clock(vcpu.as_ref()).unwrap().unwrap();
+
+        // Two paired samples are as far apart on kvmclock as on the TSC: each
+        // pairing is within half the bound, so the two together are within
+        // all of it.
+        let clock_ran = Duration::from_nanos(
+            kvm_clock_data::from(second.state).clock - kvm_clock_data::from(first.state).clock,
+        );
+        let tsc_ran = KvmVm::tsc_ticks_duration(second.tsc.unwrap() - first.tsc.unwrap(), tsc_khz);
+        assert!(clock_ran >= Duration::from_millis(20));
+        assert!(
+            clock_ran.abs_diff(tsc_ran) <= CLOCK_TSC_PAIRING_BOUND,
+            "kvmclock ran {clock_ran:?} while the TSC ran {tsc_ran:?}"
+        );
     }
 
     #[test]

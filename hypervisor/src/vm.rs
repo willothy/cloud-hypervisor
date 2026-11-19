@@ -36,7 +36,7 @@ use crate::arch::x86::CpuIdEntry;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::VcpuMsrConfigUpdate;
 use crate::cpu::Vcpu;
-use crate::{ClockRestoreMode, ClockState, IoEventAddress, IrqRoutingEntry};
+use crate::{CapturedClock, ClockRestoreMode, IoEventAddress, IrqRoutingEntry};
 
 ///
 /// I/O events data matches (32 or 64 bits).
@@ -410,7 +410,7 @@ pub trait Vm: Send + Sync + Any {
     /// `Ok(None)` means this backend has no clock to preserve. `boot_vcpu` is the
     /// boot vCPU, used by backends whose clock is per-vCPU state (e.g the aarch64
     /// counter);
-    fn snapshot_clock(&self, _boot_vcpu: &dyn Vcpu) -> Result<Option<ClockState>> {
+    fn snapshot_clock(&self, _boot_vcpu: &dyn Vcpu) -> Result<Option<CapturedClock>> {
         Ok(None)
     }
     /// Re-establish the guest clock before the vCPUs resume. `mode` distinguishes a
@@ -421,7 +421,7 @@ pub trait Vm: Send + Sync + Any {
     fn restore_clock(
         &self,
         _vcpus: &[&dyn Vcpu],
-        _state: &ClockState,
+        _clock: &CapturedClock,
         _mode: ClockRestoreMode,
     ) -> Result<()> {
         Ok(())

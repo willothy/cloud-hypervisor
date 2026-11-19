@@ -551,7 +551,7 @@ fn is_restore_cow_supported(config: &VmConfig) -> bool {
 #[derive(Clone, Copy)]
 struct SavedClock {
     mode: hypervisor::ClockRestoreMode,
-    state: hypervisor::ClockState,
+    clock: hypervisor::CapturedClock,
 }
 
 pub struct Vm {
@@ -741,7 +741,11 @@ impl Vm {
             // on resume (the counter was reset to the saved value).
             vm_snapshot.clock.map(|state| SavedClock {
                 mode: hypervisor::ClockRestoreMode::SnapshotRestore,
-                state,
+                clock: hypervisor::CapturedClock {
+                    state,
+                    #[cfg(target_arch = "x86_64")]
+                    tsc: vm_snapshot.clock_tsc,
+                },
             })
         } else {
             None
@@ -3525,9 +3529,9 @@ impl Vm {
             .snapshot_clock(boot_vcpu.hypervisor_vcpu())
             .context("Could not capture guest clock")
             .map_err(MigratableError::Pause)?
-            .map(|state| SavedClock {
+            .map(|clock| SavedClock {
                 mode: hypervisor::ClockRestoreMode::SameHostResume,
-                state,
+                clock,
             }))
     }
 
@@ -3541,7 +3545,7 @@ impl Vm {
         let hv_vcpus: Vec<&dyn hypervisor::Vcpu> =
             guards.iter().map(|g| g.hypervisor_vcpu()).collect();
         self.vm
-            .restore_clock(&hv_vcpus, &saved.state, saved.mode)
+            .restore_clock(&hv_vcpus, &saved.clock, saved.mode)
             .context("Could not restore guest clock")
             .map_err(MigratableError::Resume)
     }
@@ -3616,6 +3620,12 @@ impl Pausable for Vm {
 pub struct VmSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock: Option<hypervisor::ClockState>,
+    /// The boot vCPU's TSC at the moment `clock` was sampled. Left out when
+    /// the two were not paired, and absent from snapshots written before the
+    /// pairing was recorded.
+    #[cfg(target_arch = "x86_64")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_tsc: Option<u64>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     pub common_cpuid: Vec<x86::CpuIdEntry>,
 }
@@ -3650,7 +3660,9 @@ impl Snapshottable for Vm {
         let common_cpuid = self.cpu_manager.lock().unwrap().common_cpuid();
 
         let vm_snapshot_state = VmSnapshot {
-            clock: self.saved_clock.map(|saved| saved.state),
+            clock: self.saved_clock.map(|saved| saved.clock.state),
+            #[cfg(target_arch = "x86_64")]
+            clock_tsc: self.saved_clock.and_then(|saved| saved.clock.tsc),
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             common_cpuid,
         };
@@ -3941,6 +3953,30 @@ impl GuestDebuggable for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_vm_snapshot_clock_tsc_is_optional() {
+        // A clock captured unpaired serialises as snapshots always have, and
+        // a snapshot without the field reads back as unpaired.
+        let unpaired = VmSnapshot {
+            clock: Some(hypervisor::ClockData::Kvm(Default::default())),
+            clock_tsc: None,
+            common_cpuid: Vec::new(),
+        };
+        let state = serde_json::to_string(&unpaired).unwrap();
+        assert!(!state.contains("clock_tsc"));
+        let read: VmSnapshot = serde_json::from_str(&state).unwrap();
+        assert!(read.clock.is_some());
+        assert_eq!(read.clock_tsc, None);
+
+        let paired = VmSnapshot {
+            clock_tsc: Some(42),
+            ..unpaired
+        };
+        let state = serde_json::to_string(&paired).unwrap();
+        let read: VmSnapshot = serde_json::from_str(&state).unwrap();
+        assert_eq!(read.clock_tsc, Some(42));
+    }
 
     fn test_vm_state_transitions(state: VmState) {
         match state {
