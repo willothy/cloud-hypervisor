@@ -1388,6 +1388,7 @@ impl Vm {
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
         restore_fault_socket: Option<&Path>,
+        exit_reason: Option<&Path>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1456,6 +1457,7 @@ impl Vm {
                     restore_fault_socket,
                     phys_bits,
                     &exit_evt,
+                    exit_reason,
                 )
                 .map_err(Error::MemoryManager)?
             } else {
@@ -1468,6 +1470,7 @@ impl Vm {
                     tdx_enabled,
                     None,
                     Default::default(),
+                    exit_reason,
                 )
                 .map_err(Error::MemoryManager)?
             };
