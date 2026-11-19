@@ -5,8 +5,10 @@ name = "serial_buffer"
 rust-version.workspace = true
 version = "0.1.0"
 
-[dev-dependencies]
+[dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
 vmm-sys-util = { workspace = true }
 
 [lints]

@@ -96,6 +96,12 @@ pub(crate) enum EpollDispatch {
 }
 const EPOLL_EVENTS_LEN: usize = 4;
 
+/// How long the serial manager waits, on KILL_EVENT, for the socket
+/// console's client to read the output it still holds. That output is the
+/// guest's last, such as a panic's text before a reset, but a client that
+/// stopped reading must not hold up the VMM's exit for longer than this.
+const SOCKET_CONSOLE_DRAIN_TIMEOUT: time::Duration = time::Duration::from_secs(1);
+
 impl From<u64> for EpollDispatch {
     fn from(v: u64) -> Self {
         use EpollDispatch::*;
@@ -455,6 +461,14 @@ impl SerialManager {
                                 }
                                 EpollDispatch::Kill => {
                                     info!("KILL_EVENT received, stopping epoll loop");
+                                    if let Some(console) = socket_console.as_ref()
+                                        && let Err(e) =
+                                            console.drain_output(SOCKET_CONSOLE_DRAIN_TIMEOUT)
+                                    {
+                                        warn!(
+                                            "Serial console output lost before its client read it: {e}"
+                                        );
+                                    }
                                     return Ok(());
                                 }
                             }

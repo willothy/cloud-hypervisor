@@ -1270,6 +1270,7 @@ fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_mmap, vec![]),
         (libc::SYS_munmap, vec![]),
         (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_ppoll, vec![]),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sendto, vec![]),
