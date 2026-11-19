@@ -91,7 +91,7 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::CaptureScope;
-use crate::config::{MemoryRestoreMode, ValidationError, add_to_config};
+use crate::config::{GuestClockRestoreMode, MemoryRestoreMode, ValidationError, add_to_config};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -226,6 +226,11 @@ pub enum Error {
 
     #[error("Cannot restore VM")]
     Restore(#[source] MigratableError),
+
+    #[error(
+        "Cannot hold the guest clock: the snapshot's clock was captured without the guest TSC it is held by"
+    )]
+    HoldClockUnpaired,
 
     #[error("Cannot send VM snapshot")]
     SnapshotSend(#[source] MigratableError),
@@ -546,12 +551,38 @@ fn is_restore_cow_supported(config: &VmConfig) -> bool {
 
 /// Guest clock baseline captured for snapshot/restore, plus how it must be
 /// re-established on the next resume. `mode` is runtime-only (`SnapshotRestore`
-/// after restore/migration-receive, `SameHostResume` for a live same-host capture)
-/// and is not serialized: it is re-derived from "was this VM built from a snapshot".
+/// after restore/migration-receive, `HeldSnapshotRestore` after a restore that
+/// holds the clock, `SameHostResume` for a live same-host capture) and is not
+/// serialized: it is re-derived from "was this VM built from a snapshot" and the
+/// restore's own options.
 #[derive(Clone, Copy)]
 struct SavedClock {
     mode: hypervisor::ClockRestoreMode,
     clock: hypervisor::CapturedClock,
+}
+
+impl SavedClock {
+    /// The clock a snapshot carried, to be re-established on the first resume
+    /// of the VM built from it as `clock_restore_mode` asks. Later pauses of
+    /// that VM capture the clock afresh, so the mode governs that resume only.
+    ///
+    /// Holding a clock that was captured without what holding it takes is
+    /// refused here, before the VM exists, rather than at its first resume.
+    fn from_snapshot(
+        clock: hypervisor::CapturedClock,
+        clock_restore_mode: GuestClockRestoreMode,
+    ) -> Result<Self> {
+        let mode = match clock_restore_mode {
+            // Restored or migrated in: the guest clock must catch up to wall
+            // time on resume (the counter was reset to the saved value).
+            GuestClockRestoreMode::Advance => hypervisor::ClockRestoreMode::SnapshotRestore,
+            GuestClockRestoreMode::Hold if clock.can_be_held() => {
+                hypervisor::ClockRestoreMode::HeldSnapshotRestore
+            }
+            GuestClockRestoreMode::Hold => return Err(Error::HoldClockUnpaired),
+        };
+        Ok(Self { mode, clock })
+    }
 }
 
 pub struct Vm {
@@ -625,6 +656,7 @@ impl Vm {
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        clock_restore_mode: GuestClockRestoreMode,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
@@ -737,16 +769,19 @@ impl Vm {
 
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
             let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
-            // Restored or migrated in: the guest clock must catch up to wall time
-            // on resume (the counter was reset to the saved value).
-            vm_snapshot.clock.map(|state| SavedClock {
-                mode: hypervisor::ClockRestoreMode::SnapshotRestore,
-                clock: hypervisor::CapturedClock {
-                    state,
-                    #[cfg(target_arch = "x86_64")]
-                    tsc: vm_snapshot.clock_tsc,
-                },
-            })
+            vm_snapshot
+                .clock
+                .map(|state| {
+                    SavedClock::from_snapshot(
+                        hypervisor::CapturedClock {
+                            state,
+                            #[cfg(target_arch = "x86_64")]
+                            tsc: vm_snapshot.clock_tsc,
+                        },
+                        clock_restore_mode,
+                    )
+                })
+                .transpose()?
         } else {
             None
         };
@@ -1393,6 +1428,7 @@ impl Vm {
         memory_restore_mode: Option<MemoryRestoreMode>,
         restore_fault_socket: Option<&Path>,
         exit_reason: Option<&Path>,
+        clock_restore_mode: Option<GuestClockRestoreMode>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1497,6 +1533,7 @@ impl Vm {
             console_resize_pipe,
             original_termios,
             snapshot,
+            clock_restore_mode.unwrap_or_default(),
             #[cfg(feature = "igvm")]
             igvm_file,
         )
@@ -3953,6 +3990,34 @@ impl GuestDebuggable for Vm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_saved_clock_holds_only_a_paired_clock() {
+        let clock = |tsc| hypervisor::CapturedClock {
+            state: hypervisor::ClockData::Kvm(Default::default()),
+            tsc,
+        };
+        let mode = |tsc, clock_restore_mode| {
+            SavedClock::from_snapshot(clock(tsc), clock_restore_mode).map(|saved| saved.mode)
+        };
+
+        // A clock that advances needs no pairing, so every snapshot restores
+        // that way.
+        for tsc in [None, Some(42)] {
+            assert_eq!(
+                mode(tsc, GuestClockRestoreMode::Advance).unwrap(),
+                hypervisor::ClockRestoreMode::SnapshotRestore
+            );
+        }
+        assert_eq!(
+            mode(Some(42), GuestClockRestoreMode::Hold).unwrap(),
+            hypervisor::ClockRestoreMode::HeldSnapshotRestore
+        );
+        assert!(matches!(
+            mode(None, GuestClockRestoreMode::Hold),
+            Err(Error::HoldClockUnpaired)
+        ));
+    }
 
     #[test]
     fn test_vm_snapshot_clock_tsc_is_optional() {
