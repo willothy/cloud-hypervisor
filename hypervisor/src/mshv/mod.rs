@@ -87,7 +87,7 @@ use crate::arch::aarch64::regs;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{CpuIdEntry, FpuState, MsrEntry};
 #[cfg(target_arch = "x86_64")]
-use crate::{ClockData, ClockRestoreMode, ClockState};
+use crate::{CapturedClock, ClockData, ClockRestoreMode};
 use crate::{CpuState, IoEventAddress, IrqRoutingEntry, MpState};
 
 pub const PAGE_SHIFT: usize = 12;
@@ -2230,8 +2230,11 @@ impl vm::Vm for MshvVm {
 
     /// Capture the partition reference time for snapshot/migration.
     #[cfg(target_arch = "x86_64")]
-    fn snapshot_clock(&self, _boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<ClockState>> {
-        Ok(Some(self.get_clock()?.with_realtime_filled()))
+    fn snapshot_clock(&self, _boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<CapturedClock>> {
+        Ok(Some(CapturedClock {
+            state: self.get_clock()?.with_realtime_filled(),
+            tsc: None,
+        }))
     }
 
     /// Restore the partition reference time before the vCPUs resume.
@@ -2239,10 +2242,10 @@ impl vm::Vm for MshvVm {
     fn restore_clock(
         &self,
         _vcpus: &[&dyn cpu::Vcpu],
-        state: &ClockState,
+        clock: &CapturedClock,
         _mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        self.set_clock(state)
+        self.set_clock(&clock.state)
     }
 
     /// Downcast to the underlying MshvVm type

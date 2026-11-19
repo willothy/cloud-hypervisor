@@ -51,7 +51,9 @@ use crate::api::{
     ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
     VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
-use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
+use crate::config::{
+    GuestClockRestoreMode, MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config,
+};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::device_manager::DeviceManager;
@@ -1479,6 +1481,9 @@ impl Vmm {
                 self.console_resize_pipe.clone(),
                 Arc::clone(&self.original_termios_opt),
                 Some(&snapshot),
+                // A migrated guest was running until it moved: its clock
+                // catches up with the time the move took.
+                GuestClockRestoreMode::Advance,
                 #[cfg(feature = "igvm")]
                 None,
             )
@@ -2104,6 +2109,7 @@ impl Vmm {
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
         restore_fault_socket: Option<&path::Path>,
+        clock_restore_mode: GuestClockRestoreMode,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2158,6 +2164,7 @@ impl Vmm {
                     Some(memory_restore_mode),
                     restore_fault_socket,
                     self.exit_reason.as_deref(),
+                    Some(clock_restore_mode),
                 )?;
 
                 if self
@@ -2603,6 +2610,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             self.exit_reason.as_deref(),
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2786,6 +2794,7 @@ impl RequestHandler for Vmm {
                     restore_cfg.prefault,
                     restore_cfg.memory_restore_mode,
                     restore_cfg.restore_fault_socket.as_deref(),
+                    restore_cfg.clock_restore_mode,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2893,6 +2902,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             self.exit_reason.as_deref(),
+            None,
         )?;
 
         // And we boot it

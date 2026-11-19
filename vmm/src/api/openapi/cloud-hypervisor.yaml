@@ -1704,6 +1704,15 @@ components:
       enum: [Copy, OnDemand, CopyOnWrite]
       default: Copy
 
+    GuestClockRestoreMode:
+      type: string
+      enum: [Advance, Hold]
+      default: Advance
+      description: >
+        How the guest clock is re-established when the restored VM resumes.
+        Advance moves it forward by the wall time elapsed since the snapshot.
+        Hold resumes it where the snapshot left it, as if no time had passed.
+
     RestoreConfig:
       required:
         - source_url
@@ -1717,6 +1726,8 @@ components:
           $ref: "#/components/schemas/MemoryRestoreMode"
         resume:
           type: boolean
+        clock_restore_mode:
+          $ref: "#/components/schemas/GuestClockRestoreMode"
         zone_updates:
           type: array
           items:

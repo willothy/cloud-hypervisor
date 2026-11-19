@@ -2964,6 +2964,36 @@ impl FromStr for MemoryRestoreMode {
     }
 }
 
+/// How the guest clock is re-established when a restored VM resumes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum GuestClockRestoreMode {
+    /// Advance the guest clock by the wall time elapsed since the snapshot,
+    /// as for a VM that was suspended and is being brought back.
+    #[default]
+    Advance,
+    /// Hold the guest clock where the snapshot left it, as if no time had
+    /// passed, for a guest started fresh from a snapshot of any age.
+    Hold,
+}
+
+#[derive(Debug, Error)]
+pub enum GuestClockRestoreModeParseError {
+    #[error("Invalid value: {0}")]
+    InvalidValue(String),
+}
+
+impl FromStr for GuestClockRestoreMode {
+    type Err = GuestClockRestoreModeParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "advance" => Ok(Self::Advance),
+            "hold" => Ok(Self::Hold),
+            _ => Err(GuestClockRestoreModeParseError::InvalidValue(s.to_owned())),
+        }
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, Debug, Eq, PartialEq)]
 /// Data required for updating memory zone <-> host NUMA node mappings.
 pub struct VmMemoryZoneUpdateData {
@@ -3017,6 +3047,9 @@ pub struct RestoreConfig {
     pub iommufd_fd: Option<i32>,
     #[serde(default)]
     pub resume: bool,
+    /// How the guest clock is re-established when the restored VM resumes.
+    #[serde(default)]
+    pub clock_restore_mode: GuestClockRestoreMode,
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
 }
@@ -3026,7 +3059,7 @@ impl RestoreConfig {
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
         memory_fault_socket=<path>,net_fds=<list_of_net_ids_with_their_associated_fds>,\
         vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
-        zone_updates=<list_of_updates>\"
+        clock_restore_mode=advance|hold,zone_updates=<list_of_updates>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
         \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
@@ -3039,6 +3072,7 @@ impl RestoreConfig {
         \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
         The one saved in the snapshot does not survive serialization.\
         \n `resume` controls whether the VM will be directly resumed after restore \
+        \n`clock_restore_mode=advance` advances the guest clock by the wall time elapsed since the snapshot (the default), and `clock_restore_mode=hold` resumes it where the snapshot left it, as if no time had passed \
         \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node`";
 
     pub fn parse(restore: &str) -> Result<Self> {
@@ -3052,6 +3086,7 @@ impl RestoreConfig {
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("resume")
+            .add("clock_restore_mode")
             .add("zone_updates");
         parser.parse(restore).map_err(Error::ParseRestore)?;
 
@@ -3100,6 +3135,10 @@ impl RestoreConfig {
             .map_err(Error::ParseRestore)?
             .unwrap_or(Toggle(false))
             .0;
+        let clock_restore_mode = parser
+            .convert::<GuestClockRestoreMode>("clock_restore_mode")
+            .map_err(Error::ParseRestore)?
+            .unwrap_or_default();
 
         let zone_updates: Vec<VmMemoryZoneUpdateData> = parser
             .convert::<TupleList<String, u32>>("zone_updates")
@@ -3122,6 +3161,7 @@ impl RestoreConfig {
             vfio_fds,
             iommufd_fd,
             resume,
+            clock_restore_mode,
             zone_updates,
         })
     }
@@ -5568,6 +5608,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 vfio_fds: None,
                 iommufd_fd: None,
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             }
         );
@@ -5595,6 +5636,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 vfio_fds: None,
                 iommufd_fd: None,
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             }
         );
@@ -5609,6 +5651,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 vfio_fds: None,
                 iommufd_fd: None,
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             }
         );
@@ -5623,6 +5666,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 vfio_fds: None,
                 iommufd_fd: None,
                 resume: true,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![VmMemoryZoneUpdateData {
                     host_numa_node: 1,
                     id: "zone1".to_string(),
@@ -5651,6 +5695,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ]),
                 iommufd_fd: Some(7),
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             }
         );
@@ -5676,12 +5721,34 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ]),
                 iommufd_fd: Some(7),
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,clock_restore_mode=hold")?,
+            RestoreConfig {
+                restore_fault_socket: None,
+                source_url: PathBuf::from("/path/to/snapshot"),
+                prefault: false,
+                memory_restore_mode: MemoryRestoreMode::Copy,
+                net_fds: None,
+                vfio_fds: None,
+                iommufd_fd: None,
+                resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Hold,
+                zone_updates: vec![],
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,clock_restore_mode=advance")?
+                .clock_restore_mode,
+            GuestClockRestoreMode::Advance
         );
         // Parsing should fail as source_url is a required field
         RestoreConfig::parse("prefault=off").unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
+        RestoreConfig::parse("source_url=/path/to/snapshot,clock_restore_mode=bogus").unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@1]")
             .unwrap_err();
         RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@]")
@@ -5712,6 +5779,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             .unwrap()
             .memory_restore_mode,
             MemoryRestoreMode::OnDemand
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(r#"{"source_url":"/path/to/snapshot"}"#)
+                .unwrap()
+                .clock_restore_mode,
+            GuestClockRestoreMode::Advance
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","clock_restore_mode":"Hold"}"#
+            )
+            .unwrap()
+            .clock_restore_mode,
+            GuestClockRestoreMode::Hold
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
@@ -5844,6 +5925,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             vfio_fds: None,
             iommufd_fd: None,
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: vec![],
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
@@ -5913,6 +5995,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             vfio_fds: None,
             iommufd_fd: None,
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: vec![],
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
@@ -5925,6 +6008,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }]);
         another_valid_config.validate(&snapshot_vm_config).unwrap();
 
+        // Holding the guest clock constrains no other restore option.
+        let mut held_clock_config = another_valid_config.clone();
+        held_clock_config.clock_restore_mode = GuestClockRestoreMode::Hold;
+        held_clock_config.validate(&snapshot_vm_config).unwrap();
+
         let invalid_restore_mode = RestoreConfig {
             restore_fault_socket: None,
             source_url: PathBuf::from("/path/to/snapshot"),
@@ -5934,6 +6022,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             vfio_fds: None,
             iommufd_fd: None,
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: vec![],
         };
         assert_eq!(
@@ -5978,6 +6067,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             vfio_fds: None,
             iommufd_fd: None,
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: vec![],
         };
         assert_eq!(
@@ -5996,6 +6086,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 vfio_fds: None,
                 iommufd_fd: None,
                 resume: false,
+                clock_restore_mode: GuestClockRestoreMode::Advance,
                 zone_updates: vec![],
             };
             assert_eq!(
@@ -6060,6 +6151,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             vfio_fds: None,
             iommufd_fd: None,
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: Vec::new(),
         };
         let fault_socket = Some(PathBuf::from("/path/to/fault.sock"));
@@ -6148,6 +6240,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }]),
             iommufd_fd: Some(6),
             resume: false,
+            clock_restore_mode: GuestClockRestoreMode::Advance,
             zone_updates: vec![],
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
