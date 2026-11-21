@@ -47,6 +47,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{Builder, JoinHandle};
+use std::time::{Duration, Instant};
 use std::{io, process};
 
 use log::error;
@@ -90,6 +91,19 @@ const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
 /// body past the bound is refused here, failing that one checkpoint with a
 /// reason: sending it would end the session, which the VM cannot survive.
 const MAX_CAPTURE_BODY_LEN: usize = 1 << 30;
+
+/// How long the fault handler has to answer a settle.
+///
+/// A settle has the handler install nothing: it reads the faults already
+/// raised, takes each vhost-user backend's mappings off its userfaultfd and
+/// registers guest RAM again. That was measured at two to three
+/// milliseconds on an idle host, and at some tens of milliseconds for each
+/// of 48 VMs restored at once on 24 hardware threads. The deadline is a
+/// hundred times the slowest of those, so that only a handler that is not
+/// going to answer runs into it, and short enough that the VMM thread,
+/// which waits for the verdict with the VM borrowed, is not kept from
+/// every other request for long.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The reason the VMM records when it exits because its fault session is gone.
 /// Its manager settles a VMM that recorded this as failed, rather than as one
@@ -235,14 +249,18 @@ pub(crate) struct FaultSession {
     /// Held by every [`BackendFaultRelay`] this session handed out, so the
     /// session can tell whether a vhost-user device still holds one.
     relays: Arc<()>,
+    /// Where the VMM records why it exits, for a session lost over a
+    /// failed exchange.
+    exit_reason: Option<PathBuf>,
 }
 
 impl FaultSession {
     /// Connect to the fault handler listening on `socket` and hand it the
     /// registered userfaultfd with the guest-RAM layout. `memfds` are the
     /// files backing the regions, in the order `HandoffRegion::memfd`
-    /// indexes. `exit_reason` is where the VMM records why it exits, which a
-    /// lost session's hangup watch writes before ending the process.
+    /// indexes. `exit_reason` is where the VMM records why it exits, which
+    /// is written before the process ends over a lost session, whether the
+    /// hangup watch or a failed exchange found it lost.
     pub(crate) fn establish(
         socket: &Path,
         mode: RegistrationMode,
@@ -265,6 +283,7 @@ impl FaultSession {
             mode,
             write: Arc::new(Mutex::new(())),
             relays: Arc::new(()),
+            exit_reason: exit_reason.map(Path::to_path_buf),
         })
     }
 
@@ -312,13 +331,43 @@ impl FaultSession {
     /// flight while the handler changes the registration, and no
     /// capture-done message can be taken for the verdict.
     ///
-    /// A handler that does not know the settle message ends the session
-    /// instead of answering, which fails this call and, through the hangup
-    /// watch, the VM.
+    /// A handler that refuses the settle fails this call, and nothing has
+    /// changed. An exchange that fails any other way is the loss of the
+    /// session (see [`Self::exchange_settle`]): the VMM records that and
+    /// exits, as it does when the handler hangs up, which is also how a
+    /// handler that does not know the settle message answers one.
     pub(crate) fn settle(&mut self) -> io::Result<bool> {
         if !self.demand_paged() {
             return Ok(true);
         }
+        match self.exchange_settle(SETTLE_DEADLINE) {
+            Ok(SettleVerdict::Settled) => {
+                self.mode = RegistrationMode::WriteProtectOnly;
+                Ok(true)
+            }
+            Ok(SettleVerdict::NotYet) => Ok(false),
+            Ok(SettleVerdict::Refused { error }) => Err(io::Error::other(format!(
+                "the fault handler refused to settle guest RAM: {error}"
+            ))),
+            Err(error) => {
+                error!(
+                    "the settle exchange with the fault handler failed, and the VM's fault session with it: {error}"
+                );
+                HangupWatch::exit(self.exit_reason.as_deref())
+            }
+        }
+    }
+
+    /// Send a settle and read the handler's verdict, which has `deadline`
+    /// to arrive.
+    ///
+    /// An error leaves the connection in no known state: a verdict that
+    /// arrives late, or the rest of a message read in part, would be taken
+    /// for the answer to the next settle or capture. So no error here can
+    /// be survived by the session: a verdict that did not arrive in time, a
+    /// message of another type or of no shape this VMM knows, or a failure
+    /// of the connection itself.
+    fn exchange_settle(&self, deadline: Duration) -> io::Result<SettleVerdict> {
         let body = serde_json::to_vec(&Settle {
             version: SETTLE_VERSION,
         })?;
@@ -329,22 +378,12 @@ impl FaultSession {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             send_message(&self.stream, MSG_SETTLE, &body, &[])?;
         }
-        let verdict = receive_message(&self.stream, MSG_SETTLE_VERDICT).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("the fault handler did not answer the settle: {error}"),
-            )
-        })?;
-        match serde_json::from_slice(&verdict)? {
-            SettleVerdict::Settled => {
-                self.mode = RegistrationMode::WriteProtectOnly;
-                Ok(true)
-            }
-            SettleVerdict::NotYet => Ok(false),
-            SettleVerdict::Refused { error } => Err(io::Error::other(format!(
-                "the fault handler refused to settle guest RAM: {error}"
-            ))),
-        }
+        let verdict = receive_message(
+            &self.stream,
+            MSG_SETTLE_VERDICT,
+            Some(Instant::now() + deadline),
+        )?;
+        Ok(serde_json::from_slice(&verdict)?)
     }
 
     /// The userfaultfd, for arming write-protection.
@@ -388,7 +427,7 @@ impl FaultSession {
     /// the peer's outcome: `Ok` when every armed page was captured, or the
     /// error that aborted the capture.
     pub(crate) fn wait_done(stream: &UnixStream) -> io::Result<Result<(), String>> {
-        let body = receive_message(stream, MSG_CAPTURE_DONE)?;
+        let body = receive_message(stream, MSG_CAPTURE_DONE, None)?;
         match serde_json::from_slice(&body)? {
             CaptureOutcome::Success => Ok(Ok(())),
             CaptureOutcome::Failure { error } => Ok(Err(error)),
@@ -440,7 +479,7 @@ impl BackendFaultHandler for BackendFaultRelay {
         // with an error rather than blocking forever if the handler goes
         // away without answering.
         drop(handler_end);
-        match serde_json::from_slice(&receive_message(&verdict, MSG_BACKEND_VERDICT)?)? {
+        match serde_json::from_slice(&receive_message(&verdict, MSG_BACKEND_VERDICT, None)?)? {
             BackendVerdict::Adopted => Ok(()),
             BackendVerdict::Rejected { error } => Err(io::Error::other(format!(
                 "the fault handler refused the memory table of {device}'s backend: {error}"
@@ -630,14 +669,51 @@ fn send_message(
 }
 
 /// Read one message from the fault handler on `stream`, blocking, and
-/// return its body, which must be of type `expected`.
-fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
+/// return its body, which must be of type `expected`. With a `deadline`
+/// the whole message must have arrived by then, or the read fails as timed
+/// out; only the vmm thread may give one, since it is waited for with a
+/// poll, which the vhost-user workers are not allowed.
+fn receive_message(
+    stream: &UnixStream,
+    expected: u32,
+    deadline: Option<Instant>,
+) -> io::Result<Vec<u8>> {
     // Read through recvmsg, which every thread that waits on the handler
     // (the vmm thread, and the vhost-user workers on reconnect) is allowed,
     // unlike the recvfrom a plain read of a socket makes.
     let read_exact = |buf: &mut [u8]| -> io::Result<()> {
         let mut read = 0;
         while read < buf.len() {
+            if let Some(deadline) = deadline {
+                // Whole milliseconds, rounded up: the wait never ends
+                // before the deadline.
+                let left = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_nanos()
+                    .div_ceil(1_000_000);
+                let mut fd = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: polling one initialized pollfd whose descriptor
+                // stays open for the duration of the call.
+                let ready =
+                    unsafe { libc::poll(&mut fd, 1, i32::try_from(left).unwrap_or(i32::MAX)) };
+                if ready < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if ready == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the fault handler did not send its message in time",
+                    ));
+                }
+            }
             match stream.recv_with_fd(&mut buf[read..]) {
                 Ok((0, _)) => {
                     return Err(io::Error::new(
@@ -716,7 +792,7 @@ mod tests {
         )
         .unwrap();
         let handler = listener.accept().unwrap().0;
-        receive_message(&handler, MSG_HANDOFF).unwrap();
+        receive_message(&handler, MSG_HANDOFF, None).unwrap();
         (handler, session)
     }
 
@@ -750,7 +826,7 @@ mod tests {
         assert!(session.settle().unwrap());
 
         let settle: Settle =
-            serde_json::from_slice(&receive_message(&handler, MSG_SETTLE).unwrap()).unwrap();
+            serde_json::from_slice(&receive_message(&handler, MSG_SETTLE, None).unwrap()).unwrap();
         assert_eq!(settle.version, SETTLE_VERSION);
         assert!(!session.demand_paged());
         assert!(session.backend_fault_relay().unwrap().is_none());
@@ -796,24 +872,69 @@ mod tests {
         assert!(session.demand_paged());
     }
 
-    /// An answer that is not a settle verdict this VMM knows fails the
-    /// settle rather than being taken for one: another message's type, or a
-    /// verdict of a shape from another version.
+    /// How long the exchanges below give a stand-in handler that answers
+    /// at once, or never.
+    const A_MOMENT: Duration = Duration::from_millis(200);
+
+    /// A message of another type where the verdict belongs fails the
+    /// exchange rather than being taken for one: here the capture-done
+    /// message a capture left unread.
     #[test]
-    fn an_answer_that_is_no_known_verdict_fails_the_settle() {
-        let (handler, mut session) = demand_paged_session();
+    fn another_messages_type_fails_the_settle_exchange() {
+        let (handler, session) = demand_paged_session();
         let done = serde_json::to_vec(&CaptureOutcome::Success).unwrap();
         send_message(&handler, MSG_CAPTURE_DONE, &done, &[]).unwrap();
-        let error = session.settle().unwrap_err();
+
+        let error = session.exchange_settle(A_MOMENT).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         assert!(
             error.to_string().contains("unexpected message type 3"),
             "{error}"
         );
+    }
 
+    /// A verdict of a shape this VMM does not know, as another version of
+    /// the exchange might send, fails the exchange.
+    #[test]
+    fn a_verdict_of_an_unknown_shape_fails_the_settle_exchange() {
+        let (handler, session) = demand_paged_session();
         send_message(&handler, MSG_SETTLE_VERDICT, br#""Deferred""#, &[]).unwrap();
-        let error = session.settle().unwrap_err();
+
+        let error = session.exchange_settle(A_MOMENT).unwrap_err();
+
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
-        assert!(session.demand_paged());
+        assert!(error.to_string().contains("Deferred"), "{error}");
+    }
+
+    /// A handler that holds the connection open and never answers fails the
+    /// exchange once the deadline has passed, and not before: the settle
+    /// reached it, and nothing came back.
+    #[test]
+    fn a_handler_that_never_answers_runs_into_the_deadline() {
+        let (handler, session) = demand_paged_session();
+
+        let asked = Instant::now();
+        let error = session.exchange_settle(A_MOMENT).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(asked.elapsed() >= A_MOMENT, "{:?}", asked.elapsed());
+        assert!(message_waits(&handler));
+    }
+
+    /// A verdict cut short is waited for no longer than the deadline
+    /// either: the header arrives, and the body it announces never does.
+    #[test]
+    fn a_verdict_cut_short_runs_into_the_deadline() {
+        let (handler, session) = demand_paged_session();
+        let mut header = Vec::new();
+        header.extend_from_slice(&MSG_SETTLE_VERDICT.to_le_bytes());
+        header.extend_from_slice(&9u32.to_le_bytes());
+        handler.send_with_fds(&[&header[..]], &[]).unwrap();
+
+        let error = session.exchange_settle(A_MOMENT).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
     }
 
     /// The session knows whether a relay it handed out is still held.

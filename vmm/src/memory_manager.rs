@@ -429,6 +429,13 @@ pub enum Error {
     )]
     HotplugWhileBackendsRelayed,
 
+    /// Forbidden operation. Guest RAM demand-paged by the in-process
+    /// handler has no fault session to settle.
+    #[error(
+        "Guest RAM is demand-paged by the in-process handler, which has no fault session to settle"
+    )]
+    SettleWithoutFaultSession,
+
     /// Forbidden operation. Impossible to resize guest memory below the boot
     /// RAM as it is not removable with virtio-mem.
     #[error("Invalid resize request: desired_size = {0} below boot size = {1}")]
@@ -1236,15 +1243,19 @@ impl MemoryManager {
     /// return whether guest RAM is settled. Settled guest RAM is a booted
     /// VM's: full captures, snapshots and ACPI memory hot-plug are no longer
     /// refused, and vhost-user devices created from then on take no fault
-    /// relay. Guest RAM that never was demand-paged is settled; guest RAM
+    /// relay. Guest RAM that never was demand-paged is settled. Guest RAM
     /// demand-paged by the in-process handler has no session to settle and
-    /// never is.
+    /// never will be, so the call is refused rather than answered "not
+    /// yet", which a caller would go on asking after.
     ///
     /// The caller must hold the exclusion a live capture holds over the
     /// fault session (see [`FaultSession::settle`]).
     pub(crate) fn settle(&mut self) -> Result<bool, Error> {
         let Some(session) = self.fault_session.as_mut() else {
-            return Ok(!self.demand_paged);
+            if self.demand_paged {
+                return Err(Error::SettleWithoutFaultSession);
+            }
+            return Ok(true);
         };
         if !session.settle().map_err(Error::SettleFaultSession)? {
             return Ok(false);
@@ -1678,12 +1689,15 @@ impl MemoryManager {
         }
         out.set_len(out_offset)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("sizing capture file: {e}")))?;
-        session
-            .send_capture(ranges, &out)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
+        // The connection is duplicated before the capture is sent, so a
+        // capture that was sent can always be waited for: its answer left on
+        // the connection would be read as the answer to the next exchange.
         let stream = session
             .try_clone_stream()
             .map_err(|e| MigratableError::MigrateSend(anyhow!("cloning the session: {e}")))?;
+        session
+            .send_capture(ranges, &out)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
         Self::wait_session_capture(&stream)?;
         Ok(dirty)
     }
@@ -1961,12 +1975,14 @@ impl MemoryManager {
         let session = self.fault_session.as_ref().ok_or_else(|| {
             MigratableError::MigrateSend(anyhow!("no fault handler to run the capture"))
         })?;
-        session
-            .send_capture(ranges, &out)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
+        // Duplicated before the capture is sent, so that a capture that was
+        // sent always has a connection to be waited for on.
         let stream = session
             .try_clone_stream()
             .map_err(|e| MigratableError::MigrateSend(anyhow!("cloning the session: {e}")))?;
+        session
+            .send_capture(ranges, &out)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
         Ok(Some(stream))
     }
 
@@ -4920,6 +4936,40 @@ mod tests {
         assert!(mm.resize(256 * MIB).unwrap().is_some());
         assert_eq!(mm.guest_memory().memory().num_regions(), regions + 1);
         assert_eq!(mm.current_ram, 256 * MIB);
+    }
+
+    /// With no fault session, guest RAM that is not demand-paged is
+    /// settled, and guest RAM the in-process handler demand-pages is
+    /// refused a settle: nothing could ever settle it.
+    #[test]
+    fn a_settle_without_a_fault_session_is_refused_while_demand_paged() {
+        use hypervisor::HypervisorVmConfig;
+
+        let hv = hypervisor::new().unwrap();
+        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let config = MemoryConfig {
+            size: 128 << 20,
+            ..Default::default()
+        };
+        let mm = MemoryManager::new(
+            vm,
+            &config,
+            None,
+            40,
+            #[cfg(feature = "tdx")]
+            false,
+            None,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let mut mm = mm.lock().unwrap();
+
+        assert!(mm.settle().unwrap());
+
+        mm.demand_paged = true;
+        assert!(matches!(mm.settle(), Err(Error::SettleWithoutFaultSession)));
+        assert!(mm.demand_paged);
     }
 
     struct RecordingUffdMemorySource {
