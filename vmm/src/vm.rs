@@ -3213,6 +3213,13 @@ impl Vm {
             // Nothing was dirty; there is no capture to wait for.
             None => Ok(()),
         };
+        // The resume's error is the one returned when both failed, so the
+        // capture's is logged rather than lost.
+        if resumed.is_err()
+            && let Err(error) = &captured
+        {
+            error!("the live checkpoint's capture failed as well as its resume: {error}");
+        }
         resumed?;
         captured
     }
