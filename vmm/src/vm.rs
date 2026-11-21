@@ -249,6 +249,9 @@ pub enum Error {
     #[error("Cannot take a live checkpoint")]
     LiveCheckpoint(#[source] MigratableError),
 
+    #[error("Cannot settle guest memory")]
+    SettleMemory(#[source] MemoryManagerError),
+
     #[error("Invalid restore source URL")]
     InvalidRestoreSourceUrl,
 
@@ -3109,6 +3112,22 @@ impl Vm {
                 MigratableError::MigrateSend(anyhow!("memory manager lock poisoned: {e}"))
             })?
             .dirty_page_count()
+    }
+
+    /// End the demand paging of guest RAM once its fault handler has served
+    /// the whole memory image, and return whether guest RAM is settled: see
+    /// [`MemoryManager::settle`]. Idempotent, and a no-op that answers
+    /// `true` for a VM whose RAM never was demand-paged.
+    ///
+    /// Taking the VM exclusively is what keeps a settle and a live capture
+    /// apart: [`Self::live_checkpoint`] holds the same borrow from arming
+    /// its capture until the fault handler reports it done.
+    pub fn settle_memory(&mut self) -> Result<bool> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .settle()
+            .map_err(Error::SettleMemory)
     }
 
     /// The guest-memory ranges the devices (vhost-user backends, via their

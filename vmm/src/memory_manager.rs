@@ -300,7 +300,8 @@ pub struct MemoryManager {
     uffd_registered_layout: Vec<(u64, u64)>,
     /// This VM's guest memory is demand-paged from a checkpoint (a lazy
     /// restore): a full capture is refused — it would fault the entire lazy
-    /// tail in — so its checkpoints are always incremental.
+    /// tail in — so its checkpoints are always incremental. Cleared once
+    /// the fault handler has served the whole image (see [`Self::settle`]).
     demand_paged: bool,
 
     pub acpi_address: Option<GuestAddress>,
@@ -382,6 +383,10 @@ pub enum Error {
     #[error("Establishing the fault-handler session")]
     FaultSession(#[source] io::Error),
 
+    /// Settling demand-paged guest RAM with the fault handler failed.
+    #[error("Settling guest RAM with the fault handler")]
+    SettleFaultSession(#[source] io::Error),
+
     /// Cannot restore VM because source URL is missing
     #[error("Cannot restore VM because source URL is missing")]
     RestoreMissingSourceUrl,
@@ -416,6 +421,13 @@ pub enum Error {
     /// guest RAM is demand-paged.
     #[error("ACPI memory hot-plug is not supported while guest RAM is demand-paged")]
     HotplugWhileDemandPaged,
+
+    /// Forbidden operation. ACPI memory hot-plug is not supported while a
+    /// vhost-user device connected during demand paging remains.
+    #[error(
+        "ACPI memory hot-plug is not supported while a vhost-user device connected during demand paging remains"
+    )]
+    HotplugWhileBackendsRelayed,
 
     /// Forbidden operation. Impossible to resize guest memory below the boot
     /// RAM as it is not removable with virtio-mem.
@@ -1217,6 +1229,28 @@ impl MemoryManager {
         };
         let relay = session.backend_fault_relay().map_err(Error::FaultSession)?;
         Ok(relay.map(|relay| Arc::new(relay) as Arc<dyn BackendFaultHandler>))
+    }
+
+    /// Ask the fault handler to end demand paging, which it does once it has
+    /// served the whole memory image (see [`FaultSession::settle`]), and
+    /// return whether guest RAM is settled. Settled guest RAM is a booted
+    /// VM's: full captures, snapshots and ACPI memory hot-plug are no longer
+    /// refused, and vhost-user devices created from then on take no fault
+    /// relay. Guest RAM that never was demand-paged is settled; guest RAM
+    /// demand-paged by the in-process handler has no session to settle and
+    /// never is.
+    ///
+    /// The caller must hold the exclusion a live capture holds over the
+    /// fault session (see [`FaultSession::settle`]).
+    pub(crate) fn settle(&mut self) -> Result<bool, Error> {
+        let Some(session) = self.fault_session.as_mut() else {
+            return Ok(!self.demand_paged);
+        };
+        if !session.settle().map_err(Error::SettleFaultSession)? {
+            return Ok(false);
+        }
+        self.demand_paged = false;
+        Ok(true)
     }
 
     /// Describe registered ranges for a userfaultfd handoff: each range's
@@ -3655,6 +3689,16 @@ impl MemoryManager {
                     {
                         return Err(Error::HotplugWhileDemandPaged);
                     }
+                    // A vhost-user device connected while guest RAM was
+                    // demand-paged keeps its backend on the postcopy flow
+                    // after a settle, and refuses the region the same way.
+                    if self
+                        .fault_session
+                        .as_ref()
+                        .is_some_and(FaultSession::relays_backends)
+                    {
+                        return Err(Error::HotplugWhileBackendsRelayed);
+                    }
 
                     region =
                         Some(self.hotplug_ram_region((desired_ram - self.current_ram) as usize)?);
@@ -4801,6 +4845,81 @@ mod tests {
         ));
         assert_eq!(mm.guest_memory().memory().num_regions(), regions);
         assert_eq!(mm.current_ram, 128 * MIB);
+    }
+
+    /// Once the fault handler has settled guest RAM it is no longer
+    /// demand-paged, and an ACPI memory hot-plug goes through, but only once
+    /// no vhost-user device connected during demand paging remains: its
+    /// backend stays on the postcopy flow and would refuse the region.
+    #[test]
+    fn acpi_hotplug_follows_a_settle() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        use hypervisor::HypervisorVmConfig;
+        use vmm_sys_util::tempdir::TempDir;
+
+        const MIB: u64 = 1 << 20;
+        // The handler's end is declared first, so it outlives the session
+        // and the session's hang-up watch never fires.
+        let handler: UnixStream;
+        let dir = TempDir::new_with_prefix("/tmp/fault-session-").unwrap();
+        let socket = dir.as_path().join("fault.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let uffd_stand_in = OwnedFd::from(tempfile::tempfile().unwrap());
+        let session = FaultSession::establish(
+            &socket,
+            handoff::RegistrationMode::MissingAndWriteProtect,
+            Vec::new(),
+            uffd_stand_in,
+            &[],
+            None,
+        )
+        .unwrap();
+        handler = listener.accept().unwrap().0;
+
+        let hv = hypervisor::new().unwrap();
+        let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let config = MemoryConfig {
+            size: 128 * MIB,
+            hotplug_method: HotplugMethod::Acpi,
+            hotplug_size: Some(128 * MIB),
+            ..Default::default()
+        };
+        let mm = MemoryManager::new(
+            vm,
+            &config,
+            None,
+            40,
+            #[cfg(feature = "tdx")]
+            false,
+            None,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+        let mut mm = mm.lock().unwrap();
+        mm.fault_session = Some(session);
+        mm.demand_paged = true;
+        let relay = mm.backend_fault_handler().unwrap();
+        assert!(relay.is_some());
+        let regions = mm.guest_memory().memory().num_regions();
+
+        handoff::test_support::queue_settled(&handler);
+        assert!(mm.settle().unwrap());
+        assert!(!mm.demand_paged);
+        assert!(mm.backend_fault_handler().unwrap().is_none());
+
+        assert!(matches!(
+            mm.resize(256 * MIB),
+            Err(Error::HotplugWhileBackendsRelayed)
+        ));
+        assert_eq!(mm.guest_memory().memory().num_regions(), regions);
+
+        drop(relay);
+        assert!(mm.resize(256 * MIB).unwrap().is_some());
+        assert_eq!(mm.guest_memory().memory().num_regions(), regions + 1);
+        assert_eq!(mm.current_ram, 256 * MIB);
     }
 
     struct RecordingUffdMemorySource {

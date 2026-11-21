@@ -29,6 +29,17 @@
 //! handoff carries one end of a socket pair, on which the handler answers
 //! with `BackendVerdict` (type 5) once it has adopted the table or refused
 //! it.
+//!
+//! A demand-paged session ends its demand paging with `Settle` (type 6):
+//! the VMM asks whether the handler has served the whole memory image, and
+//! the handler answers on the connection with `SettleVerdict` (type 7).
+//! Once it has, it stops serving missing faults — it unregisters every
+//! backend's mappings and registers this process's guest RAM again
+//! write-protect-only — and answers that guest RAM is settled; from then on
+//! the session is a booted VM's, kept for live checkpoints alone. Before
+//! that it answers that it is not yet, and nothing changes. The settle
+//! message carries the version of the exchange the VMM speaks, which a
+//! handler speaking another refuses.
 
 use std::fs::{self, File};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
@@ -54,6 +65,15 @@ const MSG_CAPTURE_DONE: u32 = 3;
 const MSG_BACKEND_HANDOFF: u32 = 4;
 /// Header discriminant of a backend-verdict message.
 const MSG_BACKEND_VERDICT: u32 = 5;
+/// Header discriminant of a settle message.
+const MSG_SETTLE: u32 = 6;
+/// Header discriminant of a settle-verdict message.
+const MSG_SETTLE_VERDICT: u32 = 7;
+
+/// The version of the settle exchange this VMM speaks, sent in every settle
+/// message. A handler that speaks another version refuses the message with
+/// a reason rather than answering in a shape this side would misread.
+const SETTLE_VERSION: u32 = 1;
 
 /// Wire size of the fixed message header.
 const HEADER_LEN: usize = 8;
@@ -176,6 +196,27 @@ enum CaptureOutcome {
     Failure { error: String },
 }
 
+/// The settle body: asks the handler whether it has served the whole memory
+/// image, and to end demand paging if it has.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Settle {
+    /// The version of the exchange the sender speaks.
+    version: u32,
+}
+
+/// The handler's answer to a settle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum SettleVerdict {
+    /// The image is fully served and missing faults are no longer trapped:
+    /// guest RAM is registered write-protect-only from now on.
+    Settled,
+    /// The image is not fully served yet. Nothing changed.
+    NotYet,
+    /// The handler refused the settle, for the reason it gives. Nothing
+    /// changed.
+    Refused { error: String },
+}
+
 /// The VMM's end of a userfaultfd handoff: the connection to the fault
 /// handler and a duplicate of the userfaultfd, kept for arming
 /// write-protection during live checkpoints (ioctls do not compete with the
@@ -191,6 +232,9 @@ pub(crate) struct FaultSession {
     /// here, and backend handoffs from the [`BackendFaultRelay`]s of
     /// vhost-user devices, which can connect at any time.
     write: Arc<Mutex<()>>,
+    /// Held by every [`BackendFaultRelay`] this session handed out, so the
+    /// session can tell whether a vhost-user device still holds one.
+    relays: Arc<()>,
 }
 
 impl FaultSession {
@@ -220,6 +264,7 @@ impl FaultSession {
             uffd,
             mode,
             write: Arc::new(Mutex::new(())),
+            relays: Arc::new(()),
         })
     }
 
@@ -231,7 +276,8 @@ impl FaultSession {
 
     /// The relay vhost-user devices hand their backends' userfaultfds to,
     /// when guest RAM is demand-paged through this session; `None` for a
-    /// write-protect-only session, whose guest RAM has nothing to serve.
+    /// write-protect-only session, whose guest RAM has nothing to serve, a
+    /// settled one included.
     pub(crate) fn backend_fault_relay(&self) -> io::Result<Option<BackendFaultRelay>> {
         if !self.demand_paged() {
             return Ok(None);
@@ -239,7 +285,66 @@ impl FaultSession {
         Ok(Some(BackendFaultRelay {
             stream: self.stream.try_clone()?,
             write: Arc::clone(&self.write),
+            _session: Arc::clone(&self.relays),
         }))
+    }
+
+    /// Whether a vhost-user device still holds a relay this session handed
+    /// out while guest RAM was demand-paged. Such a device keeps its
+    /// backend on the postcopy flow for its whole life, settled or not, and
+    /// a backend on that flow takes no added memory region.
+    pub(crate) fn relays_backends(&self) -> bool {
+        Arc::strong_count(&self.relays) > 1
+    }
+
+    /// Ask the fault handler whether it has served the whole memory image,
+    /// and have it end demand paging if so. Returns whether guest RAM is
+    /// settled: `true` once the handler has registered it write-protect-only
+    /// — from then on this is a booted VM's session, with no backend fault
+    /// relay to hand out — and at once for a session that never was, or no
+    /// longer is, demand-paged; `false` while the image is still being
+    /// served, when nothing has changed.
+    ///
+    /// The verdict is read from the connection capture-done messages arrive
+    /// on, so the caller must hold the exclusion a live capture holds over
+    /// the session: the VMM thread's exclusive borrow of the VM, under which
+    /// a capture is armed, sent and waited for. No capture can then be in
+    /// flight while the handler changes the registration, and no
+    /// capture-done message can be taken for the verdict.
+    ///
+    /// A handler that does not know the settle message ends the session
+    /// instead of answering, which fails this call and, through the hangup
+    /// watch, the VM.
+    pub(crate) fn settle(&mut self) -> io::Result<bool> {
+        if !self.demand_paged() {
+            return Ok(true);
+        }
+        let body = serde_json::to_vec(&Settle {
+            version: SETTLE_VERSION,
+        })?;
+        {
+            let _write = self
+                .write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            send_message(&self.stream, MSG_SETTLE, &body, &[])?;
+        }
+        let verdict = receive_message(&self.stream, MSG_SETTLE_VERDICT).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("the fault handler did not answer the settle: {error}"),
+            )
+        })?;
+        match serde_json::from_slice(&verdict)? {
+            SettleVerdict::Settled => {
+                self.mode = RegistrationMode::WriteProtectOnly;
+                Ok(true)
+            }
+            SettleVerdict::NotYet => Ok(false),
+            SettleVerdict::Refused { error } => Err(io::Error::other(format!(
+                "the fault handler refused to settle guest RAM: {error}"
+            ))),
+        }
     }
 
     /// The userfaultfd, for arming write-protection.
@@ -296,6 +401,8 @@ impl FaultSession {
 pub(crate) struct BackendFaultRelay {
     stream: UnixStream,
     write: Arc<Mutex<()>>,
+    /// Marks the relay as held, for [`FaultSession::relays_backends`].
+    _session: Arc<()>,
 }
 
 impl BackendFaultHandler for BackendFaultRelay {
@@ -568,4 +675,157 @@ fn receive_message(stream: &UnixStream, expected: u32) -> io::Result<Vec<u8>> {
     let mut body = vec![0u8; body_len as usize];
     read_exact(&mut body)?;
     Ok(body)
+}
+
+/// Test support: the fault handler's side of the settle exchange.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Queue the verdict that guest RAM is settled on `handler`, the fault
+    /// handler's end of a session, for the session's next settle to read.
+    pub(crate) fn queue_settled(handler: &UnixStream) {
+        let body = serde_json::to_vec(&SettleVerdict::Settled).unwrap();
+        send_message(handler, MSG_SETTLE_VERDICT, &body, &[]).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use vmm_sys_util::tempdir::TempDir;
+
+    use super::*;
+
+    /// A demand-paged fault session and the stand-in handler's end of its
+    /// connection, the handoff already read off it. The handler's end comes
+    /// first so that it is dropped last: the session's hang-up watch, which
+    /// ends the process, never sees it go.
+    fn demand_paged_session() -> (UnixStream, FaultSession) {
+        let dir = TempDir::new_with_prefix("/tmp/fault-session-").unwrap();
+        let socket = dir.as_path().join("fault.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let session = FaultSession::establish(
+            &socket,
+            RegistrationMode::MissingAndWriteProtect,
+            Vec::new(),
+            OwnedFd::from(tempfile::tempfile().unwrap()),
+            &[],
+            None,
+        )
+        .unwrap();
+        let handler = listener.accept().unwrap().0;
+        receive_message(&handler, MSG_HANDOFF).unwrap();
+        (handler, session)
+    }
+
+    /// Queue `verdict` on the handler's end, for the session's next settle.
+    fn queue_verdict(handler: &UnixStream, verdict: &SettleVerdict) {
+        let body = serde_json::to_vec(verdict).unwrap();
+        send_message(handler, MSG_SETTLE_VERDICT, &body, &[]).unwrap();
+    }
+
+    /// Whether a message from the session waits on the handler's end.
+    fn message_waits(handler: &UnixStream) -> bool {
+        let mut fd = libc::pollfd {
+            fd: handler.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polling one initialized pollfd whose descriptor is open.
+        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+        assert!(ready >= 0);
+        ready == 1
+    }
+
+    /// A settled verdict makes the session a booted VM's: no longer
+    /// demand-paged, with no relay to hand out. The settle names the version
+    /// the VMM speaks, and a later settle answers without asking again.
+    #[test]
+    fn a_settled_verdict_ends_demand_paging() {
+        let (handler, mut session) = demand_paged_session();
+        queue_verdict(&handler, &SettleVerdict::Settled);
+
+        assert!(session.settle().unwrap());
+
+        let settle: Settle =
+            serde_json::from_slice(&receive_message(&handler, MSG_SETTLE).unwrap()).unwrap();
+        assert_eq!(settle.version, SETTLE_VERSION);
+        assert!(!session.demand_paged());
+        assert!(session.backend_fault_relay().unwrap().is_none());
+
+        assert!(session.settle().unwrap());
+        assert!(!message_waits(&handler));
+    }
+
+    /// While the handler is still serving the image the settle changes
+    /// nothing: guest RAM stays demand-paged and backends are still relayed.
+    #[test]
+    fn a_not_yet_verdict_changes_nothing() {
+        let (handler, mut session) = demand_paged_session();
+        queue_verdict(&handler, &SettleVerdict::NotYet);
+
+        assert!(!session.settle().unwrap());
+
+        assert!(session.demand_paged());
+        assert!(session.backend_fault_relay().unwrap().is_some());
+    }
+
+    /// A handler that refuses the settle, as one speaking another version of
+    /// the exchange does, fails it with the handler's reason and changes
+    /// nothing.
+    #[test]
+    fn a_refused_settle_fails_with_the_handlers_reason() {
+        let (handler, mut session) = demand_paged_session();
+        queue_verdict(
+            &handler,
+            &SettleVerdict::Refused {
+                error: "settle version 1 is not spoken here".to_string(),
+            },
+        );
+
+        let error = session.settle().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("settle version 1 is not spoken here"),
+            "{error}"
+        );
+        assert!(session.demand_paged());
+    }
+
+    /// An answer that is not a settle verdict this VMM knows fails the
+    /// settle rather than being taken for one: another message's type, or a
+    /// verdict of a shape from another version.
+    #[test]
+    fn an_answer_that_is_no_known_verdict_fails_the_settle() {
+        let (handler, mut session) = demand_paged_session();
+        let done = serde_json::to_vec(&CaptureOutcome::Success).unwrap();
+        send_message(&handler, MSG_CAPTURE_DONE, &done, &[]).unwrap();
+        let error = session.settle().unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected message type 3"),
+            "{error}"
+        );
+
+        send_message(&handler, MSG_SETTLE_VERDICT, br#""Deferred""#, &[]).unwrap();
+        let error = session.settle().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(session.demand_paged());
+    }
+
+    /// The session knows whether a relay it handed out is still held.
+    #[test]
+    fn a_held_relay_is_counted() {
+        let (_handler, session) = demand_paged_session();
+        assert!(!session.relays_backends());
+
+        let relay = session.backend_fault_relay().unwrap().unwrap();
+        assert!(session.relays_backends());
+
+        drop(relay);
+        assert!(!session.relays_backends());
+    }
 }
