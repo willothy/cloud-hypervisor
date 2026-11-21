@@ -569,7 +569,18 @@ impl HangupWatch {
     /// exit, which only looks once the process is gone: no reader can see a
     /// partial one. A failure to write is logged: the VMM exits either way,
     /// and a missing reason reads as an exit with no reason given.
+    ///
+    /// The watch and a failed exchange can both find the session lost at
+    /// once: a handler that closes the connection on a settle it does not
+    /// know fails the exchange as the watch sees the hangup. Only the first
+    /// to get here records and exits; the second waits here for the process
+    /// to end. Two at once would each truncate the record as they write it,
+    /// and the first to exit could leave it empty.
     fn exit(exit_reason: Option<&Path>) -> ! {
+        static EXITING: Mutex<()> = Mutex::new(());
+        let _exiting = EXITING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(path) = exit_reason
             && let Err(error) = fs::write(path, SESSION_LOST)
         {
