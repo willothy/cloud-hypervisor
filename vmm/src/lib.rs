@@ -41,7 +41,7 @@ use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
 use vm_migration::{
     MemoryMigrationContext, Migratable, MigratableError, OngoingMigrationContext, Pausable,
-    Snapshot, Snapshottable, Transportable,
+    Snapshot, Snapshottable,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
@@ -2658,7 +2658,7 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> result::Result<(), VmError> {
+    fn vm_snapshot(&mut self, config: &api::VmSnapshotConfig) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
                 if vm.restoring() {
@@ -2669,7 +2669,7 @@ impl RequestHandler for Vmm {
                 vm.snapshot()
                     .map_err(VmError::Snapshot)
                     .and_then(|snapshot| {
-                        vm.send(&snapshot, destination_url)
+                        vm.send_snapshot(&snapshot, &config.destination_url, config.zero_pages)
                             .map_err(VmError::SnapshotSend)
                     })
             }

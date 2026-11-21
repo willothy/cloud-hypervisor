@@ -1692,6 +1692,8 @@ components:
       properties:
         destination_url:
           type: string
+        zero_pages:
+          $ref: "#/components/schemas/SnapshotZeroPages"
 
     VmCoredumpData:
       type: object
@@ -1712,6 +1714,12 @@ components:
         How the guest clock is re-established when the restored VM resumes.
         Advance moves it forward by the wall time elapsed since the snapshot.
         Hold resumes it where the snapshot left it, as if no time had passed.
+
+    SnapshotZeroPages:
+      type: string
+      enum: [Write, Skip]
+      default: Write
+      description: What a snapshot does with guest pages that read as all zero. Skip leaves them out of the memory file as holes, which a restore reads as zero; it applies where guest memory is file-backed and the memory file can be sparse, and is refused for a VM with a memory zone backed by a user file.
 
     RestoreConfig:
       required:

@@ -55,7 +55,8 @@ pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::{
-    RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
+    RestoreConfig, RestoredVfioConfig, SnapshotZeroPages, VmMemoryZoneUpdateData,
+    deserialize_restored_fd,
 };
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
@@ -281,6 +282,9 @@ pub struct VmRemoveDeviceData {
 pub struct VmSnapshotConfig {
     /// The snapshot destination URL
     pub destination_url: String,
+    /// What the snapshot does with guest pages that read as all zero.
+    #[serde(default)]
+    pub zero_pages: SnapshotZeroPages,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -942,7 +946,7 @@ pub trait RequestHandler {
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
-    fn vm_snapshot(&mut self, destination_url: &str) -> Result<(), VmError>;
+    fn vm_snapshot(&mut self, config: &VmSnapshotConfig) -> Result<(), VmError>;
 
     fn vm_capture_dirty_memory(&mut self, out_path: &str) -> Result<(), VmError>;
 
@@ -2181,7 +2185,7 @@ impl ApiAction for VmSnapshot {
             info!("API request event: VmSnapshot {config:?}");
 
             let response = vmm
-                .vm_snapshot(&config.destination_url)
+                .vm_snapshot(&config)
                 .map_err(ApiError::VmSnapshot)
                 .map(|_| ApiResponsePayload::Empty);
 

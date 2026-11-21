@@ -91,7 +91,9 @@ use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::CaptureScope;
-use crate::config::{GuestClockRestoreMode, MemoryRestoreMode, ValidationError, add_to_config};
+use crate::config::{
+    GuestClockRestoreMode, MemoryRestoreMode, SnapshotZeroPages, ValidationError, add_to_config,
+};
 use crate::console_devices::{ConsoleDeviceError, ConsoleInfo};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
@@ -3727,12 +3729,36 @@ impl Snapshottable for Vm {
     }
 }
 
-impl Transportable for Vm {
-    fn send(
+impl Vm {
+    /// Write `snapshot` of this VM to `destination_url`: its config, its
+    /// state and its memory, treating guest pages that read as all zero as
+    /// `zero_pages` says.
+    pub fn send_snapshot(
         &self,
         snapshot: &Snapshot,
         destination_url: &str,
+        zero_pages: SnapshotZeroPages,
     ) -> result::Result<(), MigratableError> {
+        // A restore maps a file-backed memory zone over its file as that
+        // file stands, and fills in only the pages the memory file holds, so
+        // a page left out as zero would keep whatever the file holds then.
+        if zero_pages == SnapshotZeroPages::Skip
+            && let Some((id, file)) = self
+                .config
+                .lock()
+                .unwrap()
+                .memory
+                .zones
+                .iter()
+                .flatten()
+                .find_map(|zone| Some((&zone.id, zone.file.as_ref()?)))
+        {
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "zero_pages Skip needs guest memory that a restore starts from zero, but memory zone {id} is backed by {}",
+                file.display()
+            )));
+        }
+
         let mut snapshot_config_path = url_to_path(destination_url)?;
         snapshot_config_path.push(SNAPSHOT_CONFIG_FILE);
 
@@ -3778,11 +3804,11 @@ impl Transportable for Vm {
             .map_err(MigratableError::MigrateSend)?;
 
         // Tell the memory manager to also send/write its own snapshot.
-        if let Some(memory_manager_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
+        if snapshot.snapshots.contains_key(MEMORY_MANAGER_SNAPSHOT_ID) {
             self.memory_manager
                 .lock()
                 .unwrap()
-                .send(&memory_manager_snapshot.clone(), destination_url)?;
+                .send_memory(destination_url, zero_pages)?;
         } else {
             return Err(MigratableError::Restore(anyhow!(
                 "Missing memory manager snapshot"
@@ -3790,6 +3816,16 @@ impl Transportable for Vm {
         }
 
         Ok(())
+    }
+}
+
+impl Transportable for Vm {
+    fn send(
+        &self,
+        snapshot: &Snapshot,
+        destination_url: &str,
+    ) -> result::Result<(), MigratableError> {
+        self.send_snapshot(snapshot, destination_url, SnapshotZeroPages::Write)
     }
 }
 

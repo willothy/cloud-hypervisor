@@ -2945,6 +2945,21 @@ pub enum MemoryRestoreMode {
     CopyOnWrite,
 }
 
+/// What a snapshot does with guest pages that read as all zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub enum SnapshotZeroPages {
+    /// Write every resident page to the memory file, zero or not.
+    #[default]
+    Write,
+    /// Leave resident pages that read as all zero out of the memory file, as
+    /// holes. A restore reads a hole as zero, so the restored guest memory
+    /// is the same, and a copy restore has fewer pages to load. Applies
+    /// where guest memory is file-backed and the memory file can be sparse;
+    /// elsewhere every page is written. Refused for a VM with a memory zone
+    /// backed by a user file, which a restore does not start from zero.
+    Skip,
+}
+
 #[derive(Debug, Error)]
 pub enum MemoryRestoreModeParseError {
     #[error("Invalid value: {0}")]
