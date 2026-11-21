@@ -117,6 +117,10 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(None)
     }
 
+    fn vm_settle_memory(&mut self) -> Result<Option<Vec<u8>>, VmError> {
+        Ok(None)
+    }
+
     fn vm_live_checkpoint(&mut self, _: &str, _: CaptureScope, _: bool) -> Result<(), VmError> {
         Ok(())
     }

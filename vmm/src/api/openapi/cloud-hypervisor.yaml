@@ -140,6 +140,30 @@ paths:
         409:
           description: The operation conflicts with the current state of the VM.
 
+  /vm.settle-memory:
+    put:
+      summary: End the demand paging of guest memory once its fault handler has served the whole memory image.
+      description: >-
+        Asks the fault handler of a VM restored on demand through a fault
+        socket whether it has served the whole memory image. Once it has, the
+        handler stops trapping missing faults and guest memory is settled:
+        full live checkpoints, snapshots and ACPI memory hot-plug are no
+        longer refused, and vhost-user devices added from then on take no
+        fault relay. Until then nothing changes. The call is idempotent, and
+        a VM whose memory never was demand-paged is settled.
+      operationId: settleMemoryVM
+      responses:
+        200:
+          description: Whether guest memory is settled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VmSettleMemoryResponse"
+        404:
+          description: The VM instance is not created.
+        500:
+          description: The fault handler refused the settle or did not answer it.
+
   /vm.shutdown:
     put:
       summary: Shut the VM instance down.
@@ -696,6 +720,16 @@ components:
         additionalProperties:
           type: integer
           format: int64
+
+    VmSettleMemoryResponse:
+      required:
+        - settled
+      type: object
+      properties:
+        settled:
+          type: boolean
+          description: >-
+            Whether guest memory is settled: not demand-paged, or no longer.
 
     BalloonStatsResponse:
       required:

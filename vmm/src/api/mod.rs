@@ -139,6 +139,10 @@ pub enum ApiError {
     #[error("The VM could not take a live checkpoint")]
     VmLiveCheckpoint(#[source] VmError),
 
+    /// The VM could not settle its guest memory.
+    #[error("The VM could not settle its guest memory")]
+    VmSettleMemory(#[source] VmError),
+
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
     VmRestore(#[source] VmError),
@@ -310,6 +314,15 @@ pub enum CaptureScope {
     /// was restored from holds. Refused for a booted VM, whose RAM is all
     /// resident: capture it full.
     Resident,
+}
+
+/// The answer to `vm.settle-memory`.
+#[derive(Clone, Copy, Deserialize, Serialize, Debug, PartialEq, Eq)]
+pub struct VmSettleMemoryResponse {
+    /// Whether guest RAM is settled: not demand-paged, or no longer. While
+    /// it is `false` the fault handler is still serving the memory image
+    /// the VM was restored from, and the call changed nothing.
+    pub settled: bool,
 }
 
 #[derive(Clone, Deserialize, Serialize, Default, Debug)]
@@ -952,6 +965,8 @@ pub trait RequestHandler {
 
     fn vm_dirty_page_count(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
+    fn vm_settle_memory(&mut self) -> Result<Option<Vec<u8>>, VmError>;
+
     fn vm_live_checkpoint(
         &mut self,
         destination_url: &str,
@@ -1585,6 +1600,39 @@ impl ApiAction for VmDirtyPageCount {
             let response = vmm
                 .vm_dirty_page_count()
                 .map_err(ApiError::VmDirtyPageCount)
+                .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmSettleMemory;
+
+impl ApiAction for VmSettleMemory {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmSettleMemory");
+
+            let response = vmm
+                .vm_settle_memory()
+                .map_err(ApiError::VmSettleMemory)
                 .map(ApiResponsePayload::VmAction);
 
             response_sender
