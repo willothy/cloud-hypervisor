@@ -151,6 +151,24 @@ paths:
         longer refused, and vhost-user devices added from then on take no
         fault relay. Until then nothing changes. The call is idempotent, and
         a VM whose memory never was demand-paged is settled.
+
+
+        A settle changes what the VM takes afterwards. A live checkpoint of
+        scope "resident" is refused from then on, because all of guest
+        memory is resident: the caller captures it "full" instead. ACPI
+        memory hot-plug stays refused for as long as a vhost-user device
+        that connected while memory was demand-paged remains attached. And
+        memory hot-plugged through ACPI lies outside the layout live
+        checkpoints capture, so every live checkpoint after such a hot-plug
+        is refused.
+
+
+        A VM whose memory is demand-paged by the in-process handler, with no
+        fault socket, has no fault session to settle, and the call is
+        refused. A fault handler that does not answer within five seconds,
+        or answers with anything other than a verdict, has cost the VM its
+        fault session: the VMM records "session-lost" as its exit reason and
+        exits without answering the call.
       operationId: settleMemoryVM
       responses:
         200:
@@ -159,10 +177,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/VmSettleMemoryResponse"
-        404:
-          description: The VM instance is not created.
+        409:
+          description: >-
+            The VM is being migrated, or its memory is demand-paged by the
+            in-process handler, which has no fault session to settle.
         500:
-          description: The fault handler refused the settle or did not answer it.
+          description: No VM is running, or the fault handler refused the settle.
 
   /vm.shutdown:
     put:
