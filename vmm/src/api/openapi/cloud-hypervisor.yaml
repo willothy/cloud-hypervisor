@@ -148,7 +148,7 @@ paths:
         socket whether it has served the whole memory image. Once it has, the
         handler stops trapping missing faults and guest memory is settled:
         full live checkpoints, snapshots and ACPI memory hot-plug are no
-        longer refused, and vhost-user devices added from then on take no
+        longer refused for that reason, and vhost-user devices added from then on take no
         fault relay. Until then nothing changes. The call is idempotent, and
         a VM whose memory never was demand-paged is settled.
 
