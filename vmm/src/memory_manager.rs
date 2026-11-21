@@ -54,7 +54,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::api::CaptureScope;
-use crate::config::MemoryRestoreMode;
+use crate::config::{MemoryRestoreMode, SnapshotZeroPages};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
@@ -4404,6 +4404,19 @@ impl Transportable for MemoryManager {
         _snapshot: &Snapshot,
         destination_url: &str,
     ) -> result::Result<(), MigratableError> {
+        self.send_memory(destination_url, SnapshotZeroPages::Write)
+    }
+}
+
+impl MemoryManager {
+    /// Write the memory ranges the last snapshot recorded to the memory file
+    /// under `destination_url`, treating guest pages that read as all zero as
+    /// `zero_pages` says.
+    pub fn send_memory(
+        &self,
+        destination_url: &str,
+        zero_pages: SnapshotZeroPages,
+    ) -> result::Result<(), MigratableError> {
         if self.snapshot_memory_ranges.is_empty() {
             return Ok(());
         }
@@ -4466,6 +4479,7 @@ impl Transportable for MemoryManager {
                     &memory_file,
                     file_cursor,
                     range.length,
+                    zero_pages,
                 )
                 .context("Error writing sparse memory snapshot region")
                 .map_err(MigratableError::MigrateSend)?;

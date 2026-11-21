@@ -14,6 +14,12 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::fs::FileExt;
 
+use crate::config::SnapshotZeroPages;
+
+/// The granularity at which [`SnapshotZeroPages::Skip`] leaves zero pages
+/// out: the smallest page any guest memory backing has.
+const ZERO_PAGE_SIZE: usize = 4096;
+
 /// Find the next populated (data) extent in `[cursor, end)` of `fd`,
 /// driven by `lseek(SEEK_DATA)` / `lseek(SEEK_HOLE)`. Returns
 /// `Ok(Some((offset, len)))` for the next data extent within the window,
@@ -55,16 +61,21 @@ pub fn next_data_extent(
 }
 
 /// Copy `[src_offset, src_offset+len)` of `src` to `dst` at `dst_offset`,
-/// writing only the populated extents so `dst` keeps its holes. `dst` must
-/// already be sized (e.g. via `set_len`). Returns `Ok(true)` if the region
-/// was written sparsely, or `Ok(false)` if `SEEK_HOLE` is unsupported on the
-/// source fd (caller should fall back to a dense copy).
+/// writing only the populated extents so `dst` keeps its holes. With
+/// [`SnapshotZeroPages::Skip`], pages of a populated extent that read as all
+/// zero are not written either, so they stay holes too. Every byte of the
+/// destination range must already read as zero, as it does in a fresh file
+/// extended with `set_len`: bytes this leaves unwritten keep what they held.
+/// Returns `Ok(true)` if the region was written sparsely, or `Ok(false)` if
+/// `SEEK_HOLE` is unsupported on the source fd (caller should fall back to a
+/// dense copy).
 pub fn write_region_sparse(
     src: &File,
     src_offset: u64,
     dst: &File,
     dst_offset: u64,
     len: u64,
+    zero_pages: SnapshotZeroPages,
 ) -> io::Result<bool> {
     let src_fd = src.as_fd();
     let end = src_offset
@@ -98,19 +109,10 @@ pub fn write_region_sparse(
                     "read_at returned 0 inside data extent",
                 ));
             }
-            let mut wrote_total = 0;
-            while wrote_total < read {
-                let n = dst.write_at(
-                    &slice[wrote_total..read],
-                    dst_offset + in_region + written + wrote_total as u64,
-                )?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write_at returned 0",
-                    ));
-                }
-                wrote_total += n;
+            let chunk_offset = dst_offset + in_region + written;
+            match zero_pages {
+                SnapshotZeroPages::Write => dst.write_all_at(&slice[..read], chunk_offset)?,
+                SnapshotZeroPages::Skip => write_nonzero_pages(dst, &slice[..read], chunk_offset)?,
             }
             written += read as u64;
         }
@@ -119,6 +121,35 @@ pub fn write_region_sparse(
         next = next_data_extent(src_fd, data_off + ext_len, end)?;
     }
     Ok(true)
+}
+
+/// Write `data` to `dst` at `offset`, leaving out every [`ZERO_PAGE_SIZE`] page
+/// of it that is all zero, and writing each run of other pages in one call.
+/// The pages are those of `dst`, aligned to `ZERO_PAGE_SIZE` in the file, so a
+/// page left out can become a hole; a page that `data` covers only in part,
+/// at either end, is judged by the part it covers.
+fn write_nonzero_pages(dst: &File, data: &[u8], offset: u64) -> io::Result<()> {
+    let page_size = ZERO_PAGE_SIZE as u64;
+    let mut run_start: Option<usize> = None;
+    let mut start = 0;
+    while start < data.len() {
+        let page_end = ((offset + start as u64) / page_size + 1) * page_size;
+        let end = data.len().min((page_end - offset) as usize);
+        let zero = data[start..end].iter().all(|&byte| byte == 0);
+        match (zero, run_start) {
+            (false, None) => run_start = Some(start),
+            (true, Some(run)) => {
+                dst.write_all_at(&data[run..start], offset + run as u64)?;
+                run_start = None;
+            }
+            _ => {}
+        }
+        start = end;
+    }
+    if let Some(run) = run_start {
+        dst.write_all_at(&data[run..], offset + run as u64)?;
+    }
+    Ok(())
 }
 
 /// Copy `[src_offset, src_offset+len)` of `src` to `dst` at `dst_offset`,
@@ -133,7 +164,14 @@ pub fn copy_region(
     dst_offset: u64,
     len: u64,
 ) -> io::Result<()> {
-    if write_region_sparse(src, src_offset, dst, dst_offset, len)? {
+    if write_region_sparse(
+        src,
+        src_offset,
+        dst,
+        dst_offset,
+        len,
+        SnapshotZeroPages::Write,
+    )? {
         return Ok(());
     }
     // Dense fallback: source filesystem lacks SEEK_HOLE (e.g. hugetlbfs).
@@ -159,6 +197,7 @@ mod tests {
     use vm_allocator::page_size::get_page_size;
 
     use super::{next_data_extent, write_region_sparse};
+    use crate::config::SnapshotZeroPages;
 
     fn make_memfd(size: u64) -> fs::File {
         // SAFETY: memfd_create is a self-contained syscall; we own the
@@ -306,7 +345,8 @@ mod tests {
         dst.write_all_at(&vec![0xFE; (page_size * 16) as usize], 0)
             .unwrap();
 
-        let used = write_region_sparse(&src, 0, &dst, 0, page_size * 16).unwrap();
+        let used = write_region_sparse(&src, 0, &dst, 0, page_size * 16, SnapshotZeroPages::Write)
+            .unwrap();
         assert!(used);
 
         let buf = fs::read(tmp.path()).unwrap();
@@ -330,8 +370,17 @@ mod tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 32, &[]);
 
-        let _ = write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
-        let _ = write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+        let _ =
+            write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, SnapshotZeroPages::Write).unwrap();
+        let _ = write_region_sparse(
+            &src_b,
+            0,
+            &dst,
+            4096 * 16,
+            4096 * 16,
+            SnapshotZeroPages::Write,
+        )
+        .unwrap();
 
         let buf = fs::read(tmp.path()).unwrap();
         assert!(buf[..4096].iter().all(|&b| b == 0));
@@ -351,7 +400,15 @@ mod tests {
         let dst = tmp.reopen().unwrap();
         sparse_layout(&dst, 4096 * 16, &[]);
 
-        let used = write_region_sparse(&src, 4096 * 16, &dst, 0, 4096 * 16).unwrap();
+        let used = write_region_sparse(
+            &src,
+            4096 * 16,
+            &dst,
+            0,
+            4096 * 16,
+            SnapshotZeroPages::Write,
+        )
+        .unwrap();
         assert!(used);
 
         let buf = fs::read(tmp.path()).unwrap();
@@ -377,8 +434,16 @@ mod tests {
         let total = 4096u64 * 32;
         sparse_layout(&dst, total, &[]);
 
-        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16).unwrap();
-        write_region_sparse(&src_b, 0, &dst, 4096 * 16, 4096 * 16).unwrap();
+        write_region_sparse(&src_a, 0, &dst, 0, 4096 * 16, SnapshotZeroPages::Write).unwrap();
+        write_region_sparse(
+            &src_b,
+            0,
+            &dst,
+            4096 * 16,
+            4096 * 16,
+            SnapshotZeroPages::Write,
+        )
+        .unwrap();
 
         // Read back using next_data_extent + read_at, mirroring
         // fill_saved_regions's sparse restore path.
@@ -413,5 +478,108 @@ mod tests {
         assert!(restored[4096 * 5..4096 * 26].iter().all(|&b| b == 0));
         assert!(restored[4096 * 26..4096 * 30].iter().all(|&b| b == 0xBB));
         assert!(restored[4096 * 30..].iter().all(|&b| b == 0));
+    }
+
+    /// A source extent of mixed pages: data, zeros, data, three zero pages,
+    /// and data that has a single nonzero byte at its end, so the scan has
+    /// to look at a whole page before calling it zero.
+    fn mixed_extent() -> Vec<u8> {
+        let mut src = vec![0u8; 4096 * 7];
+        src[..4096].fill(0x11);
+        src[4096 * 2..4096 * 3].fill(0x22);
+        src[4096 * 7 - 1] = 0x33;
+        src
+    }
+
+    #[test]
+    fn skipped_zero_pages_are_never_written() {
+        let data = mixed_extent();
+        let src = make_memfd(0);
+        src.set_len(data.len() as u64).unwrap();
+        src.write_all_at(&data, 0).unwrap();
+
+        // A sentinel in dst shows which pages were written: a skipped zero
+        // page keeps the sentinel, a written one does not.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        dst.write_all_at(&vec![0xFE; data.len()], 0).unwrap();
+
+        assert!(
+            write_region_sparse(&src, 0, &dst, 0, data.len() as u64, SnapshotZeroPages::Skip)
+                .unwrap()
+        );
+
+        let out = fs::read(tmp.path()).unwrap();
+        for (page, (written, source)) in out.chunks(4096).zip(data.chunks(4096)).enumerate() {
+            if source.iter().all(|&b| b == 0) {
+                assert!(
+                    written.iter().all(|&b| b == 0xFE),
+                    "zero page {page} was written"
+                );
+            } else {
+                assert_eq!(written, source, "page {page} differs from the source");
+            }
+        }
+    }
+
+    #[test]
+    fn skipping_zero_pages_restores_the_same_bytes() {
+        let data = mixed_extent();
+        let src = make_memfd(0);
+        src.set_len(data.len() as u64 * 2).unwrap();
+        src.write_all_at(&data, 4096).unwrap();
+
+        let mut images = Vec::new();
+        for zero_pages in [SnapshotZeroPages::Write, SnapshotZeroPages::Skip] {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let dst = tmp.reopen().unwrap();
+            dst.set_len(data.len() as u64 * 2).unwrap();
+            assert!(
+                write_region_sparse(&src, 0, &dst, 0, data.len() as u64 * 2, zero_pages).unwrap()
+            );
+            images.push(fs::read(tmp.path()).unwrap());
+        }
+
+        let mut expected = vec![0u8; data.len() * 2];
+        expected[4096..4096 + data.len()].copy_from_slice(&data);
+        assert_eq!(images[0], expected);
+        assert_eq!(images[1], expected);
+    }
+
+    #[test]
+    fn a_short_final_page_is_judged_whole() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        dst.write_all_at(&vec![0xFE; 4096 + 100], 0).unwrap();
+        let mut data = vec![0u8; 4096 + 100];
+        data[4096 + 99] = 0x44;
+
+        super::write_nonzero_pages(&dst, &data, 0).unwrap();
+
+        let out = fs::read(tmp.path()).unwrap();
+        assert!(out[..4096].iter().all(|&b| b == 0xFE));
+        assert_eq!(&out[4096..], &data[4096..]);
+    }
+
+    #[test]
+    fn pages_follow_the_file_not_the_buffer() {
+        // The buffer starts 100 bytes before a file page boundary, and its
+        // only nonzero byte is the first one of the next file page. Pages
+        // counted from the buffer would write the first 4096 bytes; pages of
+        // the file write only the page holding the nonzero byte.
+        let offset = 4096 - 100;
+        let mut data = vec![0u8; 100 + 4096 * 2];
+        data[100] = 0x55;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let dst = tmp.reopen().unwrap();
+        dst.write_all_at(&vec![0xFE; 4096 * 4], 0).unwrap();
+
+        super::write_nonzero_pages(&dst, &data, offset as u64).unwrap();
+
+        let out = fs::read(tmp.path()).unwrap();
+        assert!(out[..4096].iter().all(|&b| b == 0xFE));
+        assert_eq!(&out[4096..4096 * 2], &data[100..100 + 4096]);
+        assert!(out[4096 * 2..].iter().all(|&b| b == 0xFE));
     }
 }
