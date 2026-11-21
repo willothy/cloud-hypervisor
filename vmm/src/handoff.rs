@@ -685,7 +685,12 @@ fn receive_message(
         let mut read = 0;
         while read < buf.len() {
             if let Some(deadline) = deadline {
-                let left = deadline.saturating_duration_since(Instant::now());
+                // Whole milliseconds, rounded up: the wait never ends
+                // before the deadline.
+                let left = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_nanos()
+                    .div_ceil(1_000_000);
                 let mut fd = libc::pollfd {
                     fd: stream.as_raw_fd(),
                     events: libc::POLLIN,
@@ -693,13 +698,8 @@ fn receive_message(
                 };
                 // SAFETY: polling one initialized pollfd whose descriptor
                 // stays open for the duration of the call.
-                let ready = unsafe {
-                    libc::poll(
-                        &mut fd,
-                        1,
-                        i32::try_from(left.as_millis()).unwrap_or(i32::MAX),
-                    )
-                };
+                let ready =
+                    unsafe { libc::poll(&mut fd, 1, i32::try_from(left).unwrap_or(i32::MAX)) };
                 if ready < 0 {
                     let error = io::Error::last_os_error();
                     if error.kind() == io::ErrorKind::Interrupted {
