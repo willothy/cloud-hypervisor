@@ -1689,12 +1689,15 @@ impl MemoryManager {
         }
         out.set_len(out_offset)
             .map_err(|e| MigratableError::MigrateSend(anyhow!("sizing capture file: {e}")))?;
-        session
-            .send_capture(ranges, &out)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
+        // The connection is duplicated before the capture is sent, so a
+        // capture that was sent can always be waited for: its answer left on
+        // the connection would be read as the answer to the next exchange.
         let stream = session
             .try_clone_stream()
             .map_err(|e| MigratableError::MigrateSend(anyhow!("cloning the session: {e}")))?;
+        session
+            .send_capture(ranges, &out)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
         Self::wait_session_capture(&stream)?;
         Ok(dirty)
     }
@@ -1972,12 +1975,14 @@ impl MemoryManager {
         let session = self.fault_session.as_ref().ok_or_else(|| {
             MigratableError::MigrateSend(anyhow!("no fault handler to run the capture"))
         })?;
-        session
-            .send_capture(ranges, &out)
-            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
+        // Duplicated before the capture is sent, so that a capture that was
+        // sent always has a connection to be waited for on.
         let stream = session
             .try_clone_stream()
             .map_err(|e| MigratableError::MigrateSend(anyhow!("cloning the session: {e}")))?;
+        session
+            .send_capture(ranges, &out)
+            .map_err(|e| MigratableError::MigrateSend(anyhow!("sending the capture: {e}")))?;
         Ok(Some(stream))
     }
 
