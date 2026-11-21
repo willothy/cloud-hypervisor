@@ -3202,15 +3202,19 @@ impl Vm {
         // Resume immediately, unless the caller keeps the VM stopped; the
         // fault handler (whose capture message is already buffered on its
         // connection) copies the write-protected pages out either way.
-        if !leave_paused {
-            self.resume()?;
-        }
+        let resumed = if leave_paused { Ok(()) } else { self.resume() };
 
-        match done {
+        // A capture that was sent is waited for whatever became of the
+        // resume: the fault handler answers it either way, and an answer
+        // left on the connection would be read as the answer to the next
+        // capture or settle.
+        let captured = match done {
             Some(stream) => MemoryManager::wait_session_capture(&stream),
             // Nothing was dirty; there is no capture to wait for.
             None => Ok(()),
-        }
+        };
+        resumed?;
+        captured
     }
 
     /// The paused phase of [`Self::live_checkpoint`]: snapshot config and
