@@ -2829,16 +2829,11 @@ impl DeviceManager {
         &self,
         id: &str,
     ) -> DeviceManagerResult<Option<vhost_user::BackendFaults>> {
-        let handler = self
-            .memory_manager
+        self.memory_manager
             .lock()
             .unwrap()
-            .backend_fault_handler()
-            .map_err(DeviceManagerError::MemoryManager)?;
-        Ok(handler.map(|handler| vhost_user::BackendFaults {
-            device: id.to_owned(),
-            handler,
-        }))
+            .backend_faults(id)
+            .map_err(DeviceManagerError::MemoryManager)
     }
 
     /// Creates a [`MetaVirtioDevice`] from the provided [`DiskConfig`].

@@ -33,7 +33,7 @@ use thiserror::Error;
 use tracer::trace_scoped;
 use virtio_devices::BlocksState;
 use virtio_devices::mem::Error as VirtioMemError;
-use virtio_devices::vhost_user::BackendFaultHandler;
+use virtio_devices::vhost_user::BackendFaults;
 #[cfg(target_arch = "x86_64")]
 use vm_allocator::GsiApic;
 use vm_allocator::page_size::get_page_size;
@@ -421,13 +421,6 @@ pub enum Error {
     /// guest RAM is demand-paged.
     #[error("ACPI memory hot-plug is not supported while guest RAM is demand-paged")]
     HotplugWhileDemandPaged,
-
-    /// Forbidden operation. ACPI memory hot-plug is not supported while a
-    /// vhost-user device connected during demand paging remains.
-    #[error(
-        "ACPI memory hot-plug is not supported while a vhost-user device connected during demand paging remains"
-    )]
-    HotplugWhileBackendsRelayed,
 
     /// Forbidden operation. Guest RAM demand-paged by the in-process
     /// handler has no fault session to settle.
@@ -1226,16 +1219,16 @@ impl MemoryManager {
         Ok(())
     }
 
-    /// The fault handler vhost-user devices hand their backends'
-    /// userfaultfds to: `Some` while guest RAM is demand-paged through a
-    /// fault session, so every backend mapping guest RAM faults through the
-    /// handler as this process does.
-    pub fn backend_fault_handler(&self) -> Result<Option<Arc<dyn BackendFaultHandler>>, Error> {
+    /// How the backend of vhost-user device `device` serves faults:
+    /// through the fault handler, which it hands its userfaultfds to, while
+    /// guest RAM is demand-paged through a fault session, so every backend
+    /// mapping guest RAM faults through the handler as this process does.
+    /// `None` otherwise.
+    pub fn backend_faults(&self, device: &str) -> Result<Option<BackendFaults>, Error> {
         let Some(session) = &self.fault_session else {
             return Ok(None);
         };
-        let relay = session.backend_fault_relay().map_err(Error::FaultSession)?;
-        Ok(relay.map(|relay| Arc::new(relay) as Arc<dyn BackendFaultHandler>))
+        session.backend_faults(device).map_err(Error::FaultSession)
     }
 
     /// Ask the fault handler to end demand paging, which it does once it has
@@ -3705,16 +3698,6 @@ impl MemoryManager {
                     {
                         return Err(Error::HotplugWhileDemandPaged);
                     }
-                    // A vhost-user device connected while guest RAM was
-                    // demand-paged keeps its backend on the postcopy flow
-                    // after a settle, and refuses the region the same way.
-                    if self
-                        .fault_session
-                        .as_ref()
-                        .is_some_and(FaultSession::relays_backends)
-                    {
-                        return Err(Error::HotplugWhileBackendsRelayed);
-                    }
 
                     region =
                         Some(self.hotplug_ram_region((desired_ram - self.current_ram) as usize)?);
@@ -4864,9 +4847,9 @@ mod tests {
     }
 
     /// Once the fault handler has settled guest RAM it is no longer
-    /// demand-paged, and an ACPI memory hot-plug goes through, but only once
-    /// no vhost-user device connected during demand paging remains: its
-    /// backend stays on the postcopy flow and would refuse the region.
+    /// demand-paged, and an ACPI memory hot-plug goes through, a vhost-user
+    /// device connected during demand paging included: the settle ends its
+    /// backend's postcopy flow, and the device takes the region.
     #[test]
     fn acpi_hotplug_follows_a_settle() {
         use std::os::unix::net::{UnixListener, UnixStream};
@@ -4917,22 +4900,15 @@ mod tests {
         let mut mm = mm.lock().unwrap();
         mm.fault_session = Some(session);
         mm.demand_paged = true;
-        let relay = mm.backend_fault_handler().unwrap();
-        assert!(relay.is_some());
+        let faults = mm.backend_faults("_disk0").unwrap().unwrap();
         let regions = mm.guest_memory().memory().num_regions();
 
         handoff::test_support::queue_settled(&handler);
         assert!(mm.settle().unwrap());
         assert!(!mm.demand_paged);
-        assert!(mm.backend_fault_handler().unwrap().is_none());
+        assert!(faults.paging.settled());
+        assert!(mm.backend_faults("_disk1").unwrap().is_none());
 
-        assert!(matches!(
-            mm.resize(256 * MIB),
-            Err(Error::HotplugWhileBackendsRelayed)
-        ));
-        assert_eq!(mm.guest_memory().memory().num_regions(), regions);
-
-        drop(relay);
         assert!(mm.resize(256 * MIB).unwrap().is_some());
         assert_eq!(mm.guest_memory().memory().num_regions(), regions + 1);
         assert_eq!(mm.current_ram, 256 * MIB);

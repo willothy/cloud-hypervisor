@@ -52,7 +52,9 @@ use std::{io, process};
 
 use log::error;
 use serde::{Deserialize, Serialize};
-use virtio_devices::vhost_user::{BackendFaultHandler, BackendMapping};
+use virtio_devices::vhost_user::{
+    BackendFaultHandler, BackendFaults, BackendMapping, DemandPaging, SettleError,
+};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
@@ -105,7 +107,8 @@ const MAX_CAPTURE_BODY_LEN: usize = 1 << 30;
 /// every other request for long.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The reason the VMM records when it exits because its fault session is gone.
+/// The reason the VMM records when it exits because its fault session is
+/// gone, or because a vhost-user backend did not leave it at the settle.
 /// Its manager settles a VMM that recorded this as failed, rather than as one
 /// that crashed and is restored from its latest checkpoint.
 const SESSION_LOST: &str = "session-lost";
@@ -246,9 +249,11 @@ pub(crate) struct FaultSession {
     /// here, and backend handoffs from the [`BackendFaultRelay`]s of
     /// vhost-user devices, which can connect at any time.
     write: Arc<Mutex<()>>,
-    /// Held by every [`BackendFaultRelay`] this session handed out, so the
-    /// session can tell whether a vhost-user device still holds one.
-    relays: Arc<()>,
+    /// Whether guest RAM is still demand-paged, as the vhost-user devices
+    /// handed a relay see it: settled by [`Self::settle`], with no memory
+    /// table in flight. A write-protect-only session hands out no relay, so
+    /// no device reads it.
+    paging: Arc<DemandPaging>,
     /// Where the VMM records why it exits, for a session lost over a
     /// failed exchange.
     exit_reason: Option<PathBuf>,
@@ -282,7 +287,7 @@ impl FaultSession {
             uffd,
             mode,
             write: Arc::new(Mutex::new(())),
-            relays: Arc::new(()),
+            paging: Arc::new(DemandPaging::default()),
             exit_reason: exit_reason.map(Path::to_path_buf),
         })
     }
@@ -293,27 +298,23 @@ impl FaultSession {
         self.mode == RegistrationMode::MissingAndWriteProtect
     }
 
-    /// The relay vhost-user devices hand their backends' userfaultfds to,
-    /// when guest RAM is demand-paged through this session; `None` for a
-    /// write-protect-only session, whose guest RAM has nothing to serve, a
-    /// settled one included.
-    pub(crate) fn backend_fault_relay(&self) -> io::Result<Option<BackendFaultRelay>> {
+    /// How the backend of vhost-user device `device` serves faults, when
+    /// guest RAM is demand-paged through this session: through a relay of
+    /// its userfaultfds to the fault handler, until the settle ends the
+    /// postcopy flow. `None` for a write-protect-only session, whose guest
+    /// RAM has nothing to serve, a settled one included.
+    pub(crate) fn backend_faults(&self, device: &str) -> io::Result<Option<BackendFaults>> {
         if !self.demand_paged() {
             return Ok(None);
         }
-        Ok(Some(BackendFaultRelay {
-            stream: self.stream.try_clone()?,
-            write: Arc::clone(&self.write),
-            _session: Arc::clone(&self.relays),
+        Ok(Some(BackendFaults {
+            device: device.to_owned(),
+            handler: Arc::new(BackendFaultRelay {
+                stream: self.stream.try_clone()?,
+                write: Arc::clone(&self.write),
+            }),
+            paging: Arc::clone(&self.paging),
         }))
-    }
-
-    /// Whether a vhost-user device still holds a relay this session handed
-    /// out while guest RAM was demand-paged. Such a device keeps its
-    /// backend on the postcopy flow for its whole life, settled or not, and
-    /// a backend on that flow takes no added memory region.
-    pub(crate) fn relays_backends(&self) -> bool {
-        Arc::strong_count(&self.relays) > 1
     }
 
     /// Ask the fault handler whether it has served the whole memory image,
@@ -331,31 +332,56 @@ impl FaultSession {
     /// flight while the handler changes the registration, and no
     /// capture-done message can be taken for the verdict.
     ///
+    /// The exchange runs with no vhost-user memory table in flight (see
+    /// [`DemandPaging`]): no backend maps guest RAM afresh while the handler
+    /// takes the backends' mappings off their userfaultfds. A settled
+    /// verdict then ends the postcopy flow on every backend connection on
+    /// it before the settle is recorded, so no backend is registered for
+    /// missing faults once this returns `true`, and each table sent after is
+    /// a plain one.
+    ///
     /// A handler that refuses the settle fails this call, and nothing has
     /// changed. An exchange that fails any other way is the loss of the
     /// session (see [`Self::exchange_settle`]): the VMM records that and
     /// exits, as it does when the handler hangs up, which is also how a
-    /// handler that does not know the settle message answers one.
+    /// handler that does not know the settle message answers one. So is a
+    /// backend that does not end its postcopy flow once the handler has
+    /// settled: it may still be registered for missing faults on guest RAM
+    /// the handler no longer serves, and a device left to it could lose its
+    /// disk with the guest none the wiser.
     pub(crate) fn settle(&mut self) -> io::Result<bool> {
         if !self.demand_paged() {
             return Ok(true);
         }
-        match self.exchange_settle(SETTLE_DEADLINE) {
-            Ok(SettleVerdict::Settled) => {
-                self.mode = RegistrationMode::WriteProtectOnly;
-                Ok(true)
+        let settled = Arc::clone(&self.paging).settle(|| {
+            match self.exchange_settle(SETTLE_DEADLINE) {
+                Ok(SettleVerdict::Settled) => Ok(true),
+                Ok(SettleVerdict::NotYet) => Ok(false),
+                Ok(SettleVerdict::Refused { error }) => Err(io::Error::other(format!(
+                    "the fault handler refused to settle guest RAM: {error}"
+                ))),
+                Err(error) => {
+                    error!(
+                        "the settle exchange with the fault handler failed, and the VM's fault session with it: {error}"
+                    );
+                    HangupWatch::exit(self.exit_reason.as_deref())
+                }
             }
-            Ok(SettleVerdict::NotYet) => Ok(false),
-            Ok(SettleVerdict::Refused { error }) => Err(io::Error::other(format!(
-                "the fault handler refused to settle guest RAM: {error}"
-            ))),
-            Err(error) => {
+        });
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(SettleError::Exchange(error)) => return Err(error),
+            Err(SettleError::EndRefused { connection, error }) => {
                 error!(
-                    "the settle exchange with the fault handler failed, and the VM's fault session with it: {error}"
+                    "the backend of vhost-user connection {connection} did not end its postcopy flow once guest RAM settled, and may still wait on faults nothing serves: {error:?}"
                 );
                 HangupWatch::exit(self.exit_reason.as_deref())
             }
+        };
+        if settled {
+            self.mode = RegistrationMode::WriteProtectOnly;
         }
+        Ok(settled)
     }
 
     /// Send a settle and read the handler's verdict, which has `deadline`
@@ -440,8 +466,6 @@ impl FaultSession {
 pub(crate) struct BackendFaultRelay {
     stream: UnixStream,
     write: Arc<Mutex<()>>,
-    /// Marks the relay as held, for [`FaultSession::relays_backends`].
-    _session: Arc<()>,
 }
 
 impl BackendFaultHandler for BackendFaultRelay {
@@ -832,15 +856,17 @@ mod tests {
     #[test]
     fn a_settled_verdict_ends_demand_paging() {
         let (handler, mut session) = demand_paged_session();
+        let faults = session.backend_faults("_disk0").unwrap().unwrap();
         queue_verdict(&handler, &SettleVerdict::Settled);
 
         assert!(session.settle().unwrap());
+        assert!(faults.paging.settled());
 
         let settle: Settle =
             serde_json::from_slice(&receive_message(&handler, MSG_SETTLE, None).unwrap()).unwrap();
         assert_eq!(settle.version, SETTLE_VERSION);
         assert!(!session.demand_paged());
-        assert!(session.backend_fault_relay().unwrap().is_none());
+        assert!(session.backend_faults("_disk1").unwrap().is_none());
 
         assert!(session.settle().unwrap());
         assert!(!message_waits(&handler));
@@ -851,12 +877,14 @@ mod tests {
     #[test]
     fn a_not_yet_verdict_changes_nothing() {
         let (handler, mut session) = demand_paged_session();
+        let faults = session.backend_faults("_disk0").unwrap().unwrap();
         queue_verdict(&handler, &SettleVerdict::NotYet);
 
         assert!(!session.settle().unwrap());
 
         assert!(session.demand_paged());
-        assert!(session.backend_fault_relay().unwrap().is_some());
+        assert!(!faults.paging.settled());
+        assert!(session.backend_faults("_disk1").unwrap().is_some());
     }
 
     /// A handler that refuses the settle, as one speaking another version of
@@ -946,18 +974,5 @@ mod tests {
         let error = session.exchange_settle(A_MOMENT).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
-    }
-
-    /// The session knows whether a relay it handed out is still held.
-    #[test]
-    fn a_held_relay_is_counted() {
-        let (_handler, session) = demand_paged_session();
-        assert!(!session.relays_backends());
-
-        let relay = session.backend_fault_relay().unwrap().unwrap();
-        assert!(session.relays_backends());
-
-        drop(relay);
-        assert!(!session.relays_backends());
     }
 }
