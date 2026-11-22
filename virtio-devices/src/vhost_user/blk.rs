@@ -378,6 +378,10 @@ impl VirtioDevice for Blk {
     ) -> result::Result<(), crate::Error> {
         self.vu_common.add_memory_region(region)
     }
+
+    fn end_postcopy(&mut self) -> result::Result<(), crate::Error> {
+        self.vu_common.end_postcopy()
+    }
 }
 
 impl Pausable for Blk {

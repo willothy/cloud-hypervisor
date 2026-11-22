@@ -382,6 +382,10 @@ impl VirtioDevice for GenericVhostUser {
         self.vu_common.add_memory_region(region)
     }
 
+    fn end_postcopy(&mut self) -> result::Result<(), crate::Error> {
+        self.vu_common.end_postcopy()
+    }
+
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
         let mut mappings = Vec::new();
         if let Some(cache) = self.cache.as_ref() {

@@ -2829,16 +2829,11 @@ impl DeviceManager {
         &self,
         id: &str,
     ) -> DeviceManagerResult<Option<vhost_user::BackendFaults>> {
-        let handler = self
-            .memory_manager
+        self.memory_manager
             .lock()
             .unwrap()
-            .backend_fault_handler()
-            .map_err(DeviceManagerError::MemoryManager)?;
-        Ok(handler.map(|handler| vhost_user::BackendFaults {
-            device: id.to_owned(),
-            handler,
-        }))
+            .backend_faults(id)
+            .map_err(DeviceManagerError::MemoryManager)
     }
 
     /// Creates a [`MetaVirtioDevice`] from the provided [`DiskConfig`].
@@ -5320,6 +5315,19 @@ impl DeviceManager {
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     pub fn cmdline_additions(&self) -> &[String] {
         self.cmdline_additions.as_slice()
+    }
+
+    /// End the vhost-user postcopy flow on every device's backend
+    /// connection, once guest RAM has settled. A connection that fails to
+    /// end it is shut down by its device, which then reconnects plain, so a
+    /// failure is logged here rather than failing the settle, which the
+    /// fault handler has already made.
+    pub fn end_postcopy(&self) {
+        for handle in self.virtio_devices.iter() {
+            if let Err(e) = handle.virtio_device.lock().unwrap().end_postcopy() {
+                error!("Failed ending the postcopy flow of a vhost-user device: {e:?}");
+            }
+        }
     }
 
     pub fn update_memory(&self, new_region: &Arc<GuestRegionMmap>) -> DeviceManagerResult<()> {

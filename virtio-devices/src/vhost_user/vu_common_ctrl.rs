@@ -75,10 +75,10 @@ pub struct VhostUserHandle {
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<u16>,
     vring_bases: Option<Vec<u64>>,
-    /// Set while guest RAM is demand-paged: the backend must negotiate
-    /// `PAGEFAULT`, and every memory table it maps is registered with its
-    /// postcopy userfaultfd and handed to the fault handler before it can
-    /// touch guest RAM.
+    /// Set on a device created while guest RAM is demand-paged. Until it
+    /// settles, the backend must negotiate `PAGEFAULT`, and every memory
+    /// table it maps is registered with its postcopy userfaultfd and handed
+    /// to the fault handler before it can touch guest RAM.
     faults: Option<BackendFaults>,
     /// Whether the backend negotiated `PAGEFAULT`.
     serves_faults: bool,
@@ -113,7 +113,13 @@ impl VhostUserHandle {
         }
 
         if let Some(faults) = self.faults.clone() {
-            return self.set_mem_table_postcopy(&faults, &regions);
+            let settled = faults.paging.hold();
+            if !*settled {
+                return self.set_mem_table_postcopy(&faults, &regions);
+            }
+            drop(settled);
+            // A plain table must not reach a backend still listening.
+            self.end_postcopy()?;
         }
 
         self.vu
@@ -209,7 +215,55 @@ impl VhostUserHandle {
         }
     }
 
+    /// End the postcopy flow on this connection once guest RAM has settled:
+    /// the backend stops registering the memory it maps with its
+    /// userfaultfd, drops that userfaultfd, and takes plain memory tables
+    /// from then on. A no-op on a connection not on the flow, and while guest
+    /// RAM is still demand-paged. A backend that refuses the end may still be
+    /// listening, and would answer a plain table the postcopy way, so its
+    /// connection is shut down, for the device to reconnect plain.
+    pub fn end_postcopy(&mut self) -> Result<()> {
+        if self
+            .faults
+            .as_ref()
+            .is_none_or(|faults| !faults.paging.settled())
+        {
+            return Ok(());
+        }
+        if self.postcopy_connection.take().is_none() {
+            return Ok(());
+        }
+        let Err(e) = self.vu.postcopy_end() else {
+            return Ok(());
+        };
+        let e = Error::VhostUserPostcopyEnd(e);
+        if !e.is_transport_lost() {
+            // SAFETY: shutting down the connection's own socket, which stays
+            // open until the handle is dropped.
+            let shut = unsafe { libc::shutdown(self.vu.as_raw_fd(), libc::SHUT_RDWR) };
+            if shut != 0 {
+                error!(
+                    "Failed shutting down a vhost-user connection still on the postcopy flow: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        Err(e)
+    }
+
+    /// Whether this connection's backend faults through the fault handler:
+    /// on a device created while guest RAM was demand-paged, until it
+    /// settles.
+    fn demand_paged(&self) -> bool {
+        self.faults
+            .as_ref()
+            .is_some_and(|faults| !faults.paging.settled())
+    }
+
     pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {
+        // The device refuses a region while guest RAM is demand-paged; once
+        // it has settled, a backend still listening must not get one.
+        self.end_postcopy()?;
         let (mmap_handle, mmap_offset) = match region.file_offset() {
             Some(file_offset) => (file_offset.file().as_raw_fd(), file_offset.start()),
             None => return Err(Error::MissingRegionFd),
@@ -234,7 +288,10 @@ impl VhostUserHandle {
         avail_protocol_features: VhostUserProtocolFeatures,
     ) -> Result<(u64, u64)> {
         let acked_features = avail_features & self.backend_features;
-        let avail_protocol_features = if self.faults.is_some() {
+        // Read once, so a settle meanwhile cannot change what is required
+        // of the backend from what it was offered.
+        let demand_paged = self.demand_paged();
+        let avail_protocol_features = if demand_paged {
             avail_protocol_features | VhostUserProtocolFeatures::PAGEFAULT
         } else {
             avail_protocol_features
@@ -265,7 +322,7 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features.bits());
-        if self.faults.is_some() && !self.serves_faults {
+        if demand_paged && !self.serves_faults {
             return Err(Error::BackendServesNoFaults);
         }
 
@@ -460,6 +517,7 @@ impl VhostUserHandle {
         // demand-paged now, never from what was saved: a device hot-plugged
         // while guest RAM was demand-paged by an earlier build saved it.
         acked_protocol_features &= !VhostUserProtocolFeatures::PAGEFAULT.bits();
+        let demand_paged = self.demand_paged();
         if acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits() != 0 {
             let backend_protocol_features = self
                 .vu
@@ -471,7 +529,7 @@ impl VhostUserHandle {
             }
             // A demand-paged restore needs PAGEFAULT of every backend that
             // offers it, and refuses the rest below.
-            if self.faults.is_some() {
+            if demand_paged {
                 acked_protocol_features |=
                     (backend_protocol_features & VhostUserProtocolFeatures::PAGEFAULT).bits();
                 if acked_protocol_features & VhostUserProtocolFeatures::PAGEFAULT.bits() == 0 {
@@ -492,7 +550,7 @@ impl VhostUserHandle {
         }
 
         self.update_supported_protocol_features(acked_protocol_features);
-        if self.faults.is_some() && !self.serves_faults {
+        if demand_paged && !self.serves_faults {
             return Err(Error::BackendServesNoFaults);
         }
 
@@ -1032,5 +1090,195 @@ fn memfd_create(name: &ffi::CStr, flags: u32) -> io::Result<RawFd> {
         Err(io::Error::last_os_error())
     } else {
         Ok(res as RawFd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::BorrowedFd;
+    use std::thread;
+
+    use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag};
+    use vmm_sys_util::tempdir::TempDir;
+
+    use super::*;
+    use crate::GuestMemoryMmap;
+    use crate::vhost_user::{BackendFaultHandler, DemandPaging};
+
+    /// A fault handler for tests whose backends never get a postcopy table.
+    struct Unused;
+
+    impl BackendFaultHandler for Unused {
+        fn adopt(
+            &self,
+            _: &str,
+            _: u64,
+            _: &[BackendMapping],
+            _: Option<BorrowedFd<'_>>,
+        ) -> io::Result<()> {
+            Err(io::Error::other("no postcopy table is sent"))
+        }
+    }
+
+    /// Read one request from the frontend, check it is `expected`, and
+    /// return its payload.
+    fn read_request(stream: &mut UnixStream, expected: FrontendReq) -> Vec<u8> {
+        let mut header = [0u8; 12];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(header[0..4].try_into().unwrap()),
+            u32::from(expected)
+        );
+        let size = u32::from_ne_bytes(header[8..12].try_into().unwrap()) as usize;
+        let mut payload = vec![0; size];
+        stream.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    /// Reply to `request` with the 64-bit `value`: a feature set, or an
+    /// acknowledgement, zero for success.
+    fn reply(stream: &mut UnixStream, request: FrontendReq, value: u64) {
+        for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+            stream.write_all(&field.to_ne_bytes()).unwrap();
+        }
+        stream.write_all(&value.to_ne_bytes()).unwrap();
+    }
+
+    /// A backend's connection made while guest RAM is demand-paged: the
+    /// handshake that negotiates PAGEFAULT and REPLY_ACK, played by
+    /// `backend` on its end, which then goes on as the test needs. The
+    /// connection is marked as on the postcopy flow, as its first postcopy
+    /// table leaves it. Returns the frontend's handle, the demand paging it
+    /// shares, and the backend's thread.
+    fn postcopy_connection(
+        backend: impl FnOnce(UnixStream) + Send + 'static,
+    ) -> (
+        VhostUserHandle,
+        Arc<DemandPaging>,
+        thread::JoinHandle<()>,
+        TempDir,
+    ) {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let offered = (VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::REPLY_ACK
+            | VhostUserProtocolFeatures::PAGEFAULT)
+            .bits();
+        let dir = TempDir::new_with_prefix("/tmp/vhost-user-postcopy-end-").unwrap();
+        let socket = dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+            reply(&mut stream, FrontendReq::GET_FEATURES, protocol_features);
+            assert!(read_request(&mut stream, FrontendReq::GET_PROTOCOL_FEATURES).is_empty());
+            reply(&mut stream, FrontendReq::GET_PROTOCOL_FEATURES, offered);
+            assert_eq!(
+                read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                offered.to_ne_bytes()
+            );
+            backend(stream);
+        });
+
+        let paging = Arc::new(DemandPaging::default());
+        let faults = BackendFaults {
+            device: "_disk0".to_owned(),
+            handler: Arc::new(Unused),
+            paging: Arc::clone(&paging),
+        };
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut vu = VhostUserHandle::connect_vhost_user(
+            false,
+            socket.to_str().unwrap(),
+            1,
+            false,
+            &kill_evt,
+            Some(&faults),
+            |vu| {
+                vu.negotiate_features_vhost_user(
+                    protocol_features,
+                    VhostUserProtocolFeatures::MQ | VhostUserProtocolFeatures::REPLY_ACK,
+                )
+                .map(|_| ())
+            },
+        )
+        .unwrap();
+        vu.postcopy_connection = Some(1);
+        (vu, paging, backend, dir)
+    }
+
+    /// The settle ends the postcopy flow on a connection on it, once: not
+    /// while guest RAM is still demand-paged, and not again after.
+    #[test]
+    fn the_settle_ends_the_postcopy_flow_once() {
+        let (mut vu, paging, backend, _dir) = postcopy_connection(|mut stream| {
+            assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
+            reply(&mut stream, FrontendReq::POSTCOPY_END, 0);
+            assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        });
+
+        vu.end_postcopy().unwrap();
+        paging.settle(|| Ok::<_, ()>(true)).unwrap();
+        vu.end_postcopy().unwrap();
+        vu.end_postcopy().unwrap();
+
+        drop(vu);
+        backend.join().unwrap();
+    }
+
+    /// A backend that refuses to end the postcopy flow may still be
+    /// listening, so its connection is shut down.
+    #[test]
+    fn a_refused_end_shuts_the_connection_down() {
+        let (mut vu, paging, backend, _dir) = postcopy_connection(|mut stream| {
+            assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
+            reply(&mut stream, FrontendReq::POSTCOPY_END, 1);
+            assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        });
+
+        paging.settle(|| Ok::<_, ()>(true)).unwrap();
+        assert!(matches!(
+            vu.end_postcopy(),
+            Err(Error::VhostUserPostcopyEnd(_))
+        ));
+
+        // The backend sees the connection close while the handle lives on.
+        backend.join().unwrap();
+        drop(vu);
+    }
+
+    /// A memory table sent after the settle on a connection the settle has
+    /// not ended yet ends the flow first, and is a plain one.
+    #[test]
+    fn a_table_after_the_settle_ends_the_flow_first() {
+        let (mut vu, paging, backend, dir) = postcopy_connection(|mut stream| {
+            assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
+            reply(&mut stream, FrontendReq::POSTCOPY_END, 0);
+            assert_eq!(
+                read_request(&mut stream, FrontendReq::SET_MEM_TABLE).len(),
+                40
+            );
+            reply(&mut stream, FrontendReq::SET_MEM_TABLE, 0);
+            assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        });
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.as_path().join("memory"))
+            .unwrap();
+        file.set_len(0x1000).unwrap();
+        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            0x1000,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        paging.settle(|| Ok::<_, ()>(true)).unwrap();
+        vu.update_mem_table(&mem).unwrap();
+
+        drop(vu);
+        backend.join().unwrap();
     }
 }

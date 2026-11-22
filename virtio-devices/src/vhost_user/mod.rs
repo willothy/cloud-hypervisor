@@ -7,7 +7,7 @@ use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, RwLock, RwLockReadGuard};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -100,6 +100,8 @@ pub enum Error {
     VhostUserPostcopyListen(#[source] VhostError),
     #[error("Acknowledging the backend's postcopy memory table failed")]
     VhostUserPostcopyAck(#[source] VhostError),
+    #[error("Ending the backend's postcopy flow after guest RAM settled failed")]
+    VhostUserPostcopyEnd(#[source] VhostError),
     #[error("Handing the backend's userfaultfd to the fault handler failed")]
     AdoptBackendFaults(#[source] io::Error),
     #[error("Reading the page size of a guest memory region's backing failed")]
@@ -248,7 +250,8 @@ impl Error {
             | Error::VhostUserCheckDeviceState(e)
             | Error::VhostUserPostcopyAdvise(e)
             | Error::VhostUserPostcopyListen(e)
-            | Error::VhostUserPostcopyAck(e) => vhost_error_is_transport_lost(e),
+            | Error::VhostUserPostcopyAck(e)
+            | Error::VhostUserPostcopyEnd(e) => vhost_error_is_transport_lost(e),
             Error::FrontendReqHandlerCreation(e) => vhost_user_error_is_transport_lost(e),
             _ => false,
         }
@@ -295,14 +298,60 @@ pub trait BackendFaultHandler: Send + Sync {
 }
 
 /// A vhost-user device's backend faulting through a [`BackendFaultHandler`]:
-/// set while guest RAM is demand-paged, for the device's whole life, since
-/// every reconnect maps guest RAM afresh.
+/// set on a device created while guest RAM is demand-paged, for the
+/// device's whole life, since every reconnect maps guest RAM afresh. Its
+/// connections take the postcopy flow only until guest RAM settles.
 #[derive(Clone)]
 pub struct BackendFaults {
     /// The device id the handler names the backend by.
     pub device: String,
     /// The handler the backend's memory tables are handed to.
     pub handler: Arc<dyn BackendFaultHandler>,
+    /// Whether guest RAM is still demand-paged, shared with the settle.
+    pub paging: Arc<DemandPaging>,
+}
+
+/// Whether a VM's guest RAM is still demand-paged, as its vhost-user
+/// connections see it: shared by every device created while it is, and by
+/// the settle that ends demand paging, which flips it once and for good.
+///
+/// A memory table is sent with the lock held for reading: the postcopy way
+/// while guest RAM is demand-paged, the plain way once it has settled. The
+/// settle holds it for writing through its exchange with the fault handler,
+/// so no table is in flight while the handler takes the backends' mappings
+/// off their userfaultfds, and every table sent after takes the plain way.
+#[derive(Debug, Default)]
+pub struct DemandPaging {
+    /// Whether guest RAM has settled.
+    settled: RwLock<bool>,
+}
+
+impl DemandPaging {
+    /// Whether guest RAM has settled.
+    pub fn settled(&self) -> bool {
+        *self.settled.read().unwrap()
+    }
+
+    /// Settle guest RAM: run `exchange`, the settle exchange with the fault
+    /// handler, with no memory table in flight, and once it answers that
+    /// guest RAM is settled, record that for good. Returns whether guest RAM
+    /// is settled; once it is, without running `exchange` again.
+    pub fn settle<E>(
+        &self,
+        exchange: impl FnOnce() -> result::Result<bool, E>,
+    ) -> result::Result<bool, E> {
+        let mut settled = self.settled.write().unwrap();
+        if !*settled {
+            *settled = exchange()?;
+        }
+        Ok(*settled)
+    }
+
+    /// Hold off a settle while a memory table is sent. The guard reads
+    /// whether guest RAM has settled.
+    fn hold(&self) -> RwLockReadGuard<'_, bool> {
+        self.settled.read().unwrap()
+    }
 }
 
 pub const DEFAULT_VIRTIO_FEATURES: u64 = (1 << VIRTIO_F_RING_INDIRECT_DESC)
@@ -435,6 +484,17 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         let mut vu = self.vu.lock().unwrap();
         *vu = vhost_user;
 
+        // A connection made just before a settle took the postcopy flow, and
+        // the settle ended it on the connection this one replaced. A failure
+        // shuts the new connection down, for another reconnect to make it
+        // plain.
+        if let Err(e) = vu.end_postcopy() {
+            error!(
+                "Failed ending postcopy on the reconnected vhost-user backend for socket {}: {e:?}",
+                self.socket_path
+            );
+        }
+
         Ok(())
     }
 }
@@ -549,8 +609,8 @@ pub struct VhostUserCommon {
     saved_dirty_log: Option<MemoryRangeTable>,
     dirty_logging: bool,
     resume_evt: Option<EventFd>,
-    /// Set while guest RAM is demand-paged: the backend faults through the
-    /// handler, on every connection.
+    /// Set on a device created while guest RAM is demand-paged: until it
+    /// settles, the backend faults through the handler, on every connection.
     pub faults: Option<BackendFaults>,
 }
 
@@ -755,7 +815,11 @@ impl VhostUserCommon {
     ) -> result::Result<(), crate::Error> {
         // A backend listening for postcopy cannot take ADD_MEM_REG, and
         // nothing would serve its faults on the region anyway.
-        if self.faults.is_some() {
+        if self
+            .faults
+            .as_ref()
+            .is_some_and(|faults| !faults.paging.settled())
+        {
             return Err(self.memory_update_error(Error::MemoryHotplugWhileDemandPaged));
         }
 
@@ -783,6 +847,22 @@ impl VhostUserCommon {
             return Err(self.memory_update_error(e));
         }
         Ok(())
+    }
+
+    /// End the postcopy flow on the device's connection once guest RAM has
+    /// settled (see [`VhostUserHandle::end_postcopy`]). A device with no
+    /// connection has nothing to end: it connects plain when it reconnects.
+    pub fn end_postcopy(&mut self) -> result::Result<(), crate::Error> {
+        if self.disconnected.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let Some(vu) = &self.vu else {
+            return Ok(());
+        };
+        vu.lock()
+            .unwrap()
+            .end_postcopy()
+            .map_err(crate::Error::VhostUserPostcopyEnd)
     }
 
     pub fn pause(&mut self) -> result::Result<(), MigratableError> {
@@ -1213,6 +1293,7 @@ mod tests {
             let faults = BackendFaults {
                 device: "_disk0".to_owned(),
                 handler: Arc::new(Unused),
+                paging: Arc::new(DemandPaging::default()),
             };
             let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
             let result = VhostUserHandle::connect_vhost_user(
@@ -1240,16 +1321,20 @@ mod tests {
     /// and never kept in the protocol features a device saves: a negotiation
     /// that sent it returns the features without it, and a restore of saved
     /// features carrying it neither sends it nor requires it of a backend
-    /// when guest RAM is not demand-paged.
+    /// when guest RAM is not demand-paged, the backend of a device created
+    /// while it was, which reconnects after the settle, included.
     #[test]
     fn pagefault_is_negotiated_per_connection_and_never_saved() {
         let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let mq = VhostUserProtocolFeatures::MQ.bits();
         let pagefault = VhostUserProtocolFeatures::PAGEFAULT.bits();
-        // (demand-paged, offered by the backend, sent to it)
-        for (demand_paged, available, sent) in
-            [(true, mq | pagefault, mq | pagefault), (false, mq, mq)]
-        {
+        // (device created while demand-paged, still demand-paged, offered
+        // by the backend, sent to it)
+        for (relayed, demand_paged, available, sent) in [
+            (true, true, mq | pagefault, mq | pagefault),
+            (false, false, mq, mq),
+            (true, false, mq, mq),
+        ] {
             let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-pagefault-").unwrap();
             let socket_path = temp_dir.as_path().join("backend.sock");
             let listener = UnixListener::bind(&socket_path).unwrap();
@@ -1273,10 +1358,16 @@ mod tests {
                 assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
             });
 
-            let faults = demand_paged.then(|| BackendFaults {
+            let faults = relayed.then(|| BackendFaults {
                 device: "_disk0".to_owned(),
                 handler: Arc::new(Unused),
+                paging: Arc::new(DemandPaging::default()),
             });
+            if let Some(faults) = &faults
+                && !demand_paged
+            {
+                faults.paging.settle(|| Ok::<_, ()>(true)).unwrap();
+            }
             let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
             let mut negotiated = None;
             let vu = VhostUserHandle::connect_vhost_user(
@@ -1309,7 +1400,7 @@ mod tests {
 
     /// Memory hot-plug is refused up front while guest RAM is demand-paged,
     /// with or without CONFIGURE_MEM_SLOTS, before anything reaches the
-    /// backend.
+    /// backend, and taken once it has settled.
     #[test]
     fn memory_hotplug_is_refused_while_demand_paged() {
         let region = Arc::new(
@@ -1320,11 +1411,13 @@ mod tests {
             .unwrap(),
         );
         for acked_protocol_features in [0, VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits()] {
+            let paging = Arc::new(DemandPaging::default());
             let mut common = VhostUserCommon {
                 acked_protocol_features,
                 faults: Some(BackendFaults {
                     device: "_disk0".to_owned(),
                     handler: Arc::new(Unused),
+                    paging: Arc::clone(&paging),
                 }),
                 ..Default::default()
             };
@@ -1337,6 +1430,9 @@ mod tests {
                 )) => assert_ne!(acked_protocol_features, 0),
                 other => panic!("unexpected hot-plug result: {other:?}"),
             }
+
+            paging.settle(|| Ok::<_, ()>(true)).unwrap();
+            common.add_memory_region(&region).unwrap();
         }
     }
 
