@@ -1019,9 +1019,12 @@ impl vm::Vm for KvmVm {
     /// Sets the address of the one-page region in the VM's address space.
     ///
     fn set_identity_map_address(&self, address: u64) -> vm::Result<()> {
-        self.fd
-            .set_identity_map_address(address)
-            .map_err(|e| vm::HypervisorVmError::SetIdentityMapAddress(e.into()))
+        self.fd.set_identity_map_address(address).map_err(|source| {
+            vm::HypervisorVmError::KvmIoctl {
+                ioctl: KvmIoctl::SetIdentityMapAddr,
+                source,
+            }
+        })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -1031,7 +1034,10 @@ impl vm::Vm for KvmVm {
     fn set_tss_address(&self, offset: usize) -> vm::Result<()> {
         self.fd
             .set_tss_address(offset)
-            .map_err(|e| vm::HypervisorVmError::SetTssAddress(e.into()))
+            .map_err(|source| vm::HypervisorVmError::KvmIoctl {
+                ioctl: KvmIoctl::SetTssAddr,
+                source,
+            })
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1071,10 +1077,13 @@ impl vm::Vm for KvmVm {
         vm_ops: Option<Arc<dyn VmOps>>,
         #[cfg(target_arch = "x86_64")] msr_config_update: Option<VcpuMsrConfigUpdate>,
     ) -> vm::Result<Box<dyn cpu::Vcpu>> {
-        let fd = self
-            .fd
-            .create_vcpu(id as u64)
-            .map_err(|e| vm::HypervisorVmError::CreateVcpu(e.into()))?;
+        let fd =
+            self.fd
+                .create_vcpu(id as u64)
+                .map_err(|source| vm::HypervisorVmError::KvmIoctl {
+                    ioctl: KvmIoctl::CreateVcpu,
+                    source,
+                })?;
 
         #[cfg(target_arch = "riscv64")]
         {
@@ -1379,8 +1388,12 @@ impl vm::Vm for KvmVm {
 
         // SAFETY: Safe because caller promised this is safe.
         unsafe {
-            self.set_user_memory_region(region)
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+            self.set_user_memory_region(region).map_err(|source| {
+                vm::HypervisorVmError::KvmIoctl {
+                    ioctl: KvmIoctl::SetUserMemoryRegion,
+                    source,
+                }
+            })?;
         }
 
         #[cfg(feature = "sev_snp")]
@@ -1466,7 +1479,10 @@ impl vm::Vm for KvmVm {
         cap.args[0] = NUM_IOAPIC_PINS as u64;
         self.fd
             .enable_cap(&cap)
-            .map_err(|e| vm::HypervisorVmError::EnableSplitIrq(e.into()))?;
+            .map_err(|source| vm::HypervisorVmError::KvmIoctl {
+                ioctl: KvmIoctl::EnableCap,
+                source,
+            })?;
         Ok(())
     }
 
@@ -1488,7 +1504,10 @@ impl vm::Vm for KvmVm {
             (KVM_X2APIC_API_USE_32BIT_IDS | KVM_X2APIC_API_DISABLE_BROADCAST_QUIRK) as u64;
         self.fd
             .enable_cap(&cap)
-            .map_err(|e| vm::HypervisorVmError::EnableX2ApicApi(e.into()))?;
+            .map_err(|source| vm::HypervisorVmError::KvmIoctl {
+                ioctl: KvmIoctl::EnableCap,
+                source,
+            })?;
         Ok(())
     }
 
@@ -1508,7 +1527,10 @@ impl vm::Vm for KvmVm {
         let data = (*data).into();
         self.fd
             .set_clock(&data)
-            .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))
+            .map_err(|source| vm::HypervisorVmError::KvmIoctl {
+                ioctl: KvmIoctl::SetClock,
+                source,
+            })
     }
 
     /// Capture kvmclock (filling realtime) for snapshot/migration, paired
@@ -1666,8 +1688,12 @@ impl vm::Vm for KvmVm {
             };
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             unsafe {
-                self.set_user_memory_region(region)
-                    .map_err(|e| vm::HypervisorVmError::StartDirtyLog(e.into()))?;
+                self.set_user_memory_region(region).map_err(|source| {
+                    vm::HypervisorVmError::KvmIoctl {
+                        ioctl: KvmIoctl::SetUserMemoryRegion,
+                        source,
+                    }
+                })?;
             }
         }
 
@@ -1885,7 +1911,10 @@ impl KvmHypervisor {
     fn msr_list(kvm: &Kvm) -> hypervisor::Result<MsrList> {
         let mut indices = kvm
             .get_msr_index_list()
-            .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))?
+            .map_err(|source| hypervisor::HypervisorError::KvmIoctl {
+                ioctl: KvmIoctl::GetMsrIndexList,
+                source,
+            })?
             .as_slice()
             .to_vec();
 
@@ -2008,7 +2037,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                         // this can't be considered as a regular error.
                         continue;
                     }
-                    return Err(hypervisor::HypervisorError::VmCreate(e.into()));
+                    return Err(hypervisor::HypervisorError::KvmIoctl {
+                        ioctl: KvmIoctl::CreateVm,
+                        source: e,
+                    });
                 }
             }
             break;
@@ -2026,12 +2058,9 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 as libc::c_ulong,
             ) <= 0
             {
-                return Err(hypervisor::HypervisorError::VmCreate(
-                    io::Error::other(
-                        "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is required but unsupported by this kernel",
-                    )
-                    .into(),
-                ));
+                return Err(hypervisor::HypervisorError::CheckExtensions(anyhow!(
+                    "KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2 is required but unsupported by this kernel"
+                )));
             }
             let cap = kvm_bindings::kvm_enable_cap {
                 cap: kvm_bindings::KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2,
@@ -2044,7 +2073,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 ..Default::default()
             };
             fd.enable_cap(&cap)
-                .map_err(|e| hypervisor::HypervisorError::VmCreate(e.into()))?;
+                .map_err(|source| hypervisor::HypervisorError::KvmIoctl {
+                    ioctl: KvmIoctl::EnableCap,
+                    source,
+                })?;
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -2131,7 +2163,10 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         let kvm_cpuid = self
             .kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-            .map_err(|e| hypervisor::HypervisorError::GetCpuId(e.into()))?;
+            .map_err(|source| hypervisor::HypervisorError::KvmIoctl {
+                ioctl: KvmIoctl::GetSupportedCpuid,
+                source,
+            })?;
 
         let v = kvm_cpuid.as_slice().iter().map(|e| (*e).into()).collect();
 

@@ -44,6 +44,20 @@ pub enum KvmIoctl {
     GetSupportedCpuid,
     /// `KVM_GET_TSC_KHZ`.
     GetTscKhz,
+    /// `KVM_CREATE_VM`.
+    CreateVm,
+    /// `KVM_GET_MSR_INDEX_LIST`.
+    GetMsrIndexList,
+    /// `KVM_SET_IDENTITY_MAP_ADDR`.
+    SetIdentityMapAddr,
+    /// `KVM_SET_TSS_ADDR`.
+    SetTssAddr,
+    /// `KVM_CREATE_VCPU`.
+    CreateVcpu,
+    /// `KVM_SET_USER_MEMORY_REGION` or `KVM_SET_USER_MEMORY_REGION2`.
+    SetUserMemoryRegion,
+    /// `KVM_SET_CLOCK`.
+    SetClock,
 }
 
 impl KvmIoctl {
@@ -66,6 +80,13 @@ impl KvmIoctl {
             KvmIoctl::SetVcpuEvents => "KVM_SET_VCPU_EVENTS",
             KvmIoctl::GetSupportedCpuid => "KVM_GET_SUPPORTED_CPUID",
             KvmIoctl::GetTscKhz => "KVM_GET_TSC_KHZ",
+            KvmIoctl::CreateVm => "KVM_CREATE_VM",
+            KvmIoctl::GetMsrIndexList => "KVM_GET_MSR_INDEX_LIST",
+            KvmIoctl::SetIdentityMapAddr => "KVM_SET_IDENTITY_MAP_ADDR",
+            KvmIoctl::SetTssAddr => "KVM_SET_TSS_ADDR",
+            KvmIoctl::CreateVcpu => "KVM_CREATE_VCPU",
+            KvmIoctl::SetUserMemoryRegion => "KVM_SET_USER_MEMORY_REGION",
+            KvmIoctl::SetClock => "KVM_SET_CLOCK",
         }
     }
 }

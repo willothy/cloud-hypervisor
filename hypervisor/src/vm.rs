@@ -23,6 +23,7 @@ use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
 use thiserror::Error;
+use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -36,7 +37,7 @@ use crate::arch::x86::CpuIdEntry;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::VcpuMsrConfigUpdate;
 use crate::cpu::Vcpu;
-use crate::{CapturedClock, ClockRestoreMode, IoEventAddress, IrqRoutingEntry};
+use crate::{CapturedClock, ClockRestoreMode, IoEventAddress, IrqRoutingEntry, KvmIoctl};
 
 ///
 /// I/O events data matches (32 or 64 bits).
@@ -61,20 +62,19 @@ impl From<DataMatch> for u64 {
 /// Enum for VM error
 pub enum HypervisorVmError {
     ///
+    /// A KVM ioctl on the VM failed
+    ///
+    #[error("{ioctl} failed")]
+    KvmIoctl {
+        ioctl: KvmIoctl,
+        #[source]
+        source: errno::Error,
+    },
+    ///
     /// Create Vcpu error
     ///
     #[error("Failed to create Vcpu")]
     CreateVcpu(#[source] anyhow::Error),
-    ///
-    /// Identity map address error
-    ///
-    #[error("Failed to set identity map address")]
-    SetIdentityMapAddress(#[source] anyhow::Error),
-    ///
-    /// TSS address error
-    ///
-    #[error("Failed to set TSS address")]
-    SetTssAddress(#[source] anyhow::Error),
     ///
     /// Create interrupt controller error
     ///
@@ -125,16 +125,6 @@ pub enum HypervisorVmError {
     ///
     #[error("Failed to get preferred target")]
     GetPreferredTarget(#[source] anyhow::Error),
-    ///
-    /// Enable split Irq error
-    ///
-    #[error("Failed to enable split Irq")]
-    EnableSplitIrq(#[source] anyhow::Error),
-    ///
-    /// Enable x2apic API error
-    ///
-    #[error("Failed to enable x2apic API")]
-    EnableX2ApicApi(#[source] anyhow::Error),
     /// Get clock error
     ///
     #[error("Failed to get clock")]
