@@ -13,6 +13,7 @@ use std::result;
 use std::sync::Arc;
 
 use thiserror::Error;
+use vmm_sys_util::errno;
 
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
@@ -23,7 +24,7 @@ use crate::cpu::CpuVendor;
 #[cfg(feature = "tdx")]
 use crate::kvm::TdxCapabilities;
 use crate::vm::Vm;
-use crate::{HypervisorType, HypervisorVmConfig};
+use crate::{HypervisorType, HypervisorVmConfig, KvmIoctl};
 
 #[derive(Error, Debug)]
 pub enum HypervisorError {
@@ -43,10 +44,14 @@ pub enum HypervisorError {
     #[error("Failed to create Vm")]
     VmCreate(#[source] anyhow::Error),
     ///
-    /// CpuId error
+    /// A KVM ioctl on the hypervisor or a VM being created failed
     ///
-    #[error("Failed to get cpuid")]
-    GetCpuId(#[source] anyhow::Error),
+    #[error("{ioctl} failed")]
+    KvmIoctl {
+        ioctl: KvmIoctl,
+        #[source]
+        source: errno::Error,
+    },
     ///
     /// Failed to retrieve list of MSRs.
     ///

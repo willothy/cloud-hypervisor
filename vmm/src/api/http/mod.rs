@@ -40,6 +40,7 @@ use crate::device_manager::DeviceManagerError;
 use crate::landlock::Landlock;
 use crate::locked_unix_listener::{LockedUnixListener, LockedUnixListenerError};
 use crate::memory_manager::Error as MemoryManagerError;
+use crate::restore_failure::RestoreFailure;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::{error_chain_messages, flatten_error_chain_to_string};
 use crate::vm::Error as VmError;
@@ -81,6 +82,10 @@ pub enum HttpError {
     /// Error from internal API
     #[error("Error from API")]
     ApiError(#[source] ApiError),
+
+    /// A restore request the API couldn't accept
+    #[error(transparent)]
+    RestoreRequest(RestoreFailure),
 }
 
 impl HttpError {
@@ -92,13 +97,33 @@ impl HttpError {
             HttpError::TooManyRequests => StatusCode::TooManyRequests,
             HttpError::InternalServerError => StatusCode::InternalServerError,
             HttpError::ApiError(e) => api_error_status_code(e),
+            HttpError::RestoreRequest(_) => StatusCode::BadRequest,
+        }
+    }
+
+    /// The classified failure of a `vm.restore` request, if this is one.
+    fn restore_failure(&self) -> Option<&RestoreFailure> {
+        match self {
+            HttpError::RestoreRequest(failure)
+            | HttpError::ApiError(ApiError::VmRestore(failure)) => Some(failure),
+            HttpError::SerdeJsonDeserialize(_)
+            | HttpError::BadRequest
+            | HttpError::NotFound
+            | HttpError::TooManyRequests
+            | HttpError::InternalServerError
+            | HttpError::ApiError(_) => None,
         }
     }
 }
 
 /// Maps an [`ApiError`] to an HTTP [`StatusCode`].
 fn api_error_status_code(error: &ApiError) -> StatusCode {
-    let source = error.source();
+    // A restore's failure is classified; its status is the one of the error
+    // it classifies.
+    let source = match error {
+        ApiError::VmRestore(failure) => Some(failure.error() as &(dyn Error + 'static)),
+        _ => error.source(),
+    };
 
     // The migration endpoints report state conflicts with a `MigratableError`,
     // which the `VmError` downcast below cannot see.
@@ -141,6 +166,12 @@ const HTTP_ROOT: &str = "/api/v1";
 #[expect(clippy::needless_pass_by_value)]
 pub fn error_response(error: HttpError) -> Response {
     let mut response = Response::new(Version::Http11, error.status_code());
+
+    if let Some(failure) = error.restore_failure()
+        && let Err(e) = response.set_custom_headers(&failure.response_headers())
+    {
+        error!("Failed to set the headers of a failed restore's response: {e:?}");
+    }
 
     info!(
         "HTTP API error response: {}",
@@ -594,8 +625,8 @@ mod tests {
             StatusCode::Conflict
         );
         assert_eq!(
-            api_error_status_code(&ApiError::VmRestore(VmError::ConfigValidation(
-                ValidationError::IdentifierNotUnique("net0".to_string())
+            api_error_status_code(&ApiError::VmRestore(RestoreFailure::of_vm_error(
+                VmError::ConfigValidation(ValidationError::IdentifierNotUnique("net0".to_string()))
             ))),
             StatusCode::Conflict
         );

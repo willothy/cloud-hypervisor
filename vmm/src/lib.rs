@@ -69,6 +69,7 @@ use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
 };
 use crate::migration::{recv_vm_config, recv_vm_state};
+use crate::restore_failure::RestoreFailure;
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
@@ -99,6 +100,7 @@ pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
 mod prefault;
+pub mod restore_failure;
 pub mod seccomp_filters;
 mod serial_manager;
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
@@ -263,6 +265,8 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
             #[cfg(feature = "sev_snp")]
             vmsa_features: 0,
             nested: _value.cpus.nested,
+            #[cfg(target_arch = "x86_64")]
+            tsc_tolerance_ppm: None,
             smt_enabled: _value
                 .cpus
                 .topology
@@ -273,6 +277,21 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+/// Why this host can't present a VM's saved or migrated CPUID.
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+#[derive(Debug, Error)]
+pub enum CpuidCompatibilityError {
+    #[cfg(feature = "tdx")]
+    #[error("Live Migration is not supported when TDX is enabled")]
+    Tdx,
+    #[error("Error enabling AMX state components")]
+    EnableAmx(#[source] hypervisor::HypervisorError),
+    #[error("Error generating common cpuid")]
+    CommonCpuid(#[source] arch::Error),
+    #[error("Error checking cpu feature compatibility")]
+    Incompatible(#[source] arch::x86_64::Error),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -1337,7 +1356,8 @@ impl Vmm {
         self.vm_check_cpuid_compatibility(
             &vm_migration_config.vm_config,
             &vm_migration_config.common_cpuid,
-        )?;
+        )
+        .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
 
         update_memory_zones(zone_updates, &vm_migration_config.vm_config).map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error updating memory zones: {e:?}"))
@@ -1377,7 +1397,8 @@ impl Vmm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         if config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
-            vm.enable_x2apic_api().unwrap();
+            vm.enable_x2apic_api()
+                .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
         }
 
         let phys_bits = vm::physical_bits(
@@ -2059,12 +2080,10 @@ impl Vmm {
         &self,
         src_vm_config: &Arc<Mutex<VmConfig>>,
         src_vm_cpuid: &[x86::CpuIdEntry],
-    ) -> result::Result<(), MigratableError> {
+    ) -> result::Result<(), CpuidCompatibilityError> {
         #[cfg(feature = "tdx")]
         if src_vm_config.lock().unwrap().is_tdx_enabled() {
-            return Err(MigratableError::MigrateReceive(anyhow!(
-                "Live Migration is not supported when TDX is enabled"
-            )));
+            return Err(CpuidCompatibilityError::Tdx);
         }
 
         // We check the `CPUID` compatibility of between the source vm and destination, which is
@@ -2077,7 +2096,7 @@ impl Vmm {
                 // as this affects what Hypervisor::get_supported_cpuid returns.
                 self.hypervisor
                     .enable_amx_state_components()
-                    .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+                    .map_err(CpuidCompatibilityError::EnableAmx)?;
             }
 
             let phys_bits =
@@ -2094,14 +2113,115 @@ impl Vmm {
                     profile: vm_config.cpus.profile,
                 },
             )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateReceive)?
+            .map_err(CpuidCompatibilityError::CommonCpuid)?
         };
         arch::CpuidFeatureEntry::check_cpuid_compatibility(src_vm_cpuid, dest_cpuid)
-            .context("Error checking cpu feature compatibility")
-            .map_err(MigratableError::MigrateReceive)
+            .map_err(CpuidCompatibilityError::Incompatible)
     }
 
+    /// Restores a VM as `restore_cfg` asks, failing with the `VmError` of
+    /// the step that failed; [`RequestHandler::vm_restore`] classifies it.
+    fn restore_vm(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+        match &self.vm {
+            VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => {
+                if self.vm_config.is_some() {
+                    return Err(VmError::VmAlreadyCreated);
+                }
+
+                let source_url = restore_cfg.source_url.as_path().to_str();
+                if source_url.is_none() {
+                    return Err(VmError::InvalidRestoreSourceUrl);
+                }
+                // Safe to unwrap as we checked it was Some(&str).
+                let source_url = source_url.unwrap();
+
+                let vm_config = Arc::new(Mutex::new(
+                    recv_vm_config(source_url).map_err(VmError::RecvSnapshot)?,
+                ));
+                restore_cfg
+                    .validate(&vm_config.lock().unwrap().clone())
+                    .map_err(VmError::ConfigValidation)?;
+
+                // Update VM's net configurations with new fds received for restore operation
+                if let (Some(restored_nets), Some(vm_net_configs)) =
+                    (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
+                {
+                    for net in restored_nets.iter() {
+                        for net_config in vm_net_configs.iter_mut() {
+                            // update only if the net dev is backed by FDs
+                            if net_config.pci_common.id.as_ref() == Some(&net.id)
+                                && net_config.fds.is_some()
+                            {
+                                net_config.fds.clone_from(&net.fds);
+                            }
+                        }
+                    }
+                }
+
+                // Swap each VFIO device's saved path or stale FD for the cdev
+                // FD received with the restore request, and install the fresh
+                // iommufd FD backing them. The one saved in the snapshot is
+                // stale, and validate() has confirmed both accompany vfio_fds.
+                if let Some(restored_vfios) = restore_cfg.vfio_fds {
+                    let mut config = vm_config.lock().unwrap();
+                    if let Some(vm_device_configs) = config.devices.as_mut() {
+                        for v in restored_vfios.iter() {
+                            for device_config in vm_device_configs.iter_mut() {
+                                if device_config.pci_common.id.as_ref() == Some(&v.id) {
+                                    device_config.path = None;
+                                    device_config.fd = v.fd;
+                                }
+                            }
+                        }
+                    }
+                    let iommufd_fd = restore_cfg
+                        .iommufd_fd
+                        .expect("restore validated an iommufd FD accompanies vfio_fds");
+                    config
+                        .platform
+                        .as_mut()
+                        .expect("restore validated iommufd=on, so a platform exists")
+                        .iommufd_fd = Some(iommufd_fd);
+                }
+
+                update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
+                    error!("VM Restore failed: {e:?}");
+                    VmError::ApplyMemoryZoneUpdate(e)
+                })?;
+
+                self.vm_restore(
+                    source_url,
+                    vm_config,
+                    restore_cfg.prefault,
+                    restore_cfg.memory_restore_mode,
+                    restore_cfg.restore_fault_socket.as_deref(),
+                    restore_cfg.clock_restore_mode,
+                    #[cfg(target_arch = "x86_64")]
+                    restore_cfg.tsc_tolerance_ppm,
+                )
+                .and_then(|()| {
+                    if restore_cfg.resume {
+                        self.vm_resume()
+                    } else {
+                        Ok(())
+                    }
+                })
+                .inspect_err(|_| {
+                    // The restore's own failure is what its caller needs; a
+                    // failure to clean up after it is only logged.
+                    if let Err(e) = self.vm_delete() {
+                        error!("Failed to delete the VM after a failed restore: {e:?}");
+                    }
+                })?;
+
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg_attr(target_arch = "x86_64", expect(clippy::too_many_arguments))]
     fn vm_restore(
         &mut self,
         source_url: &str,
@@ -2110,18 +2230,19 @@ impl Vmm {
         memory_restore_mode: MemoryRestoreMode,
         restore_fault_socket: Option<&path::Path>,
         clock_restore_mode: GuestClockRestoreMode,
+        #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
-                let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                let snapshot = recv_vm_state(source_url).map_err(VmError::RecvSnapshot)?;
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-                let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
+                let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::RecvSnapshot)?;
 
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
-                    .map_err(VmError::Restore)?;
+                    .map_err(VmError::CpuidCompatibility)?;
 
                 self.vm_config = Some(Arc::clone(&vm_config));
 
@@ -2165,6 +2286,8 @@ impl Vmm {
                     restore_fault_socket,
                     self.exit_reason.as_deref(),
                     Some(clock_restore_mode),
+                    #[cfg(target_arch = "x86_64")]
+                    tsc_tolerance_ppm,
                 )?;
 
                 if self
@@ -2611,6 +2734,8 @@ impl RequestHandler for Vmm {
                             None,
                             self.exit_reason.as_deref(),
                             None,
+                            #[cfg(target_arch = "x86_64")]
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2731,102 +2856,17 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
-        match &self.vm {
-            VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
-            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
-            VmOwnership::None => {
-                if self.vm_config.is_some() {
-                    return Err(VmError::VmAlreadyCreated);
-                }
-
-                let source_url = restore_cfg.source_url.as_path().to_str();
-                if source_url.is_none() {
-                    return Err(VmError::InvalidRestoreSourceUrl);
-                }
-                // Safe to unwrap as we checked it was Some(&str).
-                let source_url = source_url.unwrap();
-
-                let vm_config = Arc::new(Mutex::new(
-                    recv_vm_config(source_url).map_err(VmError::Restore)?,
-                ));
-                restore_cfg
-                    .validate(&vm_config.lock().unwrap().clone())
-                    .map_err(VmError::ConfigValidation)?;
-
-                // Update VM's net configurations with new fds received for restore operation
-                if let (Some(restored_nets), Some(vm_net_configs)) =
-                    (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
-                {
-                    for net in restored_nets.iter() {
-                        for net_config in vm_net_configs.iter_mut() {
-                            // update only if the net dev is backed by FDs
-                            if net_config.pci_common.id.as_ref() == Some(&net.id)
-                                && net_config.fds.is_some()
-                            {
-                                net_config.fds.clone_from(&net.fds);
-                            }
-                        }
-                    }
-                }
-
-                // Swap each VFIO device's saved path or stale FD for the cdev
-                // FD received with the restore request, and install the fresh
-                // iommufd FD backing them. The one saved in the snapshot is
-                // stale, and validate() has confirmed both accompany vfio_fds.
-                if let Some(restored_vfios) = restore_cfg.vfio_fds {
-                    let mut config = vm_config.lock().unwrap();
-                    if let Some(vm_device_configs) = config.devices.as_mut() {
-                        for v in restored_vfios.iter() {
-                            for device_config in vm_device_configs.iter_mut() {
-                                if device_config.pci_common.id.as_ref() == Some(&v.id) {
-                                    device_config.path = None;
-                                    device_config.fd = v.fd;
-                                }
-                            }
-                        }
-                    }
-                    let iommufd_fd = restore_cfg
-                        .iommufd_fd
-                        .expect("restore validated an iommufd FD accompanies vfio_fds");
-                    config
-                        .platform
-                        .as_mut()
-                        .expect("restore validated iommufd=on, so a platform exists")
-                        .iommufd_fd = Some(iommufd_fd);
-                }
-
-                update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
-                    error!("VM Restore failed: {e:?}");
-                    VmError::ApplyMemoryZoneUpdate(e)
-                })?;
-
-                self.vm_restore(
-                    source_url,
-                    vm_config,
-                    restore_cfg.prefault,
-                    restore_cfg.memory_restore_mode,
-                    restore_cfg.restore_fault_socket.as_deref(),
-                    restore_cfg.clock_restore_mode,
-                )
-                .and_then(|()| {
-                    if restore_cfg.resume {
-                        self.vm_resume()
-                    } else {
-                        Ok(())
-                    }
-                })
-                .map_err(|e| {
-                    error!("VM Restore failed: {e:?}");
-                    if let Err(e) = self.vm_delete() {
-                        return e;
-                    }
-                    e
-                })?;
-
-                Ok(())
-            }
-        }
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), RestoreFailure> {
+        self.restore_vm(restore_cfg).map_err(|e| {
+            let failure = RestoreFailure::of_vm_error(e);
+            error!(
+                "VM Restore failed at {} ({}): {:?}",
+                failure.site(),
+                failure.kind(),
+                failure.error()
+            );
+            failure
+        })
     }
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
@@ -2915,6 +2955,8 @@ impl RequestHandler for Vmm {
             None,
             None,
             self.exit_reason.as_deref(),
+            None,
+            #[cfg(target_arch = "x86_64")]
             None,
         )?;
 

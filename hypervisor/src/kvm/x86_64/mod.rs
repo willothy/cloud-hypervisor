@@ -32,6 +32,7 @@ use crate::arch::x86::{
 };
 use crate::kvm::{Cap, Kvm, KvmError, KvmResult};
 
+pub(crate) mod restore;
 #[cfg(feature = "sev_snp")]
 pub(crate) mod sev;
 

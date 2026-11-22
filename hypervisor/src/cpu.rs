@@ -10,6 +10,8 @@
 //
 //
 
+#[cfg(target_arch = "x86_64")]
+use std::fmt;
 #[cfg(feature = "tdx")]
 use std::io;
 use std::result;
@@ -17,6 +19,7 @@ use std::result;
 #[cfg(feature = "sev_snp")]
 use igvm::snp_defs::SevVmsa;
 use thiserror::Error;
+use vmm_sys_util::errno;
 #[cfg(not(target_arch = "riscv64"))]
 use {anyhow::anyhow, vm_memory::GuestAddress};
 
@@ -30,7 +33,7 @@ use crate::arch::aarch64::ExtendedReg;
 use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, msr_index};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
-use crate::{CpuState, HypervisorType, MpState, StandardRegisters};
+use crate::{CpuState, HypervisorType, KvmIoctl, MpState, StandardRegisters};
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -101,10 +104,31 @@ pub enum HypervisorCpuError {
     #[error("Failed to set Msr entries")]
     SetMsrEntries(#[source] anyhow::Error),
     ///
-    /// Restoring required feature MSR
+    /// KVM refused to set an MSR a vCPU's saved state carries
     ///
-    #[error("Failed to restore required feature MSR")]
-    RestoreFeatureMsr,
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to restore MSR {index:#x}: {refusal}")]
+    RestoreMsr { index: u32, refusal: MsrRefusal },
+    ///
+    /// A KVM ioctl restoring part of a vCPU's saved state failed
+    ///
+    #[error("Failed to restore vCPU state with {ioctl}")]
+    SetVcpuState {
+        ioctl: KvmIoctl,
+        #[source]
+        source: errno::Error,
+    },
+    ///
+    /// The host can't present part of a vCPU's saved state
+    ///
+    #[cfg(target_arch = "x86_64")]
+    #[error("The host can't present the saved vCPU state")]
+    IncompatibleVcpuState(#[source] IncompatibleVcpuState),
+    ///
+    /// The saved vCPU state does not fit the hypervisor's structures
+    ///
+    #[error("Saved vCPU state does not fit the hypervisor's structures")]
+    MalformedVcpuState(#[source] anyhow::Error),
     ///
     /// Getting Msr entries error
     ///
@@ -120,12 +144,6 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to get MP state")]
     GetMpState(#[source] anyhow::Error),
-    ///
-    /// Setting Saved Processor Extended States error
-    ///
-    #[cfg(feature = "kvm")]
-    #[error("Failed to set Saved Processor Extended States")]
-    SetXsaveState(#[source] anyhow::Error),
     ///
     /// Getting Saved Processor Extended States error
     ///
@@ -297,11 +315,6 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to get TSC frequency")]
     GetTscKhz(#[source] anyhow::Error),
-    ///
-    /// Error setting TSC frequency
-    ///
-    #[error("Failed to set TSC frequency")]
-    SetTscKhz(#[source] anyhow::Error),
     #[cfg(target_arch = "x86_64")]
     ///
     /// Error getting TSC offset
@@ -343,6 +356,75 @@ pub enum HypervisorCpuError {
     Nmi(#[source] anyhow::Error),
     #[error("Failed to get nested guest state")]
     GetNestedState(#[source] anyhow::Error),
+}
+
+/// What a host lacks that a vCPU's saved state needs, found by comparing the
+/// state with the host's capabilities before restoring any of it.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum IncompatibleVcpuState {
+    /// The guest's TSC rate is beyond the band the host runs a TSC
+    /// unscaled within, and the host can't scale it.
+    #[error(
+        "The guest's TSC runs at {saved_khz} kHz, beyond {tolerance_ppm} ppm of the host's {host_khz} kHz, and the host can't scale it"
+    )]
+    TscRate {
+        saved_khz: u32,
+        host_khz: u32,
+        tolerance_ppm: u32,
+    },
+    /// CR4 has bits set the host doesn't let a guest set.
+    #[error("CR4 has bits {bits:#x} set that the host doesn't support")]
+    Cr4 { bits: u64 },
+    /// The XSAVE area holds state components the host doesn't support.
+    #[error("The XSAVE area holds state components {components:#x} the host doesn't support")]
+    XsaveComponents { components: u64 },
+    /// XCR0 enables state components the host doesn't support.
+    #[error("XCR0 enables state components {components:#x} the host doesn't support")]
+    Xcr0 { components: u64 },
+    /// The vCPU uses a Hyper-V synthetic interrupt controller the host
+    /// doesn't emulate.
+    #[error("The host doesn't emulate the Hyper-V synthetic interrupt controller the vCPU uses")]
+    HypervSynic,
+    /// The vCPU has nested state in a format the host doesn't restore.
+    #[error("The host doesn't restore nested state in format {format}")]
+    NestedState { format: u16 },
+    /// The vCPU has a CET shadow-stack pointer, and the host doesn't support
+    /// shadow stacks.
+    #[error("The host doesn't support the CET shadow stacks the vCPU uses")]
+    ShadowStack,
+    /// The vCPU's events carry flags for capabilities the VM doesn't enable.
+    #[error("The vCPU's events carry flags {flags:#x} for capabilities the VM doesn't enable")]
+    VcpuEvents { flags: u32 },
+    /// The vCPU is in or entering system-management mode, which the host
+    /// doesn't support.
+    #[error("The host doesn't support the system-management mode the vCPU is in")]
+    Smm,
+}
+
+/// Why KVM refused to set an MSR a vCPU's saved state carries.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MsrRefusal {
+    /// The host doesn't list the MSR as one KVM saves or emulates.
+    NotListed,
+    /// The host lists the MSR as one describing what it supports, and
+    /// refused the saved value: the host lacks a capability the value
+    /// claims.
+    FeatureValue,
+    /// The host lists the MSR, and refused the saved value.
+    Value,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl fmt::Display for MsrRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            MsrRefusal::NotListed => "the host doesn't support it",
+            MsrRefusal::FeatureValue => "the host lacks a capability its value claims",
+            MsrRefusal::Value => "the host refused its value",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -612,13 +694,6 @@ pub trait Vcpu: Send + Sync {
     ///
     fn tsc_khz(&self) -> Result<Option<u32>> {
         Ok(None)
-    }
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Set the frequency of the TSC if available
-    ///
-    fn set_tsc_khz(&self, _freq: u32) -> Result<()> {
-        Ok(())
     }
     #[cfg(target_arch = "x86_64")]
     ///

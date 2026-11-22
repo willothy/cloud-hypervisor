@@ -113,7 +113,9 @@ use crate::memory_manager::{
 };
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
-use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
+use crate::migration::{
+    RecvError, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path,
+};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::MeasuredBootInfo;
 use crate::util::flatten_error_chain_to_string;
@@ -178,6 +180,35 @@ pub enum Error {
     #[error("Error initializing VM")]
     InitializeVm(#[source] hypervisor::HypervisorVmError),
 
+    #[error("Error reading the snapshot")]
+    RecvSnapshot(#[source] RecvError),
+
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[error("The host can't present the snapshot's CPUID")]
+    CpuidCompatibility(#[source] crate::CpuidCompatibilityError),
+
+    #[error("The hypervisor lacks a capability the VMM requires")]
+    HypervisorExtensions(#[source] hypervisor::HypervisorError),
+
+    #[error("Error creating the hypervisor VM")]
+    CreateHypervisorVm(#[source] hypervisor::HypervisorError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error setting the VM's identity map address")]
+    SetIdentityMapAddress(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error setting the VM's TSS address")]
+    SetTssAddress(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error enabling the split irqchip")]
+    EnableSplitIrq(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[error("Error enabling the x2APIC API")]
+    EnableX2ApicApi(#[source] hypervisor::HypervisorVmError),
+
     #[error("No device with id {0:?} to remove")]
     NoDeviceToRemove(String),
 
@@ -225,9 +256,6 @@ pub enum Error {
 
     #[error("Cannot snapshot VM")]
     Snapshot(#[source] MigratableError),
-
-    #[error("Cannot restore VM")]
-    Restore(#[source] MigratableError),
 
     #[error(
         "Cannot hold the guest clock: the snapshot's clock was captured without the guest TSC it is held by"
@@ -773,7 +801,7 @@ impl Vm {
             .map_err(Error::InitramfsFile)?;
 
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
-            let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
+            let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::RecvSnapshot)?;
             vm_snapshot
                 .clock
                 .map(|state| {
@@ -1434,6 +1462,7 @@ impl Vm {
         restore_fault_socket: Option<&Path>,
         exit_reason: Option<&Path>,
         clock_restore_mode: Option<GuestClockRestoreMode>,
+        #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1467,12 +1496,16 @@ impl Vm {
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
             }
+            #[cfg(target_arch = "x86_64")]
+            {
+                hv_config.tsc_tolerance_ppm = tsc_tolerance_ppm;
+            }
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         if vm_config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
-            vm.enable_x2apic_api().unwrap();
+            vm.enable_x2apic_api().map_err(Error::EnableX2ApicApi)?;
         }
 
         let phys_bits = physical_bits(
@@ -1548,16 +1581,21 @@ impl Vm {
         hypervisor: &dyn hypervisor::Hypervisor,
         config: HypervisorVmConfig,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
-        hypervisor.check_required_extensions().unwrap();
+        hypervisor
+            .check_required_extensions()
+            .map_err(Error::HypervisorExtensions)?;
 
-        let vm = hypervisor.create_vm(config).unwrap();
+        let vm = hypervisor
+            .create_vm(config)
+            .map_err(Error::CreateHypervisorVm)?;
 
         #[cfg(target_arch = "x86_64")]
         {
             vm.set_identity_map_address(KVM_IDENTITY_MAP_START.0)
-                .unwrap();
-            vm.set_tss_address(KVM_TSS_START.0 as usize).unwrap();
-            vm.enable_split_irq().unwrap();
+                .map_err(Error::SetIdentityMapAddress)?;
+            vm.set_tss_address(KVM_TSS_START.0 as usize)
+                .map_err(Error::SetTssAddress)?;
+            vm.enable_split_irq().map_err(Error::EnableSplitIrq)?;
         }
 
         Ok(vm)

@@ -58,6 +58,7 @@ use crate::api::{
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
+use crate::restore_failure::{RestoreFailure, RestoreSite};
 use crate::vm::Error as VmError;
 
 /// Helper module for attaching externally opened FDs to config objects.
@@ -577,6 +578,64 @@ impl GetHandler for VmResize {}
 
 // Special handling for virtio-net devices backed by network FDs.
 // See module description for more info.
+impl VmRestore {
+    /// The restore configuration a request carries, with the request's file
+    /// descriptors attached, or the failure of a request the API can't
+    /// accept, at the site that refused it.
+    fn request_config(
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> result::Result<RestoreConfig, RestoreFailure> {
+        let invalid =
+            |site: RestoreSite| move |e: HttpError| RestoreFailure::of_request(site, Box::new(e));
+
+        let body = body
+            .as_ref()
+            .ok_or(HttpError::BadRequest)
+            .map_err(invalid(RestoreSite::RequestBody))?;
+        let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())
+            .map_err(HttpError::SerdeJsonDeserialize)
+            .map_err(invalid(RestoreSite::RequestBody))?;
+
+        let net_total: usize = restore_cfg
+            .net_fds
+            .iter()
+            .flatten()
+            .map(|c| c.num_fds)
+            .sum();
+        let vfio_total = restore_cfg.vfio_fds.as_ref().map_or(0, |c| c.len());
+        let iommufd_total = usize::from(restore_cfg.vfio_fds.is_some());
+        let expected = net_total + vfio_total + iommufd_total;
+        if files.len() != expected {
+            error!(
+                "Expected {expected} FDs in VmRestore request, received {}",
+                files.len()
+            );
+            return Err(invalid(RestoreSite::RequestFds)(HttpError::BadRequest));
+        }
+
+        // Split in the order net_fds, then vfio_fds, then the iommufd FD.
+        let mut files = files;
+        if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
+            let net_files: Vec<File> = files.drain(..net_total).collect();
+            let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+            attach_fds_to_cfgs(net_files, cfgs.as_mut_slice())
+                .map_err(invalid(RestoreSite::RequestFds))?;
+        }
+        if let Some(cfgs) = restore_cfg.vfio_fds.as_mut() {
+            let vfio_files: Vec<File> = files.drain(..vfio_total).collect();
+            let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+            attach_fds_to_cfgs(vfio_files, cfgs.as_mut_slice())
+                .map_err(invalid(RestoreSite::RequestFds))?;
+        }
+        if restore_cfg.vfio_fds.is_some() {
+            restore_cfg.iommufd_fd = Some(files.remove(0).into_raw_fd());
+        }
+
+        Ok(restore_cfg)
+    }
+}
+
 impl PutHandler for VmRestore {
     fn handle_request(
         &'static self,
@@ -585,47 +644,9 @@ impl PutHandler for VmRestore {
         body: &Option<Body>,
         files: Vec<File>,
     ) -> result::Result<Option<Body>, HttpError> {
-        if let Some(body) = body {
-            let mut restore_cfg: RestoreConfig = serde_json::from_slice(body.raw())?;
-
-            let net_total: usize = restore_cfg
-                .net_fds
-                .iter()
-                .flatten()
-                .map(|c| c.num_fds)
-                .sum();
-            let vfio_total = restore_cfg.vfio_fds.as_ref().map_or(0, |c| c.len());
-            let iommufd_total = usize::from(restore_cfg.vfio_fds.is_some());
-            let expected = net_total + vfio_total + iommufd_total;
-            if files.len() != expected {
-                error!(
-                    "Expected {expected} FDs in VmRestore request, received {}",
-                    files.len()
-                );
-                return Err(HttpError::BadRequest);
-            }
-
-            // Split in the order net_fds, then vfio_fds, then the iommufd FD.
-            let mut files = files;
-            if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
-                let net_files: Vec<File> = files.drain(..net_total).collect();
-                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
-                attach_fds_to_cfgs(net_files, cfgs.as_mut_slice())?;
-            }
-            if let Some(cfgs) = restore_cfg.vfio_fds.as_mut() {
-                let vfio_files: Vec<File> = files.drain(..vfio_total).collect();
-                let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
-                attach_fds_to_cfgs(vfio_files, cfgs.as_mut_slice())?;
-            }
-            if restore_cfg.vfio_fds.is_some() {
-                restore_cfg.iommufd_fd = Some(files.remove(0).into_raw_fd());
-            }
-
-            self.send(api_notifier, api_sender, restore_cfg)
-                .map_err(HttpError::ApiError)
-        } else {
-            Err(HttpError::BadRequest)
-        }
+        let restore_cfg = Self::request_config(body, files).map_err(HttpError::RestoreRequest)?;
+        self.send(api_notifier, api_sender, restore_cfg)
+            .map_err(HttpError::ApiError)
     }
 }
 

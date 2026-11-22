@@ -62,6 +62,7 @@ use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
+use crate::restore_failure::RestoreFailure;
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
     DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
@@ -145,7 +146,7 @@ pub enum ApiError {
 
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
-    VmRestore(#[source] VmError),
+    VmRestore(#[source] RestoreFailure),
 
     /// The VM could not be coredumped.
     #[error("The VM could not be coredumped")]
@@ -974,7 +975,7 @@ pub trait RequestHandler {
         leave_paused: bool,
     ) -> Result<(), VmError>;
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), VmError>;
+    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), RestoreFailure>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn vm_coredump(&mut self, destination_url: &str) -> Result<(), VmError>;

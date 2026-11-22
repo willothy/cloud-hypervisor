@@ -45,6 +45,9 @@ mod cpu;
 /// Device related module
 mod device;
 
+/// KVM ioctl names for error reporting
+mod ioctl;
+
 use std::result;
 use std::sync::Arc;
 #[cfg(target_arch = "x86_64")]
@@ -57,7 +60,10 @@ use concat_idents::concat_idents;
 #[cfg(target_arch = "x86_64")]
 pub use cpu::CpuVendor;
 pub use cpu::{HypervisorCpuError, Vcpu, VmExit};
+#[cfg(target_arch = "x86_64")]
+pub use cpu::{IncompatibleVcpuState, MsrRefusal};
 pub use device::HypervisorDeviceError;
+pub use ioctl::KvmIoctl;
 #[cfg(all(feature = "kvm", target_arch = "aarch64"))]
 pub use kvm::aarch64;
 #[cfg(all(feature = "kvm", target_arch = "riscv64"))]
@@ -315,6 +321,12 @@ pub struct HypervisorVmConfig {
     pub vmsa_features: u64,
     pub nested: bool,
     pub smt_enabled: bool,
+    /// How far, in parts per million, a guest's TSC rate may be from the
+    /// host's for the host to run it unscaled: the host's
+    /// `kvm.tsc_tolerance_ppm`, when the VMM is told it. A vCPU state
+    /// restore checks a saved TSC rate against it.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_tolerance_ppm: Option<u32>,
 }
 
 #[derive(Copy, Clone)]
