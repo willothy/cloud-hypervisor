@@ -87,6 +87,13 @@ pub enum Error {
         "The backend of restored device {id} does not offer virtio features {missing:#x} the snapshot acked"
     )]
     RestoredFeaturesUnsupported { id: String, missing: u64 },
+    #[error("Connecting to the backend of restored device {id} at {socket} failed")]
+    RestoreConnect {
+        id: String,
+        socket: String,
+        #[source]
+        source: Box<Error>,
+    },
     #[error(
         "The backend of restored device {id} reports {field} {backend}, but the snapshot holds {saved}"
     )]

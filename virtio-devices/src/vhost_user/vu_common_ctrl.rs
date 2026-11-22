@@ -597,6 +597,20 @@ impl VhostUserHandle {
         initialize(self)
     }
 
+    /// Connect to the backend listening on `socket_path` with a single
+    /// attempt, for a caller that knows the backend is already serving: a
+    /// missing or refusing socket fails at once instead of being waited out.
+    pub fn connect_vhost_user_once(
+        socket_path: &str,
+        num_queues: u64,
+        faults: Option<&BackendFaults>,
+    ) -> Result<Self> {
+        let vu = Frontend::connect(socket_path, num_queues).map_err(Error::VhostUserConnect)?;
+        let mut vhost_user = Self::new(vu, faults);
+        vhost_user.handshake(&mut |_| Ok(()))?;
+        Ok(vhost_user)
+    }
+
     pub fn connect_vhost_user(
         server: bool,
         socket_path: &str,
