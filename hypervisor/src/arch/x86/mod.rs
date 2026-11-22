@@ -341,7 +341,8 @@ impl MsrClass {
         match index {
             // IA32_PMCx, IA32_PERFEVTSELx, the fixed counters and their
             // control, the global status, control and overflow registers,
-            // the full-width IA32_A_PMCx, PEBS and the debug store area.
+            // the full-width IA32_A_PMCx, PEBS and the debug store area, and
+            // IA32_PERF_CAPABILITIES, which describes them.
             0xc1..=0xc8
             | 0x186..=0x18d
             | 0x309..=0x30c
@@ -349,6 +350,7 @@ impl MsrClass {
             | 0x3f1..=0x3f2
             | 0x4c1..=0x4c8
             | 0x600
+            | msr_index::MSR_IA32_PERF_CAPABILITIES
             // AMD's legacy and extended performance counters and selects,
             // and the PerfMonV2 global registers.
             | 0xc0010000..=0xc0010007
@@ -498,6 +500,10 @@ mod tests {
                 "{index:#x}"
             );
         }
+        assert_eq!(
+            MsrClass::of(msr_index::MSR_IA32_PERF_CAPABILITIES),
+            MsrClass::PerformanceMonitoring
+        );
         for index in [0x179, 0x17a, 0x17b, 0x4d0, 0x280, 0x29f, 0x400, 0x47f] {
             assert_eq!(MsrClass::of(index), MsrClass::MachineCheck, "{index:#x}");
         }
