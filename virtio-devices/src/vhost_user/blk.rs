@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 use std::{io, result};
 
+use anyhow::anyhow;
 use block::VirtioBlockConfig;
 use log::{error, info};
 use seccompiler::SeccompAction;
@@ -73,6 +74,146 @@ fn check_restored_features(id: &str, acked_features: u64, backend_features: u64)
     Ok(())
 }
 
+/// A restored device's config, reconciled with its new backend's.
+struct RestoredConfig {
+    config: VirtioBlockConfig,
+    /// The capacity is the backend's and differs from the snapshot's, so the
+    /// restored guest has to be told its config changed.
+    capacity_changed: bool,
+}
+
+/// Reconcile the config the snapshot of device `id` saved with the one its
+/// new backend reports.
+///
+/// A saved capacity of 0 is a placeholder: the device was captured with no
+/// disk behind it, and the backend's capacity is taken. A nonzero saved
+/// capacity is the disk the guest already sized itself to, and the backend
+/// must report it unchanged. Every other field is read by the guest's driver
+/// once, at probe, and never again, so it must match the snapshot's either
+/// way. `writeback` is the exception: the driver sets it, so the snapshot's
+/// value stands whatever the backend reports.
+fn restored_config(
+    id: &str,
+    saved: VirtioBlockConfig,
+    backend: VirtioBlockConfig,
+) -> Result<RestoredConfig> {
+    let unused1 = |config: &VirtioBlockConfig| {
+        let [a, b, c] = config.unused1;
+        u64::from(u32::from_le_bytes([a, b, c, 0]))
+    };
+    let fields = [
+        (
+            "size_max",
+            u64::from(saved.size_max),
+            u64::from(backend.size_max),
+        ),
+        (
+            "seg_max",
+            u64::from(saved.seg_max),
+            u64::from(backend.seg_max),
+        ),
+        (
+            "geometry.cylinders",
+            u64::from(saved.geometry.cylinders),
+            u64::from(backend.geometry.cylinders),
+        ),
+        (
+            "geometry.heads",
+            u64::from(saved.geometry.heads),
+            u64::from(backend.geometry.heads),
+        ),
+        (
+            "geometry.sectors",
+            u64::from(saved.geometry.sectors),
+            u64::from(backend.geometry.sectors),
+        ),
+        (
+            "blk_size",
+            u64::from(saved.blk_size),
+            u64::from(backend.blk_size),
+        ),
+        (
+            "physical_block_exp",
+            u64::from(saved.physical_block_exp),
+            u64::from(backend.physical_block_exp),
+        ),
+        (
+            "alignment_offset",
+            u64::from(saved.alignment_offset),
+            u64::from(backend.alignment_offset),
+        ),
+        (
+            "min_io_size",
+            u64::from(saved.min_io_size),
+            u64::from(backend.min_io_size),
+        ),
+        (
+            "opt_io_size",
+            u64::from(saved.opt_io_size),
+            u64::from(backend.opt_io_size),
+        ),
+        ("unused", u64::from(saved.unused), u64::from(backend.unused)),
+        (
+            "num_queues",
+            u64::from(saved.num_queues),
+            u64::from(backend.num_queues),
+        ),
+        (
+            "max_discard_sectors",
+            u64::from(saved.max_discard_sectors),
+            u64::from(backend.max_discard_sectors),
+        ),
+        (
+            "max_discard_seg",
+            u64::from(saved.max_discard_seg),
+            u64::from(backend.max_discard_seg),
+        ),
+        (
+            "discard_sector_alignment",
+            u64::from(saved.discard_sector_alignment),
+            u64::from(backend.discard_sector_alignment),
+        ),
+        (
+            "max_write_zeroes_sectors",
+            u64::from(saved.max_write_zeroes_sectors),
+            u64::from(backend.max_write_zeroes_sectors),
+        ),
+        (
+            "max_write_zeroes_seg",
+            u64::from(saved.max_write_zeroes_seg),
+            u64::from(backend.max_write_zeroes_seg),
+        ),
+        (
+            "write_zeroes_may_unmap",
+            u64::from(saved.write_zeroes_may_unmap),
+            u64::from(backend.write_zeroes_may_unmap),
+        ),
+        ("unused1", unused1(&saved), unused1(&backend)),
+    ];
+    let saved_capacity = saved.capacity;
+    let backend_capacity = backend.capacity;
+    let capacity = (saved_capacity != 0).then_some(("capacity", saved_capacity, backend_capacity));
+    if let Some((field, saved, backend)) = capacity
+        .into_iter()
+        .chain(fields)
+        .find(|(_, saved, backend)| saved != backend)
+    {
+        return Err(Error::RestoredConfigMismatch {
+            id: id.to_owned(),
+            field,
+            saved,
+            backend,
+        });
+    }
+
+    let mut config = saved;
+    config.capacity = backend_capacity;
+    Ok(RestoredConfig {
+        config,
+        capacity_changed: saved_capacity != backend_capacity,
+    })
+}
+
 struct BackendReqHandler {
     vu: Arc<Mutex<VhostUserHandle>>,
     config: Arc<Mutex<VirtioBlockConfig>>,
@@ -104,6 +245,10 @@ pub struct Blk {
     config: Arc<Mutex<VirtioBlockConfig>>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
+    /// Restored with its backend's capacity in place of the snapshot's: the
+    /// guest is sent a config-change interrupt when the device first
+    /// resumes, so its driver reads the new capacity.
+    config_changed_at_restore: bool,
 }
 
 impl Blk {
@@ -134,7 +279,7 @@ impl Blk {
             acked_features,
             acked_protocol_features,
             vu_num_queues,
-            config,
+            restored,
             paused,
             vring_bases,
         ) = if let Some(state) = state {
@@ -149,12 +294,14 @@ impl Blk {
 
             vu.restore_state(&state)?;
 
+            let backend_config = get_block_config(&mut vu, num_queues)?;
+
             (
                 state.avail_features,
                 state.acked_features,
                 state.acked_protocol_features,
                 state.vu_num_queues,
-                state.config,
+                restored_config(&id, state.config, backend_config)?,
                 true,
                 state.vring_bases,
             )
@@ -220,7 +367,10 @@ impl Blk {
                 acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
                 acked_protocol_features,
                 num_queues,
-                config,
+                RestoredConfig {
+                    config,
+                    capacity_changed: false,
+                },
                 false,
                 None,
             )
@@ -247,9 +397,10 @@ impl Blk {
                 ..Default::default()
             },
             id,
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(Mutex::new(restored.config)),
             seccomp_action,
             exit_evt,
+            config_changed_at_restore: restored.capacity_changed,
         })
     }
 
@@ -407,7 +558,20 @@ impl Pausable for Blk {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.virtio_common.resume()?;
-        self.vu_common.resume()
+        self.vu_common.resume()?;
+        if self.config_changed_at_restore {
+            self.vu_common
+                .virtio_common
+                .trigger_interrupt(VirtioInterruptType::Config)
+                .map_err(|e| {
+                    MigratableError::Resume(anyhow!(
+                        "Failed to signal the config change of restored vhost-user-block {}: {e:?}",
+                        self.id
+                    ))
+                })?;
+            self.config_changed_at_restore = false;
+        }
+        Ok(())
     }
 }
 
@@ -478,5 +642,199 @@ mod tests {
     fn restore_does_not_require_access_platform_of_the_backend() {
         let acked = (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_F_ACCESS_PLATFORM);
         check_restored_features("base", acked, 1u64 << VIRTIO_BLK_F_FLUSH).unwrap();
+    }
+
+    /// A config as a backend reports it, with every field nonzero so a
+    /// mismatch in any one of them is visible.
+    fn backend_config(capacity: u64) -> VirtioBlockConfig {
+        VirtioBlockConfig {
+            capacity,
+            size_max: 65535,
+            seg_max: 126,
+            geometry: block::VirtioBlockGeometry {
+                cylinders: 16,
+                heads: 4,
+                sectors: 32,
+            },
+            blk_size: 512,
+            physical_block_exp: 3,
+            alignment_offset: 1,
+            min_io_size: 8,
+            opt_io_size: 64,
+            writeback: 0,
+            unused: 1,
+            num_queues: 2,
+            max_discard_sectors: 1 << 20,
+            max_discard_seg: 1,
+            discard_sector_alignment: 8,
+            max_write_zeroes_sectors: 1 << 20,
+            max_write_zeroes_seg: 1,
+            write_zeroes_may_unmap: 1,
+            unused1: [1, 2, 3],
+        }
+    }
+
+    /// A field a backend must report unchanged, with a change to it.
+    type FieldChange = (&'static str, fn(&mut VirtioBlockConfig));
+
+    /// Every field a backend must report unchanged.
+    const FIELD_CHANGES: &[FieldChange] = &[
+        ("size_max", |c| c.size_max += 1),
+        ("seg_max", |c| c.seg_max += 1),
+        ("geometry.cylinders", |c| c.geometry.cylinders += 1),
+        ("geometry.heads", |c| c.geometry.heads += 1),
+        ("geometry.sectors", |c| c.geometry.sectors += 1),
+        ("blk_size", |c| c.blk_size *= 8),
+        ("physical_block_exp", |c| c.physical_block_exp += 1),
+        ("alignment_offset", |c| c.alignment_offset += 1),
+        ("min_io_size", |c| c.min_io_size += 1),
+        ("opt_io_size", |c| c.opt_io_size += 1),
+        ("unused", |c| c.unused += 1),
+        ("num_queues", |c| c.num_queues += 1),
+        ("max_discard_sectors", |c| c.max_discard_sectors += 1),
+        ("max_discard_seg", |c| c.max_discard_seg += 1),
+        ("discard_sector_alignment", |c| {
+            c.discard_sector_alignment += 1;
+        }),
+        ("max_write_zeroes_sectors", |c| {
+            c.max_write_zeroes_sectors += 1;
+        }),
+        ("max_write_zeroes_seg", |c| c.max_write_zeroes_seg += 1),
+        ("write_zeroes_may_unmap", |c| c.write_zeroes_may_unmap = 0),
+        ("unused1", |c| c.unused1[2] += 1),
+    ];
+
+    fn assert_mismatch(
+        result: Result<RestoredConfig>,
+        want_field: &str,
+        want_saved: u64,
+        want_backend: u64,
+    ) {
+        match result {
+            Err(Error::RestoredConfigMismatch {
+                id,
+                field,
+                saved,
+                backend,
+            }) => {
+                assert_eq!(id, "scratch");
+                assert_eq!(field, want_field);
+                assert_eq!(saved, want_saved);
+                assert_eq!(backend, want_backend);
+            }
+            Err(other) => panic!("expected a mismatch on {want_field}, got {other:?}"),
+            Ok(_) => panic!("expected a mismatch on {want_field}, got a restored config"),
+        }
+    }
+
+    #[test]
+    fn a_placeholder_takes_the_backends_capacity() {
+        let mut saved = backend_config(0);
+        saved.writeback = 1;
+        let restored = restored_config("scratch", saved, backend_config(2048)).unwrap();
+        assert!(restored.capacity_changed);
+        assert_eq!({ restored.config.capacity }, 2048);
+        assert_eq!({ restored.config.writeback }, 1);
+        assert_eq!({ restored.config.seg_max }, 126);
+    }
+
+    #[test]
+    fn a_placeholder_on_an_empty_backend_has_no_config_change() {
+        let restored = restored_config("scratch", backend_config(0), backend_config(0)).unwrap();
+        assert!(!restored.capacity_changed);
+        assert_eq!({ restored.config.capacity }, 0);
+    }
+
+    #[test]
+    fn a_checkpoint_restores_on_a_backend_reporting_its_config() {
+        let mut saved = backend_config(2048);
+        saved.writeback = 1;
+        let restored = restored_config("scratch", saved, backend_config(2048)).unwrap();
+        assert!(!restored.capacity_changed);
+        assert_eq!({ restored.config.capacity }, 2048);
+        assert_eq!({ restored.config.writeback }, 1);
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_backend_of_another_capacity() {
+        assert_mismatch(
+            restored_config("scratch", backend_config(2048), backend_config(4096)),
+            "capacity",
+            2048,
+            4096,
+        );
+        assert_mismatch(
+            restored_config("scratch", backend_config(2048), backend_config(0)),
+            "capacity",
+            2048,
+            0,
+        );
+    }
+
+    #[test]
+    fn a_placeholder_refuses_a_backend_differing_in_any_other_field() {
+        for (field, change) in FIELD_CHANGES {
+            let mut backend = backend_config(2048);
+            change(&mut backend);
+            let result = restored_config("scratch", backend_config(0), backend);
+            let (saved, theirs) = field_values(field, &backend_config(0), &backend);
+            assert_mismatch(result, field, saved, theirs);
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_refuses_a_backend_differing_in_any_other_field() {
+        for (field, change) in FIELD_CHANGES {
+            let mut backend = backend_config(2048);
+            change(&mut backend);
+            let result = restored_config("scratch", backend_config(2048), backend);
+            let (saved, theirs) = field_values(field, &backend_config(2048), &backend);
+            assert_mismatch(result, field, saved, theirs);
+        }
+    }
+
+    #[test]
+    fn the_backends_writeback_is_not_compared() {
+        let mut backend = backend_config(2048);
+        backend.writeback = 1;
+        restored_config("scratch", backend_config(0), backend).unwrap();
+        restored_config("scratch", backend_config(2048), backend).unwrap();
+    }
+
+    /// The values of `field` in `saved` and `backend`, as a mismatch on it
+    /// names them.
+    fn field_values(
+        field: &str,
+        saved: &VirtioBlockConfig,
+        backend: &VirtioBlockConfig,
+    ) -> (u64, u64) {
+        let value = |c: &VirtioBlockConfig| -> u64 {
+            match field {
+                "size_max" => c.size_max.into(),
+                "seg_max" => c.seg_max.into(),
+                "geometry.cylinders" => c.geometry.cylinders.into(),
+                "geometry.heads" => c.geometry.heads.into(),
+                "geometry.sectors" => c.geometry.sectors.into(),
+                "blk_size" => c.blk_size.into(),
+                "physical_block_exp" => c.physical_block_exp.into(),
+                "alignment_offset" => c.alignment_offset.into(),
+                "min_io_size" => c.min_io_size.into(),
+                "opt_io_size" => c.opt_io_size.into(),
+                "unused" => c.unused.into(),
+                "num_queues" => c.num_queues.into(),
+                "max_discard_sectors" => c.max_discard_sectors.into(),
+                "max_discard_seg" => c.max_discard_seg.into(),
+                "discard_sector_alignment" => c.discard_sector_alignment.into(),
+                "max_write_zeroes_sectors" => c.max_write_zeroes_sectors.into(),
+                "max_write_zeroes_seg" => c.max_write_zeroes_seg.into(),
+                "write_zeroes_may_unmap" => c.write_zeroes_may_unmap.into(),
+                "unused1" => {
+                    let [a, b, c] = c.unused1;
+                    u32::from_le_bytes([a, b, c, 0]).into()
+                }
+                other => panic!("no field {other}"),
+            }
+        };
+        (value(saved), value(backend))
     }
 }
