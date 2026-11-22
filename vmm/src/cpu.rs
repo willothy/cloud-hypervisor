@@ -132,7 +132,21 @@ const VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD: usize = 4;
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Error creating vCPU")]
-    VcpuCreate(#[source] anyhow::Error),
+    VcpuCreate(#[source] hypervisor::HypervisorVmError),
+
+    #[error("Error decoding vCPU {id}'s saved state")]
+    VcpuStateDecode {
+        id: u32,
+        #[source]
+        source: MigratableError,
+    },
+
+    #[error("Error restoring vCPU {id}'s state")]
+    VcpuStateRestore {
+        id: u32,
+        #[source]
+        source: HypervisorCpuError,
+    },
 
     #[error("Error running vCPU")]
     VcpuRun(#[source] anyhow::Error),
@@ -522,7 +536,7 @@ impl Vcpu {
                 #[cfg(target_arch = "x86_64")]
                 msr_config_update,
             )
-            .map_err(|e| Error::VcpuCreate(e.into()))?;
+            .map_err(Error::VcpuCreate)?;
         // Initially the cpuid per vCPU is the one supported by this VM.
         Ok(Vcpu {
             vcpu,
@@ -708,19 +722,23 @@ impl Snapshottable for Vcpu {
 }
 
 impl Vcpu {
-    fn restore(&self, snapshot: &Snapshot) -> result::Result<(), MigratableError> {
-        let state: CpuState = snapshot.to_state().map_err(|e| {
-            MigratableError::Restore(anyhow!("Could not get vCPU state from snapshot {e:?}"))
-        })?;
+    fn restore(&self, snapshot: &Snapshot) -> Result<()> {
+        let state: CpuState = snapshot
+            .to_state()
+            .map_err(|source| Error::VcpuStateDecode {
+                id: self.id,
+                source,
+            })?;
 
         #[cfg(target_arch = "aarch64")]
-        self.finalize(state.pre_finalize_regs()).map_err(|e| {
-            MigratableError::Restore(anyhow!("Could not finalize vCPU state: {e:?}"))
-        })?;
+        self.finalize(state.pre_finalize_regs())?;
 
         self.vcpu
             .set_state(&state)
-            .map_err(|e| MigratableError::Restore(anyhow!("Could not set the vCPU state {e:?}")))
+            .map_err(|source| Error::VcpuStateRestore {
+                id: self.id,
+                source,
+            })
     }
 }
 
@@ -1169,8 +1187,7 @@ impl CpuManager {
                 },
                 VCPU_SERIALIZE_MAX_THREADS,
                 VCPU_SERIALIZE_MIN_CHUNKS_PER_THREAD,
-            )
-            .map_err(|e| Error::VcpuCreate(e.into()))?;
+            )?;
         }
 
         #[cfg(target_arch = "x86_64")]
