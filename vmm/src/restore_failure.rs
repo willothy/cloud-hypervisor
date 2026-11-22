@@ -24,6 +24,7 @@ use hypervisor::arch::x86::MsrValueCheck;
 use hypervisor::{HypervisorCpuError, HypervisorError, HypervisorVmError, KvmIoctl};
 #[cfg(target_arch = "x86_64")]
 use hypervisor::{IncompatibleVcpuState, MsrRefusal};
+use virtio_devices::vhost_user;
 use vm_migration::{MigratableError, UffdError};
 use vmm_sys_util::errno;
 
@@ -203,6 +204,12 @@ restore_sites! {
     CpuManager => "cpu-manager",
     /// Creating a device.
     DeviceCreate => "device-create",
+    /// Connecting to a restored vhost-user device's backend, which the
+    /// VMM's manager brings up before the restore.
+    VhostUserBackendConnect => "vhost-user-backend-connect",
+    /// A restored vhost-user device's backend doesn't offer a feature the
+    /// snapshot acked, or reports a config the snapshot's guest can't take.
+    VhostUserBackendMismatch => "vhost-user-backend-mismatch",
     /// A device's configuration is invalid.
     DeviceConfig => "device-config",
     /// A device's section of the snapshot doesn't decode.
@@ -322,12 +329,16 @@ impl RestoreSite {
             | RestoreSite::EventFdClone
             | RestoreSite::ConsoleSocketInUse
             | RestoreSite::DiskLock
-            | RestoreSite::VcpuThreads => Node,
+            | RestoreSite::VcpuThreads
+            | RestoreSite::VhostUserBackendConnect => Node,
 
+            // The backend is the node's, decided by comparing what it offers
+            // with what the snapshot needs.
             RestoreSite::CpuidCompatibility
             | RestoreSite::KvmExtensions
             | RestoreSite::UffdIoctls
-            | RestoreSite::HeldClockUnpaired => Incompatible,
+            | RestoreSite::HeldClockUnpaired
+            | RestoreSite::VhostUserBackendMismatch => Incompatible,
 
             RestoreSite::PageServerConnect | RestoreSite::Vmgenid | RestoreSite::Unexpected => {
                 Ambiguous
@@ -1038,7 +1049,6 @@ impl Cause {
             | DeviceManagerError::CreateVirtioRtc(_)
             | DeviceManagerError::CreateGenericVhostUser(_)
             | DeviceManagerError::CreateVirtioFs(_)
-            | DeviceManagerError::CreateVhostUserBlk(_)
             | DeviceManagerError::CreateVirtioPmem(_)
             | DeviceManagerError::CreateVdpa(_)
             | DeviceManagerError::CreateVirtioVsock(_)
@@ -1104,6 +1114,19 @@ impl Cause {
             | DeviceManagerError::RateLimiterGroupCreate(_)
             | DeviceManagerError::InvalidConsoleInfo
             | DeviceManagerError::DiskResize(_) => Cause::chain(RestoreSite::DeviceCreate, error),
+            DeviceManagerError::CreateVhostUserBlk(source) => match source {
+                vhost_user::Error::RestoreConnect { .. } => {
+                    Cause::at(RestoreSite::VhostUserBackendConnect)
+                }
+                vhost_user::Error::RestoredConfigMismatch { .. }
+                | vhost_user::Error::RestoredFeaturesUnsupported { .. }
+                | vhost_user::Error::UnsupportedProtocolFeatures(_) => {
+                    Cause::at(RestoreSite::VhostUserBackendMismatch)
+                }
+                // Every other failure to create a vhost-user-blk device,
+                // as for every other device.
+                _ => Cause::chain(RestoreSite::DeviceCreate, error),
+            },
             #[cfg(feature = "kvm")]
             DeviceManagerError::IommufdCreate(_) => Cause::chain(RestoreSite::DeviceCreate, error),
             #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -1319,11 +1342,13 @@ mod tests {
             | RestoreSite::EventFdClone
             | RestoreSite::ConsoleSocketInUse
             | RestoreSite::DiskLock
-            | RestoreSite::VcpuThreads => always(Node),
+            | RestoreSite::VcpuThreads
+            | RestoreSite::VhostUserBackendConnect => always(Node),
             RestoreSite::CpuidCompatibility
             | RestoreSite::KvmExtensions
             | RestoreSite::UffdIoctls
-            | RestoreSite::HeldClockUnpaired => always(Incompatible),
+            | RestoreSite::HeldClockUnpaired
+            | RestoreSite::VhostUserBackendMismatch => always(Incompatible),
             RestoreSite::PageServerConnect | RestoreSite::Vmgenid | RestoreSite::Unexpected => {
                 always(Ambiguous)
             }
@@ -1431,6 +1456,52 @@ mod tests {
                 assert_eq!(site.classify(evidence), kind, "{site} with {evidence:?}");
             }
         }
+    }
+
+    #[test]
+    fn test_restored_vhost_user_backend_faults_are_the_hosts() {
+        let blk = |source| VmError::DeviceManager(DeviceManagerError::CreateVhostUserBlk(source));
+        assert_eq!(
+            classified(blk(vhost_user::Error::RestoreConnect {
+                id: "base".to_owned(),
+                socket: "/vm/vblk-base.sock".to_owned(),
+                source: Box::new(vhost_user::Error::VhostUserConnectTimeout),
+            })),
+            (
+                RestoreSite::VhostUserBackendConnect,
+                RestoreKind::Node,
+                None,
+                None
+            )
+        );
+        for source in [
+            vhost_user::Error::RestoredConfigMismatch {
+                id: "scratch".to_owned(),
+                field: "capacity",
+                saved: 2048,
+                backend: 4096,
+            },
+            vhost_user::Error::RestoredFeaturesUnsupported {
+                id: "base".to_owned(),
+                missing: 1 << 5,
+            },
+            vhost_user::Error::UnsupportedProtocolFeatures(1 << 9),
+        ] {
+            assert_eq!(
+                classified(blk(source)),
+                (
+                    RestoreSite::VhostUserBackendMismatch,
+                    RestoreKind::Incompatible,
+                    None,
+                    None
+                )
+            );
+        }
+        assert_eq!(
+            classified(blk(vhost_user::Error::BadQueueNum)).0,
+            RestoreSite::DeviceCreate,
+            "another failure to create the device is still the device's"
+        );
     }
 
     #[test]
