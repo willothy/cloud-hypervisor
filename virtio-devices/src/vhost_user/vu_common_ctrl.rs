@@ -745,6 +745,12 @@ impl VhostUserHandle {
         }
     }
 
+    /// The virtio features the backend offered in reply to `GET_FEATURES`
+    /// when this connection was set up.
+    pub fn backend_features(&self) -> u64 {
+        self.backend_features
+    }
+
     pub fn socket_handle(&mut self) -> &mut Frontend {
         &mut self.vu
     }
