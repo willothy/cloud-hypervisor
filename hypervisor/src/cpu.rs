@@ -30,7 +30,9 @@ use crate::VcpuInit;
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::ExtendedReg;
 #[cfg(target_arch = "x86_64")]
-use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, msr_index};
+use crate::arch::x86::{
+    CpuIdEntry, FpuState, LapicState, MsrEntry, MsrValueCheck, SpecialRegisters, msr_index,
+};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
 use crate::{CpuState, HypervisorType, KvmIoctl, MpState, StandardRegisters};
@@ -412,8 +414,9 @@ pub enum MsrRefusal {
     /// refused the saved value: the host lacks a capability the value
     /// claims.
     FeatureValue,
-    /// The host lists the MSR, and refused the saved value.
-    Value,
+    /// The host lists the MSR, and refused the saved value for failing
+    /// what KVM checks a value of it against.
+    Value(MsrValueCheck),
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -422,7 +425,11 @@ impl fmt::Display for MsrRefusal {
         f.write_str(match self {
             MsrRefusal::NotListed => "the host doesn't support it",
             MsrRefusal::FeatureValue => "the host lacks a capability its value claims",
-            MsrRefusal::Value => "the host refused its value",
+            MsrRefusal::Value(MsrValueCheck::Host) => {
+                "the host refused its value, which KVM checks against what this host supports"
+            }
+            MsrRefusal::Value(MsrValueCheck::Content) => "the host refused its value as invalid",
+            MsrRefusal::Value(MsrValueCheck::Unexamined) => "the host refused its value",
         })
     }
 }

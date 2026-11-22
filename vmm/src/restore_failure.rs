@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::{fmt, io};
 
+#[cfg(target_arch = "x86_64")]
+use hypervisor::arch::x86::MsrValueCheck;
 use hypervisor::{HypervisorCpuError, HypervisorError, HypervisorVmError, KvmIoctl};
 #[cfg(target_arch = "x86_64")]
 use hypervisor::{IncompatibleVcpuState, MsrRefusal};
@@ -884,13 +886,16 @@ impl Cause {
             }
             #[cfg(target_arch = "x86_64")]
             HypervisorCpuError::RestoreMsr { refusal, .. } => match refusal {
-                MsrRefusal::NotListed | MsrRefusal::FeatureValue => {
+                MsrRefusal::NotListed
+                | MsrRefusal::FeatureValue
+                | MsrRefusal::Value(MsrValueCheck::Host) => {
                     Cause::host_lacks(RestoreSite::KvmSetMsrs)
                 }
-                MsrRefusal::Value => Cause {
+                MsrRefusal::Value(MsrValueCheck::Content) => Cause {
                     evidence: Evidence::Refused,
                     ..Cause::at(RestoreSite::KvmSetMsrs)
                 },
+                MsrRefusal::Value(MsrValueCheck::Unexamined) => Cause::at(RestoreSite::KvmSetMsrs),
             },
             #[cfg(target_arch = "x86_64")]
             HypervisorCpuError::IncompatibleVcpuState(incompatible) => {
@@ -1522,6 +1527,8 @@ mod tests {
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_host_capability_checks_and_refused_msrs_are_classified() {
+        use hypervisor::arch::x86::msr_index::MSR_K7_HWCR;
+
         assert_eq!(
             classified(vcpu_state(HypervisorCpuError::IncompatibleVcpuState(
                 IncompatibleVcpuState::Cr4 { bits: 1 << 12 }
@@ -1557,7 +1564,24 @@ mod tests {
         };
         assert_eq!(msr(MsrRefusal::NotListed), RestoreKind::Incompatible);
         assert_eq!(msr(MsrRefusal::FeatureValue), RestoreKind::Incompatible);
-        assert_eq!(msr(MsrRefusal::Value), RestoreKind::Snapshot);
+        assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::Host)),
+            RestoreKind::Incompatible
+        );
+        assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::Content)),
+            RestoreKind::Snapshot
+        );
+        assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::Unexamined)),
+            RestoreKind::Ambiguous
+        );
+        // A refused HWCR value is this host's kernel taking fewer bits than
+        // the capture's did.
+        assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::of(MSR_K7_HWCR))),
+            RestoreKind::Incompatible
+        );
     }
 
     #[test]
