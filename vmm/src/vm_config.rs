@@ -51,6 +51,10 @@ pub enum CoreScheduling {
     Vm, // All vCPUs have the same cookie so can share a core
     Vcpu, // Each vCPU has a unique cookie so can't share a core
     Off,
+    /// The vCPUs hold their tenant's cookie, given to vcpu0 from outside the
+    /// VMM: they wait at a gate until `vm.release-vcpus` (see
+    /// [`crate::cpu::VcpuGate`]), then take vcpu0's cookie and run.
+    Tenant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

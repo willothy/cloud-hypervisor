@@ -717,6 +717,7 @@ impl FromStr for CoreScheduling {
             "vm" => Ok(CoreScheduling::Vm),
             "vcpu" => Ok(CoreScheduling::Vcpu),
             "off" => Ok(CoreScheduling::Off),
+            "tenant" => Ok(CoreScheduling::Tenant),
             _ => Err(ParseCoreSchedulingError::InvalidValue(s.to_owned())),
         }
     }

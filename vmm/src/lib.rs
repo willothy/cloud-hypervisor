@@ -2701,6 +2701,14 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_release_vcpus(&mut self) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref vm) => vm.release_vcpus(),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
     fn vm_settle_memory(&mut self) -> result::Result<Option<Vec<u8>>, VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -2959,11 +2967,18 @@ impl RequestHandler for Vmm {
             VmOwnership::Migration { .. } => unreachable!("migration path is handled above"),
         };
 
+        let vcpu_gate = match &self.vm {
+            VmOwnership::Owned(vm) => vm.vcpu_gate_status(),
+            VmOwnership::None => None,
+            VmOwnership::Migration { .. } => unreachable!("migration path is handled above"),
+        };
+
         Ok(VmInfoResponse {
             config: Box::new(vm_config),
             state,
             memory_actual_size,
             device_tree,
+            vcpu_gate,
         })
     }
 

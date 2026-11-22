@@ -32,8 +32,9 @@ use crate::api::{
     AddDisk, ApiError, ApiRequest, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet,
     VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot, VmCancelMigration,
     VmCaptureDirtyMemory, VmCounters, VmDelete, VmDirtyPageCount, VmLiveCheckpoint, VmNmi, VmPause,
-    VmPowerButton, VmReboot, VmReceiveMigration, VmRemoveDevice, VmResize, VmResizeDisk,
-    VmResizeZone, VmRestore, VmResume, VmSendMigration, VmSettleMemory, VmShutdown, VmSnapshot,
+    VmPowerButton, VmReboot, VmReceiveMigration, VmReleaseVcpus, VmRemoveDevice, VmResize,
+    VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmSettleMemory, VmShutdown,
+    VmSnapshot,
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
@@ -336,6 +337,10 @@ pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
     r.routes.insert(
         endpoint!("/vm.cancel-migration"),
         Box::new(VmActionHandler::new(&VmCancelMigration)),
+    );
+    r.routes.insert(
+        endpoint!("/vm.release-vcpus"),
+        Box::new(VmActionHandler::new(&VmReleaseVcpus)),
     );
     r.routes.insert(
         endpoint!("/vm.settle-memory"),

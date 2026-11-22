@@ -252,6 +252,9 @@ pub enum Error {
     #[error("Cannot settle guest memory")]
     SettleMemory(#[source] MemoryManagerError),
 
+    #[error("Cannot release the vCPUs from their core-scheduling gate")]
+    ReleaseVcpus(#[source] cpu::Error),
+
     #[error("Invalid restore source URL")]
     InvalidRestoreSourceUrl,
 
@@ -3128,6 +3131,24 @@ impl Vm {
             .unwrap()
             .settle()
             .map_err(Error::SettleMemory)
+    }
+
+    /// Release a `Tenant` VM's vCPUs from their core-scheduling gate: see
+    /// [`cpu::VcpuGate::release_vcpus`]. The CPU manager's lock is not held
+    /// while the vCPUs take the cookie.
+    pub fn release_vcpus(&self) -> Result<()> {
+        let gate = self
+            .cpu_manager
+            .lock()
+            .unwrap()
+            .vcpu_gate()
+            .map_err(Error::ReleaseVcpus)?;
+        gate.release_vcpus().map_err(Error::ReleaseVcpus)
+    }
+
+    /// Where a `Tenant` VM's vCPUs stand against their core-scheduling gate.
+    pub fn vcpu_gate_status(&self) -> Option<cpu::VcpuGateStatus> {
+        self.cpu_manager.lock().unwrap().vcpu_gate_status()
     }
 
     /// The guest-memory ranges the devices (vhost-user backends, via their
