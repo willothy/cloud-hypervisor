@@ -10,6 +10,8 @@
 //
 //
 
+#[cfg(target_arch = "x86_64")]
+use std::fmt;
 #[cfg(feature = "tdx")]
 use std::io;
 use std::result;
@@ -102,10 +104,11 @@ pub enum HypervisorCpuError {
     #[error("Failed to set Msr entries")]
     SetMsrEntries(#[source] anyhow::Error),
     ///
-    /// Restoring required feature MSR
+    /// KVM refused to set an MSR a vCPU's saved state carries
     ///
-    #[error("Failed to restore required feature MSR")]
-    RestoreFeatureMsr,
+    #[cfg(target_arch = "x86_64")]
+    #[error("Failed to restore MSR {index:#x}: {refusal}")]
+    RestoreMsr { index: u32, refusal: MsrRefusal },
     ///
     /// A KVM ioctl restoring part of a vCPU's saved state failed
     ///
@@ -347,6 +350,31 @@ pub enum HypervisorCpuError {
     Nmi(#[source] anyhow::Error),
     #[error("Failed to get nested guest state")]
     GetNestedState(#[source] anyhow::Error),
+}
+
+/// Why KVM refused to set an MSR a vCPU's saved state carries.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MsrRefusal {
+    /// The host doesn't list the MSR as one KVM saves or emulates.
+    NotListed,
+    /// The host lists the MSR as one describing what it supports, and
+    /// refused the saved value: the host lacks a capability the value
+    /// claims.
+    FeatureValue,
+    /// The host lists the MSR, and refused the saved value.
+    Value,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl fmt::Display for MsrRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            MsrRefusal::NotListed => "the host doesn't support it",
+            MsrRefusal::FeatureValue => "the host lacks a capability its value claims",
+            MsrRefusal::Value => "the host refused its value",
+        })
+    }
 }
 
 #[derive(Debug)]

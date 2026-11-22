@@ -94,9 +94,11 @@ use crate::ClockData;
 use crate::KvmIoctl;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
-    CpuIdEntry, FpuState, LapicState, MTRR_ENABLE, MTRR_MEM_TYPE_WB, MTRR_MSR_INDICES, MsrEntry,
-    NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
+    CpuIdEntry, FpuState, LapicState, MTRR_ENABLE, MTRR_MEM_TYPE_WB, MTRR_MSR_INDICES, MsrClass,
+    MsrEntry, NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::cpu::MsrRefusal;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::{CapturedClock, ClockRestoreMode};
 use crate::{
@@ -189,6 +191,16 @@ const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 #[cfg(target_arch = "x86_64")]
 const INVALID_GPA: u64 = u64::MAX;
+
+/// The MSRs of the Hyper-V synthetic interrupt controller, saved with a
+/// vCPU's state when the controller is emulated.
+#[cfg(target_arch = "x86_64")]
+const HYPERV_SYNIC_MSRS: [u32; 31] = [
+    0x40000020, 0x40000021, 0x40000080, 0x40000081, 0x40000082, 0x40000083, 0x40000084, 0x40000090,
+    0x40000091, 0x40000092, 0x40000093, 0x40000094, 0x40000095, 0x40000096, 0x40000097, 0x40000098,
+    0x40000099, 0x4000009a, 0x4000009b, 0x4000009c, 0x4000009d, 0x4000009e, 0x4000009f, 0x400000b0,
+    0x400000b1, 0x400000b2, 0x400000b3, 0x400000b4, 0x400000b5, 0x400000b6, 0x400000b7,
+];
 
 /// How far apart kvmclock and the guest TSC may be sampled and still count as
 /// one instant. A guest's clocksource watchdog compares the two every half
@@ -673,6 +685,9 @@ pub struct KvmVm {
     fd: Arc<VmFd>,
     #[cfg(target_arch = "x86_64")]
     msrs: Vec<MsrEntry>,
+    /// The system KVM handle, which answers what the host supports.
+    #[cfg(target_arch = "x86_64")]
+    kvm: Arc<Kvm>,
     #[cfg(feature = "sev_snp")]
     sev_fd: Option<x86_64::sev::SevFd>,
     #[cfg(feature = "sev_snp")]
@@ -1113,6 +1128,8 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
+            #[cfg(target_arch = "x86_64")]
+            kvm: Arc::clone(&self.kvm),
             #[cfg(feature = "sev_snp")]
             vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
@@ -1849,17 +1866,17 @@ fn tdx_command(
 
 /// Wrapper over KVM system ioctls.
 pub struct KvmHypervisor {
-    kvm: Kvm,
+    kvm: Arc<Kvm>,
 }
 
 impl KvmHypervisor {
     #[cfg(target_arch = "x86_64")]
     ///
-    /// Retrieve the list of MSRs supported by the hypervisor.
+    /// Retrieve the list of MSRs supported by the hypervisor `kvm` is a
+    /// handle on.
     ///
-    fn get_msr_list(&self) -> hypervisor::Result<MsrList> {
-        let mut indices = self
-            .kvm
+    fn msr_list(kvm: &Kvm) -> hypervisor::Result<MsrList> {
+        let mut indices = kvm
             .get_msr_index_list()
             .map_err(|e| hypervisor::HypervisorError::GetMsrList(e.into()))?
             .as_slice()
@@ -1896,7 +1913,9 @@ impl KvmHypervisor {
             return Err(hypervisor::HypervisorError::IncompatibleApiVersion);
         }
 
-        Ok(Arc::new(KvmHypervisor { kvm: kvm_obj }))
+        Ok(Arc::new(KvmHypervisor {
+            kvm: Arc::new(kvm_obj),
+        }))
     }
 
     /// Check if the hypervisor is available
@@ -2023,7 +2042,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
         #[cfg(target_arch = "x86_64")]
         {
-            let msr_list = self.get_msr_list()?;
+            let msr_list = Self::msr_list(&self.kvm)?;
             let num_msrs = msr_list.as_fam_struct_ref().nmsrs as usize;
             let mut msrs = vec![
                 MsrEntry {
@@ -2069,6 +2088,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             Ok(Arc::new(KvmVm {
                 fd: Arc::new(fd),
                 msrs,
+                kvm: Arc::clone(&self.kvm),
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 #[cfg(feature = "sev_snp")]
                 sev_fd,
@@ -2148,7 +2168,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
 
     #[cfg(target_arch = "x86_64")]
     fn get_msr_index_list(&self) -> hypervisor::Result<Vec<u32>> {
-        self.get_msr_list().map(|list| list.as_slice().to_vec())
+        Self::msr_list(&self.kvm).map(|list| list.as_slice().to_vec())
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -2215,6 +2235,9 @@ pub struct KvmVcpu {
     xsave_size: i32,
     #[cfg(target_arch = "x86_64")]
     has_xcrs: bool,
+    /// The system KVM handle, which answers what the host supports.
+    #[cfg(target_arch = "x86_64")]
+    kvm: Arc<Kvm>,
     #[cfg(feature = "sev_snp")]
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
@@ -3475,14 +3498,7 @@ impl cpu::Vcpu for KvmVcpu {
         // emulated.
         let hyperv_synic = self.hyperv_synic.load(Ordering::Acquire);
         if hyperv_synic {
-            let hyperv_synic_msrs = vec![
-                0x40000020, 0x40000021, 0x40000080, 0x40000081, 0x40000082, 0x40000083, 0x40000084,
-                0x40000090, 0x40000091, 0x40000092, 0x40000093, 0x40000094, 0x40000095, 0x40000096,
-                0x40000097, 0x40000098, 0x40000099, 0x4000009a, 0x4000009b, 0x4000009c, 0x4000009d,
-                0x4000009e, 0x4000009f, 0x400000b0, 0x400000b1, 0x400000b2, 0x400000b3, 0x400000b4,
-                0x400000b5, 0x400000b6, 0x400000b7,
-            ];
-            for index in hyperv_synic_msrs {
+            for index in HYPERV_SYNIC_MSRS {
                 let msr = kvm_msr_entry {
                     index,
                     ..Default::default()
@@ -3774,11 +3790,9 @@ impl cpu::Vcpu for KvmVcpu {
                 .map_err(failed(KvmIoctl::EnableCap))?;
         }
 
-        // Try to set all MSRs previously stored.
-        // If the number of MSRs set from SET_MSRS is different from the
-        // expected amount, we fallback onto a slower method by setting MSRs
-        // by chunks. This is the only way to make sure we try to set as many
-        // MSRs as possible, even if some MSRs are not supported.
+        // KVM_SET_MSRS stops at the first entry KVM refuses and returns how
+        // many it set before it, so set the saved MSRs a run at a time,
+        // deciding about each refused one before going on past it.
         let set_msrs = |msrs: &[MsrEntry]| -> cpu::Result<usize> {
             let msrs: Vec<kvm_msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
             let msrs = MsrEntries::from_entries(&msrs)
@@ -3786,39 +3800,14 @@ impl cpu::Vcpu for KvmVcpu {
                 .map_err(cpu::HypervisorCpuError::MalformedVcpuState)?;
             self.fd.set_msrs(&msrs).map_err(failed(KvmIoctl::SetMsrs))
         };
-        let expected_num_msrs = state.msrs.len();
-        let num_msrs = set_msrs(&state.msrs)?;
-        if num_msrs != expected_num_msrs {
-            let mut faulty_msr_index = num_msrs;
-            let mut required_feature_msr_not_set = false;
-            loop {
-                let msr_address = state.msrs[faulty_msr_index].index;
-                warn!("Detected faulty MSR {msr_address:#x} while setting MSRs");
-
-                if self.feature_msrs.iter().any(|msr| msr.index == msr_address) {
-                    error!(
-                        "Unable to set feature MSR {msr_address:#x}, MSR value={}",
-                        state.msrs[faulty_msr_index].data
-                    );
-                    required_feature_msr_not_set = true;
-                }
-
-                // Skip the first bad MSR
-                let start_pos = faulty_msr_index + 1;
-
-                let sub_msr_entries = &state.msrs[start_pos..];
-
-                let num_msrs = set_msrs(sub_msr_entries)?;
-
-                if num_msrs == sub_msr_entries.len() {
-                    break;
-                }
-
-                faulty_msr_index = start_pos + num_msrs;
-            }
-            if required_feature_msr_not_set {
-                return Err(cpu::HypervisorCpuError::RestoreFeatureMsr);
-            }
+        let mut pending = state.msrs.as_slice();
+        loop {
+            let set = set_msrs(pending)?;
+            let Some(refused) = pending.get(set) else {
+                break;
+            };
+            self.accept_refused_msr(refused, state.hyperv_synic)?;
+            pending = &pending[set + 1..];
         }
 
         if let Some(nested_state) = state.nested_state {
@@ -4259,6 +4248,54 @@ impl KvmVcpu {
 impl KvmVcpu {
     #[cfg(target_arch = "x86_64")]
     ///
+    /// Decides whether a vCPU state restore can go on without `msr`, which
+    /// KVM refused to set.
+    ///
+    /// A performance-monitoring or machine-check MSR only records what the
+    /// guest observed, so the restore goes on without it, with a warning
+    /// naming it. Any other MSR is state the guest runs with, and the
+    /// restore fails, saying whether this host lists the MSR at all, lists
+    /// it as one describing a host capability, or lists it and refused its
+    /// value. `hyperv_synic` says whether the state being restored has the
+    /// Hyper-V synthetic interrupt controller enabled, whose MSRs KVM
+    /// handles without listing them.
+    ///
+    fn accept_refused_msr(&self, msr: &MsrEntry, hyperv_synic: bool) -> cpu::Result<()> {
+        let class = MsrClass::of(msr.index);
+        if class != MsrClass::Architectural {
+            warn!(
+                "Restoring the vCPU without MSR {:#x}, a {class} MSR KVM refused to set",
+                msr.index
+            );
+            return Ok(());
+        }
+
+        let listed = KvmHypervisor::msr_list(&self.kvm)
+            .map_err(|e| cpu::HypervisorCpuError::GetMsrEntries(e.into()))?
+            .as_slice()
+            .contains(&msr.index)
+            || (hyperv_synic && HYPERV_SYNIC_MSRS.contains(&msr.index));
+        let refusal = if !listed {
+            MsrRefusal::NotListed
+        } else if self
+            .kvm
+            .get_msr_feature_index_list()
+            .map_err(|e| cpu::HypervisorCpuError::GetMsrEntries(e.into()))?
+            .as_slice()
+            .contains(&msr.index)
+        {
+            MsrRefusal::FeatureValue
+        } else {
+            MsrRefusal::Value
+        };
+        Err(cpu::HypervisorCpuError::RestoreMsr {
+            index: msr.index,
+            refusal,
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
     /// Enables the Hyper-V synthetic interrupt controller on this vCPU.
     ///
     fn enable_hyperv_synic_cap(&self) -> result::Result<(), errno::Error> {
@@ -4482,6 +4519,8 @@ mod tests {
             xsave_size: 0,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: false,
+            #[cfg(target_arch = "x86_64")]
+            kvm: Arc::new(Kvm::new().unwrap()),
             vm_fd,
             memory_slots: slots,
             memory_conversion_handler: Arc::new(OnceLock::new()),

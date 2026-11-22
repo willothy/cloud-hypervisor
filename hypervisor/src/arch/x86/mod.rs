@@ -309,6 +309,67 @@ pub struct MsrEntry {
     pub data: u64,
 }
 
+/// What an MSR holds, as far as restoring a vCPU without it goes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MsrClass {
+    /// A performance-monitoring counter, event select, or counter control
+    /// or status register: what it holds is a count of events the guest
+    /// observed, not state the guest's execution depends on.
+    PerformanceMonitoring,
+    /// A machine-check capability, control, status or bank register: what
+    /// it holds is the record of hardware errors reported to the guest.
+    MachineCheck,
+    /// Any other MSR, which holds state the guest executes with, such as
+    /// its system-call entry points, memory types, timers, paravirtual
+    /// clock or speculation controls.
+    Architectural,
+}
+
+impl MsrClass {
+    /// The class of the MSR at `index`.
+    ///
+    /// The ranges cover every counter KVM can expose: up to eight general
+    /// purpose and four fixed counters on Intel, and the legacy four and the
+    /// six extended counters on AMD, and up to 32 machine-check banks. An
+    /// MSR is architectural unless it is listed here.
+    pub fn of(index: u32) -> Self {
+        match index {
+            // IA32_PMCx, IA32_PERFEVTSELx, the fixed counters and their
+            // control, the global status, control and overflow registers,
+            // the full-width IA32_A_PMCx, PEBS and the debug store area.
+            0xc1..=0xc8
+            | 0x186..=0x18d
+            | 0x309..=0x30c
+            | 0x38d..=0x391
+            | 0x3f1..=0x3f2
+            | 0x4c1..=0x4c8
+            | 0x600
+            // AMD's legacy and extended performance counters and selects,
+            // and the PerfMonV2 global registers.
+            | 0xc0010000..=0xc0010007
+            | 0xc0010200..=0xc001020b
+            | 0xc0000300..=0xc0000303 => MsrClass::PerformanceMonitoring,
+            // IA32_MCG_CAP, IA32_MCG_STATUS, IA32_MCG_CTL, IA32_MCG_EXT_CTL,
+            // the banks' IA32_MCi_CTL2 and their CTL, STATUS, ADDR and MISC.
+            msr_index::MSR_IA32_MCG_CAP..=msr_index::MSR_IA32_MCG_CTL
+            | msr_index::MSR_IA32_MCG_EXT_CTL
+            | 0x280..=0x29f
+            | 0x400..=0x47f => MsrClass::MachineCheck,
+            _ => MsrClass::Architectural,
+        }
+    }
+}
+
+impl fmt::Display for MsrClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            MsrClass::PerformanceMonitoring => "performance-monitoring",
+            MsrClass::MachineCheck => "machine-check",
+            MsrClass::Architectural => "architectural",
+        })
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VcpuMsrConfigUpdate {
     pub feature_msrs: Vec<MsrEntry>,
@@ -412,4 +473,45 @@ pub enum AmxGuestSupportError {
     /// The request to enable AMX related state components for guests failed.
     #[error("Failed to enable AMX tile state components for guests: errno={errno}")]
     AmxGuestTileRequest { errno: i64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_msr_class_tolerates_only_counters_and_machine_checks() {
+        for index in [
+            0xc1, 0xc8, 0x186, 0x18d, 0x309, 0x30c, 0x38d, 0x38f, 0x391, 0x3f1, 0x4c1, 0x600,
+            0xc0010000, 0xc0010007, 0xc0010200, 0xc001020b, 0xc0000300, 0xc0000303,
+        ] {
+            assert_eq!(
+                MsrClass::of(index),
+                MsrClass::PerformanceMonitoring,
+                "{index:#x}"
+            );
+        }
+        for index in [0x179, 0x17a, 0x17b, 0x4d0, 0x280, 0x29f, 0x400, 0x47f] {
+            assert_eq!(MsrClass::of(index), MsrClass::MachineCheck, "{index:#x}");
+        }
+        for index in [
+            msr_index::MSR_IA32_TSC,
+            msr_index::MSR_IA32_SYSENTER_CS,
+            msr_index::MSR_IA32_CR_PAT,
+            msr_index::MSR_IA32_MISC_ENABLE,
+            msr_index::MSR_IA32_TSC_DEADLINE,
+            msr_index::MSR_EFER,
+            msr_index::MSR_LSTAR,
+            msr_index::MSR_KERNEL_GS_BASE,
+            msr_index::MSR_TSC_AUX,
+            msr_index::MSR_MTRRdefType,
+            0x48,       // IA32_SPEC_CTRL
+            0x1d9,      // IA32_DEBUGCTL
+            0x4b564d01, // MSR_KVM_SYSTEM_TIME_NEW
+            0xc0010008, // past the legacy AMD counters
+            0x480,      // past the last machine-check bank
+        ] {
+            assert_eq!(MsrClass::of(index), MsrClass::Architectural, "{index:#x}");
+        }
+    }
 }
