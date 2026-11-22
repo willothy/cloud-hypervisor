@@ -579,6 +579,7 @@ impl Cause {
             | VmError::DirtyPageCount(_)
             | VmError::LiveCheckpoint(_)
             | VmError::SettleMemory(_)
+            | VmError::ReleaseVcpus(_)
             | VmError::SerializeJson(_)
             | VmError::CreateSeccompFilter(_)
             | VmError::ApplySeccompFilter(_)
@@ -828,6 +829,7 @@ impl Cause {
             | CpuError::VcpuPendingRemovedVcpu
             | CpuError::ThreadCleanup(_)
             | CpuError::SignalAcknowledgeTimeout
+            | CpuError::VcpuGate(_)
             | CpuError::CreateSeccompFilter(_)
             | CpuError::ApplySeccompFilter(_) => Cause::at(RestoreSite::Unexpected),
             #[cfg(target_arch = "aarch64")]
