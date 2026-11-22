@@ -746,7 +746,6 @@ impl Cause {
             | MemoryManagerError::InvalidMemoryPath(_)
             | MemoryManagerError::InvalidResizeWithMemoryZones
             | MemoryManagerError::HotplugWhileDemandPaged
-            | MemoryManagerError::HotplugWhileBackendsRelayed
             | MemoryManagerError::SettleWithoutFaultSession
             | MemoryManagerError::InvalidResizeBelowBootSize(..)
             | MemoryManagerError::InvalidSharedMemoryZoneWithHostNuma
