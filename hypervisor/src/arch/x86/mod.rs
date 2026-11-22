@@ -379,6 +379,122 @@ impl fmt::Display for MsrClass {
     }
 }
 
+/// What KVM checks a saved value of an architectural MSR against when it
+/// refuses to set it, and so what the refusal says about the snapshot.
+///
+/// Read from the `KVM_SET_MSRS` paths of Linux v6.18: `__kvm_set_msr()` and
+/// `kvm_set_msr_common()` in `arch/x86/kvm/x86.c`, `vmx_set_msr()`,
+/// `svm_set_msr()`, and the Hyper-V, MTRR and PMU handlers they call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MsrValueCheck {
+    /// What this host's processor or kernel supports: its features, its
+    /// paging levels, its kernel configuration, or the bits KVM's own
+    /// emulation accepts. A value a capture held on another host can be
+    /// refused here, so the refusal is the host's.
+    Host,
+    /// Only what the architecture, KVM's ABI or the vCPU's own saved state
+    /// lets the MSR hold. No capture holds a value refused here, so the
+    /// refusal is the snapshot's.
+    Content,
+    /// Not established from KVM's source: an MSR KVM v6.18 doesn't save or
+    /// emulate, or one added since.
+    Unexamined,
+}
+
+impl MsrValueCheck {
+    /// What KVM checks a value of the architectural MSR at `index` against.
+    pub fn of(index: u32) -> Self {
+        match index {
+            // IA32_FEATURE_CONTROL: the bits the kernel supports
+            // (is_vmx_feature_control_msr_valid()). IA32_SMBASE: whether the
+            // kernel is built with SMM. IA32_SPEC_CTRL and IA32_TSX_CTRL:
+            // whether this processor takes the value. IA32_DEBUGCTL: the
+            // bits this processor's features allow
+            // (vmx_get_supported_debugctl()). The LBR records: whether this
+            // processor's LBR format is the guest's. IA32_BNDCFGS: whether
+            // this host has MPX. XFD, XFD_ERR and XSS: the state components
+            // this host supports. TSC_AUX: whether this host switches it.
+            // The PT trace MSRs: whether the kernel runs PT in host-guest
+            // mode, and this processor's PT capabilities.
+            msr_index::MSR_IA32_FEATURE_CONTROL
+            | msr_index::MSR_IA32_SMBASE
+            | 0x48 // IA32_SPEC_CTRL
+            | 0x122 // IA32_TSX_CTRL
+            | msr_index::MSR_IA32_DEBUGCTLMSR
+            | msr_index::MSR_IA32_LASTBRANCHFROMIP..=msr_index::MSR_IA32_LASTINTTOIP
+            | msr_index::MSR_IA32_BNDCFGS
+            | 0x1c4 // IA32_XFD
+            | 0x1c5 // IA32_XFD_ERR
+            | msr_index::MSR_IA32_XSS
+            | msr_index::MSR_TSC_AUX
+            | 0x560..=0x561 // IA32_RTIT_OUTPUT_BASE, IA32_RTIT_OUTPUT_MASK_PTRS
+            | msr_index::MSR_IA32_RTIT_CTL..=0x572 // IA32_RTIT_STATUS, IA32_RTIT_CR3_MATCH
+            | 0x580..=msr_index::MSR_IA32_RTIT_ADDR3_B
+            // MSRs holding linear addresses, which KVM checks for
+            // canonicality at this host's paging levels, not the guest's
+            // (is_noncanonical_address() in arch/x86/kvm/x86.h), so a value
+            // canonical on a host with 5-level paging is refused on one
+            // without: LSTAR, CSTAR and KERNEL_GS_BASE, and CET's U_CET,
+            // S_CET, PL0-3_SSP and INTERRUPT_SSP_TABLE_ADDR, which KVM also
+            // takes only when it grants the guest shadow stacks or IBT.
+            | msr_index::MSR_LSTAR
+            | msr_index::MSR_CSTAR
+            | msr_index::MSR_KERNEL_GS_BASE
+            | 0x6a0 // IA32_U_CET
+            | 0x6a2 // IA32_S_CET
+            | 0x6a4..=0x6a8 // IA32_PL0-3_SSP, IA32_INTERRUPT_SSP_TABLE_ADDR
+            // MSR_KVM_STEAL_TIME: whether the kernel accounts scheduling
+            // statistics (sched_info_on()). TSC_RATIO: whether KVM grants
+            // the guest TSC scaling on this host. HWCR: the bits KVM's
+            // emulation accepts, which differ between kernels.
+            | 0x4b564d03 // MSR_KVM_STEAL_TIME
+            | msr_index::MSR_AMD64_TSC_RATIO
+            | msr_index::MSR_K7_HWCR
+            // HV_X64_MSR_VP_INDEX: below the kernel's KVM_MAX_VCPUS.
+            | 0x40000002 => MsrValueCheck::Host,
+            // SYSENTER_CS, _ESP and _EIP, which KVM never refuses (it makes
+            // the addresses canonical), STAR and SFMASK, the TSC, TSC_ADJUST
+            // and TSC_DEADLINE, which KVM never refuses, PAT and the MTRRs,
+            // whose memory types and reserved bits are architectural and
+            // whose address bits are the guest's, MISC_ENABLE, POWER_CTL,
+            // MISC_FEATURES_ENABLES, UMWAIT_CONTROL, VM_HSAVE_PA and
+            // VIRT_SPEC_CTRL, whose reserved bits are fixed.
+            msr_index::MSR_IA32_SYSENTER_CS..=msr_index::MSR_IA32_SYSENTER_EIP
+            | msr_index::MSR_STAR
+            | msr_index::MSR_SYSCALL_MASK
+            | msr_index::MSR_IA32_TSC
+            | msr_index::MSR_IA32_TSC_ADJUST
+            | msr_index::MSR_IA32_TSC_DEADLINE
+            | msr_index::MSR_IA32_CR_PAT
+            | 0x200..=0x20f // IA32_MTRR_PHYSBASE0-PHYSMASK7, KVM's eight
+            | 0x250 // IA32_MTRR_FIX64K_00000
+            | 0x258..=0x259 // IA32_MTRR_FIX16K_80000, _A0000
+            | 0x268..=0x26f // IA32_MTRR_FIX4K_C0000-F8000
+            | msr_index::MSR_MTRRdefType
+            | msr_index::MSR_IA32_MISC_ENABLE
+            | msr_index::MSR_IA32_POWER_CTL
+            | 0x140 // MSR_MISC_FEATURES_ENABLES
+            | 0xe1 // IA32_UMWAIT_CONTROL
+            | msr_index::MSR_VM_HSAVE_PA
+            | 0xc001011f // MSR_AMD64_VIRT_SPEC_CTRL
+            // KVM's paravirtual MSRs other than steal time: their reserved
+            // bits are KVM's ABI, and their addresses must lie in the
+            // guest's memory.
+            | 0x11 // MSR_KVM_WALL_CLOCK
+            | 0x12 // MSR_KVM_SYSTEM_TIME
+            | 0x4b564d00..=0x4b564d02 // MSR_KVM_WALL_CLOCK_NEW, _SYSTEM_TIME_NEW, _ASYNC_PF_EN
+            | 0x4b564d04..=0x4b564d07 // MSR_KVM_PV_EOI_EN, _POLL_CONTROL, _ASYNC_PF_INT, _ASYNC_PF_ACK
+            // The Hyper-V MSRs other than the VP index: KVM takes what the
+            // host sets, refusing only values the Hyper-V ABI reserves,
+            // addresses outside the guest's memory, and SynIC state the
+            // checked SynIC capability already covers.
+            | 0x40000000..=0x40000001
+            | 0x40000003..=0x400001ff => MsrValueCheck::Content,
+            _ => MsrValueCheck::Unexamined,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct VcpuMsrConfigUpdate {
     pub feature_msrs: Vec<MsrEntry>,
@@ -530,5 +646,24 @@ mod tests {
         ] {
             assert_eq!(MsrClass::of(index), MsrClass::Architectural, "{index:#x}");
         }
+    }
+
+    #[test]
+    fn test_msr_value_check_tells_host_limits_from_invalid_content() {
+        // KVM's emulation accepts only bits 18 and 24 of HWCR, which differ
+        // between kernels, and IA32_SPEC_CTRL takes what this processor
+        // takes.
+        assert_eq!(
+            MsrValueCheck::of(msr_index::MSR_K7_HWCR),
+            MsrValueCheck::Host
+        );
+        assert_eq!(MsrValueCheck::of(0x48), MsrValueCheck::Host);
+        // PAT's memory types are architectural.
+        assert_eq!(
+            MsrValueCheck::of(msr_index::MSR_IA32_CR_PAT),
+            MsrValueCheck::Content
+        );
+        // VM_CR isn't among the MSRs KVM v6.18 saves or emulates.
+        assert_eq!(MsrValueCheck::of(0xc0010114), MsrValueCheck::Unexamined);
     }
 }
