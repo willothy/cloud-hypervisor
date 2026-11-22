@@ -56,6 +56,23 @@ fn get_block_config(vu: &mut VhostUserHandle, num_queues: usize) -> Result<Virti
     Ok(config)
 }
 
+/// Refuse to restore device `id` on a backend that doesn't offer every
+/// virtio feature the snapshot's guest acked. `SET_FEATURES` only sends the
+/// features both sides support, so a feature missing from the backend
+/// would otherwise be dropped while the restored guest goes on using it.
+/// `VIRTIO_F_ACCESS_PLATFORM` is the frontend's to offer, never the
+/// backend's, so it is not required of it.
+fn check_restored_features(id: &str, acked_features: u64, backend_features: u64) -> Result<()> {
+    let missing = acked_features & !(1u64 << VIRTIO_F_ACCESS_PLATFORM) & !backend_features;
+    if missing != 0 {
+        return Err(Error::RestoredFeaturesUnsupported {
+            id: id.to_owned(),
+            missing,
+        });
+    }
+    Ok(())
+}
+
 struct BackendReqHandler {
     vu: Arc<Mutex<VhostUserHandle>>,
     config: Arc<Mutex<VirtioBlockConfig>>,
@@ -122,6 +139,8 @@ impl Blk {
             vring_bases,
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-block {id}");
+
+            check_restored_features(&id, state.acked_features, vu.backend_features())?;
 
             vu.set_protocol_features_vhost_user(
                 state.acked_features,
@@ -426,5 +445,38 @@ impl Migratable for Blk {
 
     fn notify_completed_migration(&mut self) -> result::Result<(), MigratableError> {
         self.vu_common.notify_completed_migration()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use virtio_bindings::virtio_blk::VIRTIO_BLK_F_DISCARD;
+
+    use super::*;
+
+    #[test]
+    fn restore_accepts_a_backend_offering_every_acked_feature() {
+        let acked = (1u64 << VIRTIO_BLK_F_RO) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let backend = acked | (1u64 << VIRTIO_BLK_F_DISCARD);
+        check_restored_features("base", acked, backend).unwrap();
+    }
+
+    #[test]
+    fn restore_names_the_acked_features_a_backend_lacks() {
+        let acked = (1u64 << VIRTIO_BLK_F_RO) | (1u64 << VIRTIO_BLK_F_FLUSH);
+        let backend = 1u64 << VIRTIO_BLK_F_FLUSH;
+        match check_restored_features("base", acked, backend) {
+            Err(Error::RestoredFeaturesUnsupported { id, missing }) => {
+                assert_eq!(id, "base");
+                assert_eq!(missing, 1u64 << VIRTIO_BLK_F_RO);
+            }
+            other => panic!("expected RestoredFeaturesUnsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_does_not_require_access_platform_of_the_backend() {
+        let acked = (1u64 << VIRTIO_BLK_F_FLUSH) | (1u64 << VIRTIO_F_ACCESS_PLATFORM);
+        check_restored_features("base", acked, 1u64 << VIRTIO_BLK_F_FLUSH).unwrap();
     }
 }
