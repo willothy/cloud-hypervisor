@@ -371,6 +371,14 @@ pub enum Error {
     #[error("Cannot restore VM")]
     Restore(#[source] MigratableError),
 
+    /// The restore's snapshot directory isn't a valid source URL
+    #[error("Invalid snapshot source URL")]
+    RestoreSourceUrl(#[source] MigratableError),
+
+    /// The memory manager's section of the snapshot doesn't decode
+    #[error("Error decoding the memory manager's saved state")]
+    RestoreStateDecode(#[source] MigratableError),
+
     /// A userfaultfd handoff needs the peer to read guest RAM through its
     /// backing file, so anonymous guest memory cannot be handed off.
     #[error(
@@ -2951,11 +2959,11 @@ impl MemoryManager {
         exit_reason: Option<&Path>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
-            let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
+            let mut memory_file_path = url_to_path(source_url).map_err(Error::RestoreSourceUrl)?;
             memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
             let mem_snapshot: MemoryManagerSnapshotData =
-                snapshot.to_state().map_err(Error::Restore)?;
+                snapshot.to_state().map_err(Error::RestoreStateDecode)?;
 
             let mm = MemoryManager::new(
                 vm,
