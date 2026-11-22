@@ -95,7 +95,8 @@ use crate::KvmIoctl;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
     CpuIdEntry, FpuState, LapicState, MTRR_ENABLE, MTRR_MEM_TYPE_WB, MTRR_MSR_INDICES, MsrClass,
-    MsrEntry, NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
+    MsrEntry, MsrValueCheck, NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState,
+    msr_index,
 };
 #[cfg(target_arch = "x86_64")]
 use crate::cpu::MsrRefusal;
@@ -4350,19 +4351,20 @@ impl KvmVcpu {
     /// KVM refused to set.
     ///
     /// A performance-monitoring or machine-check MSR only records what the
-    /// guest observed, so the restore goes on without it, with a warning
-    /// naming it. Any other MSR is state the guest runs with, and the
+    /// guest observed, and an informational one reports a fact about the
+    /// host, so the restore goes on without it, with a warning naming it
+    /// and its class. Any other MSR is state the guest runs with, and the
     /// restore fails, saying whether this host lists the MSR at all, lists
     /// it as one describing a host capability, or lists it and refused its
-    /// value. `hyperv_synic` says whether the state being restored has the
-    /// Hyper-V synthetic interrupt controller enabled, whose MSRs KVM
-    /// handles without listing them.
+    /// value, and what KVM checks that value against. `hyperv_synic` says
+    /// whether the state being restored has the Hyper-V synthetic interrupt
+    /// controller enabled, whose MSRs KVM handles without listing them.
     ///
     fn accept_refused_msr(&self, msr: &MsrEntry, hyperv_synic: bool) -> cpu::Result<()> {
         let class = MsrClass::of(msr.index);
         if class != MsrClass::Architectural {
             warn!(
-                "Restoring the vCPU without MSR {:#x}, a {class} MSR KVM refused to set",
+                "Restoring the vCPU without MSR {:#x} ({class}), which KVM refused to set",
                 msr.index
             );
             return Ok(());
@@ -4384,7 +4386,7 @@ impl KvmVcpu {
         {
             MsrRefusal::FeatureValue
         } else {
-            MsrRefusal::Value
+            MsrRefusal::Value(MsrValueCheck::of(msr.index))
         };
         Err(cpu::HypervisorCpuError::RestoreMsr {
             index: msr.index,
