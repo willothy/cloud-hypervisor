@@ -3764,10 +3764,9 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(failed(KvmIoctl::SetFpu))?;
 
         if let Some(freq) = state.tsc_khz {
-            match self.fd.set_tsc_khz(freq) {
-                Err(e) if e.errno() == libc::EIO => {}
-                result => result.map_err(failed(KvmIoctl::SetTscKhz))?,
-            }
+            self.fd
+                .set_tsc_khz(freq)
+                .map_err(failed(KvmIoctl::SetTscKhz))?;
         }
 
         if state.hyperv_synic {
@@ -4035,23 +4034,6 @@ impl cpu::Vcpu for KvmVcpu {
                 }
             }
             Ok(v) => Ok(Some(v)),
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    ///
-    /// Set the frequency of the TSC if available
-    ///
-    fn set_tsc_khz(&self, freq: u32) -> cpu::Result<()> {
-        match self.fd.set_tsc_khz(freq) {
-            Err(e) => {
-                if e.errno() == libc::EIO {
-                    Ok(())
-                } else {
-                    Err(cpu::HypervisorCpuError::SetTscKhz(e.into()))
-                }
-            }
-            Ok(_) => Ok(()),
         }
     }
 
