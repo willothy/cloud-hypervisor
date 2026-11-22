@@ -276,6 +276,21 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
 
 pub type Result<T> = result::Result<T, Error>;
 
+/// Why this host can't present a VM's saved or migrated CPUID.
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+#[derive(Debug, Error)]
+pub enum CpuidCompatibilityError {
+    #[cfg(feature = "tdx")]
+    #[error("Live Migration is not supported when TDX is enabled")]
+    Tdx,
+    #[error("Error enabling AMX state components")]
+    EnableAmx(#[source] hypervisor::HypervisorError),
+    #[error("Error generating common cpuid")]
+    CommonCpuid(#[source] arch::Error),
+    #[error("Error checking cpu feature compatibility")]
+    Incompatible(#[source] arch::x86_64::Error),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum EpollDispatch {
@@ -1339,7 +1354,8 @@ impl Vmm {
         self.vm_check_cpuid_compatibility(
             &vm_migration_config.vm_config,
             &vm_migration_config.common_cpuid,
-        )?;
+        )
+        .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
 
         update_memory_zones(zone_updates, &vm_migration_config.vm_config).map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error updating memory zones: {e:?}"))
@@ -2062,12 +2078,10 @@ impl Vmm {
         &self,
         src_vm_config: &Arc<Mutex<VmConfig>>,
         src_vm_cpuid: &[x86::CpuIdEntry],
-    ) -> result::Result<(), MigratableError> {
+    ) -> result::Result<(), CpuidCompatibilityError> {
         #[cfg(feature = "tdx")]
         if src_vm_config.lock().unwrap().is_tdx_enabled() {
-            return Err(MigratableError::MigrateReceive(anyhow!(
-                "Live Migration is not supported when TDX is enabled"
-            )));
+            return Err(CpuidCompatibilityError::Tdx);
         }
 
         // We check the `CPUID` compatibility of between the source vm and destination, which is
@@ -2080,7 +2094,7 @@ impl Vmm {
                 // as this affects what Hypervisor::get_supported_cpuid returns.
                 self.hypervisor
                     .enable_amx_state_components()
-                    .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+                    .map_err(CpuidCompatibilityError::EnableAmx)?;
             }
 
             let phys_bits =
@@ -2097,12 +2111,10 @@ impl Vmm {
                     profile: vm_config.cpus.profile,
                 },
             )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateReceive)?
+            .map_err(CpuidCompatibilityError::CommonCpuid)?
         };
         arch::CpuidFeatureEntry::check_cpuid_compatibility(src_vm_cpuid, dest_cpuid)
-            .context("Error checking cpu feature compatibility")
-            .map_err(MigratableError::MigrateReceive)
+            .map_err(CpuidCompatibilityError::Incompatible)
     }
 
     #[cfg_attr(target_arch = "x86_64", expect(clippy::too_many_arguments))]
@@ -2126,7 +2138,7 @@ impl Vmm {
 
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
-                    .map_err(VmError::Restore)?;
+                    .map_err(VmError::CpuidCompatibility)?;
 
                 self.vm_config = Some(Arc::clone(&vm_config));
 

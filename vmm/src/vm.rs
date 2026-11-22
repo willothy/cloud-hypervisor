@@ -183,6 +183,10 @@ pub enum Error {
     #[error("Error reading the snapshot")]
     RecvSnapshot(#[source] RecvError),
 
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[error("The host can't present the snapshot's CPUID")]
+    CpuidCompatibility(#[source] crate::CpuidCompatibilityError),
+
     #[error("The hypervisor lacks a capability the VMM requires")]
     HypervisorExtensions(#[source] hypervisor::HypervisorError),
 
@@ -252,9 +256,6 @@ pub enum Error {
 
     #[error("Cannot snapshot VM")]
     Snapshot(#[source] MigratableError),
-
-    #[error("Cannot restore VM")]
-    Restore(#[source] MigratableError),
 
     #[error(
         "Cannot hold the guest clock: the snapshot's clock was captured without the guest TSC it is held by"
