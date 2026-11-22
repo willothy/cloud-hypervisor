@@ -157,15 +157,6 @@ pub trait VirtioDevice: Send {
         Ok(())
     }
 
-    /// End the vhost-user postcopy flow on the device's backend connection
-    /// once guest RAM has settled, so the backend stops registering guest
-    /// RAM with a userfaultfd and takes plain memory tables from then on.
-    /// Only a vhost-user device created while guest RAM was demand-paged has
-    /// a flow to end.
-    fn end_postcopy(&mut self) -> result::Result<(), Error> {
-        Ok(())
-    }
-
     /// Returns the list of userspace mappings associated with this device.
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
         Vec::new()

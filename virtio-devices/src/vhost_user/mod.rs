@@ -1,12 +1,14 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fs::{File, remove_file};
 use std::io::ErrorKind;
+use std::mem;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex, RwLock, RwLockReadGuard};
 use std::{io, result};
 
@@ -20,7 +22,10 @@ use vhost::Error as VhostError;
 use vhost::vhost_user::message::{
     VhostUserInflight, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
 };
-use vhost::vhost_user::{Error as VhostUserError, FrontendReqHandler, VhostUserFrontendReqHandler};
+use vhost::vhost_user::{
+    Error as VhostUserError, Frontend, FrontendReqHandler, VhostUserFrontend,
+    VhostUserFrontendReqHandler,
+};
 use virtio_queue::{Error as QueueError, Queue};
 use vm_memory::guest_memory::Error as MmapError;
 use vm_memory::mmap::MmapRegionError;
@@ -100,8 +105,6 @@ pub enum Error {
     VhostUserPostcopyListen(#[source] VhostError),
     #[error("Acknowledging the backend's postcopy memory table failed")]
     VhostUserPostcopyAck(#[source] VhostError),
-    #[error("Ending the backend's postcopy flow after guest RAM settled failed")]
-    VhostUserPostcopyEnd(#[source] VhostError),
     #[error("Handing the backend's userfaultfd to the fault handler failed")]
     AdoptBackendFaults(#[source] io::Error),
     #[error("Reading the page size of a guest memory region's backing failed")]
@@ -250,8 +253,7 @@ impl Error {
             | Error::VhostUserCheckDeviceState(e)
             | Error::VhostUserPostcopyAdvise(e)
             | Error::VhostUserPostcopyListen(e)
-            | Error::VhostUserPostcopyAck(e)
-            | Error::VhostUserPostcopyEnd(e) => vhost_error_is_transport_lost(e),
+            | Error::VhostUserPostcopyAck(e) => vhost_error_is_transport_lost(e),
             Error::FrontendReqHandlerCreation(e) => vhost_user_error_is_transport_lost(e),
             _ => false,
         }
@@ -316,14 +318,22 @@ pub struct BackendFaults {
 /// the settle that ends demand paging, which flips it once and for good.
 ///
 /// A memory table is sent with the lock held for reading: the postcopy way
-/// while guest RAM is demand-paged, the plain way once it has settled. The
-/// settle holds it for writing through its exchange with the fault handler,
-/// so no table is in flight while the handler takes the backends' mappings
-/// off their userfaultfds, and every table sent after takes the plain way.
-#[derive(Debug, Default)]
+/// while guest RAM is demand-paged, the plain way once it has settled. A
+/// connection is registered here as it takes the postcopy flow, under the
+/// same read lock. The settle holds the lock for writing through its
+/// exchange with the fault handler and, once the handler answers settled,
+/// through ending the postcopy flow on every registered connection. So no
+/// table is in flight while the handler takes the backends' mappings off
+/// their userfaultfds, no connection is left on the flow once guest RAM
+/// is settled, and every table sent after takes the plain way.
+#[derive(Default)]
 pub struct DemandPaging {
     /// Whether guest RAM has settled.
     settled: RwLock<bool>,
+    /// The backend connections on the postcopy flow, by the id each is
+    /// handed to the fault handler under, until the settle ends the flow
+    /// on them or they are dropped.
+    connections: Mutex<BTreeMap<u64, Frontend>>,
 }
 
 impl DemandPaging {
@@ -334,23 +344,101 @@ impl DemandPaging {
 
     /// Settle guest RAM: run `exchange`, the settle exchange with the fault
     /// handler, with no memory table in flight, and once it answers that
-    /// guest RAM is settled, record that for good. Returns whether guest RAM
-    /// is settled; once it is, without running `exchange` again.
+    /// guest RAM is settled, end the postcopy flow on every connection on it
+    /// and record that for good. Returns whether guest RAM is settled; once
+    /// it is, without running `exchange` again.
+    ///
+    /// A backend that refuses `POSTCOPY_END` may still be listening, and
+    /// would answer a plain memory table the postcopy way, so its
+    /// connection is shut down, for the device to reconnect plain. A
+    /// connection already lost has nothing left to end. Neither fails the
+    /// settle, which the fault handler has already made.
     pub fn settle<E>(
         &self,
         exchange: impl FnOnce() -> result::Result<bool, E>,
     ) -> result::Result<bool, E> {
         let mut settled = self.settled.write().unwrap();
-        if !*settled {
-            *settled = exchange()?;
+        if *settled {
+            return Ok(true);
         }
-        Ok(*settled)
+        if !exchange()? {
+            return Ok(false);
+        }
+        let connections = mem::take(&mut *self.connections.lock().unwrap());
+        for (connection, mut frontend) in connections {
+            let Err(e) = frontend.postcopy_end() else {
+                continue;
+            };
+            error!("Failed ending the postcopy flow of vhost-user connection {connection}: {e:?}");
+            if vhost_error_is_transport_lost(&e) {
+                continue;
+            }
+            // SAFETY: shutting down the connection's own socket, which its
+            // frontend keeps open.
+            if unsafe { libc::shutdown(frontend.as_raw_fd(), libc::SHUT_RDWR) } != 0 {
+                error!(
+                    "Failed shutting down vhost-user connection {connection}, still on the postcopy flow: {}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        *settled = true;
+        Ok(true)
     }
 
     /// Hold off a settle while a memory table is sent. The guard reads
     /// whether guest RAM has settled.
     fn hold(&self) -> RwLockReadGuard<'_, bool> {
         self.settled.read().unwrap()
+    }
+
+    /// Register `frontend`'s connection as on the postcopy flow, for the
+    /// settle to end it, under the guard of [`Self::hold`] that found guest
+    /// RAM still demand-paged. The registration names the connection to the
+    /// fault handler and lasts until it is dropped.
+    fn register(
+        self: &Arc<Self>,
+        held: &RwLockReadGuard<'_, bool>,
+        frontend: &Frontend,
+    ) -> PostcopyConnection {
+        debug_assert!(
+            !**held,
+            "a connection takes the postcopy flow only before the settle"
+        );
+        /// The id the next connection to take the postcopy flow is named
+        /// by, for the life of the process.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        self.connections
+            .lock()
+            .unwrap()
+            .insert(id, frontend.clone());
+        PostcopyConnection {
+            id,
+            paging: Arc::clone(self),
+        }
+    }
+}
+
+/// A backend connection's place on the postcopy flow, registered with the
+/// [`DemandPaging`] whose settle ends it. Dropped with the connection,
+/// which takes it off the register.
+pub(crate) struct PostcopyConnection {
+    /// The id the connection is handed to the fault handler under.
+    id: u64,
+    paging: Arc<DemandPaging>,
+}
+
+impl PostcopyConnection {
+    /// The id the connection is handed to the fault handler under.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+impl Drop for PostcopyConnection {
+    fn drop(&mut self) {
+        self.paging.connections.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -483,17 +571,6 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
         // Update vhost-user reference
         let mut vu = self.vu.lock().unwrap();
         *vu = vhost_user;
-
-        // A connection made just before a settle took the postcopy flow, and
-        // the settle ended it on the connection this one replaced. A failure
-        // shuts the new connection down, for another reconnect to make it
-        // plain.
-        if let Err(e) = vu.end_postcopy() {
-            error!(
-                "Failed ending postcopy on the reconnected vhost-user backend for socket {}: {e:?}",
-                self.socket_path
-            );
-        }
 
         Ok(())
     }
@@ -847,22 +924,6 @@ impl VhostUserCommon {
             return Err(self.memory_update_error(e));
         }
         Ok(())
-    }
-
-    /// End the postcopy flow on the device's connection once guest RAM has
-    /// settled (see [`VhostUserHandle::end_postcopy`]). A device with no
-    /// connection has nothing to end: it connects plain when it reconnects.
-    pub fn end_postcopy(&mut self) -> result::Result<(), crate::Error> {
-        if self.disconnected.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let Some(vu) = &self.vu else {
-            return Ok(());
-        };
-        vu.lock()
-            .unwrap()
-            .end_postcopy()
-            .map_err(crate::Error::VhostUserPostcopyEnd)
     }
 
     pub fn pause(&mut self) -> result::Result<(), MigratableError> {

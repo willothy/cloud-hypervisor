@@ -5317,19 +5317,6 @@ impl DeviceManager {
         self.cmdline_additions.as_slice()
     }
 
-    /// End the vhost-user postcopy flow on every device's backend
-    /// connection, once guest RAM has settled. A connection that fails to
-    /// end it is shut down by its device, which then reconnects plain, so a
-    /// failure is logged here rather than failing the settle, which the
-    /// fault handler has already made.
-    pub fn end_postcopy(&self) {
-        for handle in self.virtio_devices.iter() {
-            if let Err(e) = handle.virtio_device.lock().unwrap().end_postcopy() {
-                error!("Failed ending the postcopy flow of a vhost-user device: {e:?}");
-            }
-        }
-    }
-
     pub fn update_memory(&self, new_region: &Arc<GuestRegionMmap>) -> DeviceManagerResult<()> {
         for handle in self.virtio_devices.iter() {
             handle

@@ -3116,25 +3116,18 @@ impl Vm {
 
     /// End the demand paging of guest RAM once its fault handler has served
     /// the whole memory image, and return whether guest RAM is settled: see
-    /// [`MemoryManager::settle`]. Once it is, the vhost-user backends
-    /// connected while it was demand-paged are taken off the postcopy flow
-    /// (see [`DeviceManager::end_postcopy`]). Idempotent, and a no-op that
-    /// answers `true` for a VM whose RAM never was demand-paged.
+    /// [`MemoryManager::settle`]. Idempotent, and a no-op that answers
+    /// `true` for a VM whose RAM never was demand-paged.
     ///
     /// Taking the VM exclusively is what keeps a settle and a live capture
     /// apart: [`Self::live_checkpoint`] holds the same borrow from arming
     /// its capture until the fault handler reports it done.
     pub fn settle_memory(&mut self) -> Result<bool> {
-        let settled = self
-            .memory_manager
+        self.memory_manager
             .lock()
             .unwrap()
             .settle()
-            .map_err(Error::SettleMemory)?;
-        if settled {
-            self.device_manager.lock().unwrap().end_postcopy();
-        }
-        Ok(settled)
+            .map_err(Error::SettleMemory)
     }
 
     /// The guest-memory ranges the devices (vhost-user backends, via their

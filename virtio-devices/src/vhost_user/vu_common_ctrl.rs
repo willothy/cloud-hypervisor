@@ -7,8 +7,8 @@ use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLockReadGuard};
 use std::time::{Duration, Instant};
 use std::{ffi, fs, io, slice};
 
@@ -35,7 +35,7 @@ use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::timerfd::TimerFd;
 
-use super::{BackendFaults, BackendMapping, Error, Result, VhostUserState};
+use super::{BackendFaults, BackendMapping, Error, PostcopyConnection, Result, VhostUserState};
 use crate::vhost_user::Inflight;
 use crate::{
     GuestMemoryMmap, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
@@ -44,11 +44,6 @@ use crate::{
 
 // Size of a dirty page for vhost-user.
 const VHOST_LOG_PAGE: u64 = 0x1000;
-
-/// The id the next vhost-user connection to open a postcopy userfaultfd
-/// takes, naming it to the [`super::BackendFaultHandler`] for the life of
-/// the process.
-static NEXT_POSTCOPY_CONNECTION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct VhostUserConfig {
@@ -63,7 +58,6 @@ struct VringInfo {
     used_guest_addr: u64,
 }
 
-#[derive(Clone)]
 pub struct VhostUserHandle {
     vu: Frontend,
     backend_features: u64,
@@ -82,10 +76,13 @@ pub struct VhostUserHandle {
     faults: Option<BackendFaults>,
     /// Whether the backend negotiated `PAGEFAULT`.
     serves_faults: bool,
-    /// The id this connection's backend userfaultfd was handed to the fault
-    /// handler under, once the backend advised it, listens, and the handler
-    /// adopted its first memory table.
-    postcopy_connection: Option<u64>,
+    /// The connection's place on the postcopy flow, from the moment the
+    /// backend advised its userfaultfd: the id the fault handler knows it
+    /// by, and its registration for the settle to end the flow on it.
+    postcopy_connection: Option<PostcopyConnection>,
+    /// The backend's userfaultfd, until the fault handler has adopted the
+    /// connection's first memory table, which hands it over.
+    unadopted_uffd: Option<File>,
 }
 
 impl VhostUserHandle {
@@ -113,13 +110,10 @@ impl VhostUserHandle {
         }
 
         if let Some(faults) = self.faults.clone() {
-            let settled = faults.paging.hold();
-            if !*settled {
-                return self.set_mem_table_postcopy(&faults, &regions);
+            let held = faults.paging.hold();
+            if !*held {
+                return self.set_mem_table_postcopy(&faults, &held, &regions);
             }
-            drop(settled);
-            // A plain table must not reach a backend still listening.
-            self.end_postcopy()?;
         }
 
         self.vu
@@ -135,25 +129,33 @@ impl VhostUserHandle {
     /// first time, its userfaultfd) to the fault handler, and only once the
     /// handler has adopted them acknowledge, which is what lets the backend
     /// touch guest RAM. A table the handler refuses fails the connection.
+    /// The connection is registered for the settle to end the flow on it as
+    /// soon as the backend has a userfaultfd, under `held`, the guard that
+    /// found guest RAM still demand-paged.
     fn set_mem_table_postcopy(
         &mut self,
         faults: &BackendFaults,
+        held: &RwLockReadGuard<'_, bool>,
         regions: &[VhostUserMemoryRegionInfo],
     ) -> Result<()> {
         if !self.serves_faults {
             return Err(Error::BackendServesNoFaults);
         }
-        let uffd = match self.postcopy_connection {
-            Some(_) => None,
+        let connection = match &self.postcopy_connection {
+            Some(connection) => connection.id(),
             None => {
                 let uffd = self
                     .vu
                     .postcopy_advise()
                     .map_err(Error::VhostUserPostcopyAdvise)?;
+                let connection = faults.paging.register(held, &self.vu);
+                let id = connection.id();
+                self.postcopy_connection = Some(connection);
+                self.unadopted_uffd = Some(uffd);
                 self.vu
                     .postcopy_listen()
                     .map_err(Error::VhostUserPostcopyListen)?;
-                Some(uffd)
+                id
             }
         };
         let bases = self
@@ -172,19 +174,16 @@ impl VhostUserHandle {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let connection = self
-            .postcopy_connection
-            .unwrap_or_else(|| NEXT_POSTCOPY_CONNECTION.fetch_add(1, Ordering::Relaxed));
         faults
             .handler
             .adopt(
                 &faults.device,
                 connection,
                 &mappings,
-                uffd.as_ref().map(|uffd| uffd.as_fd()),
+                self.unadopted_uffd.as_ref().map(|uffd| uffd.as_fd()),
             )
             .map_err(Error::AdoptBackendFaults)?;
-        self.postcopy_connection = Some(connection);
+        self.unadopted_uffd = None;
         self.vu
             .postcopy_ack_mem_table()
             .map_err(Error::VhostUserPostcopyAck)
@@ -215,42 +214,6 @@ impl VhostUserHandle {
         }
     }
 
-    /// End the postcopy flow on this connection once guest RAM has settled:
-    /// the backend stops registering the memory it maps with its
-    /// userfaultfd, drops that userfaultfd, and takes plain memory tables
-    /// from then on. A no-op on a connection not on the flow, and while guest
-    /// RAM is still demand-paged. A backend that refuses the end may still be
-    /// listening, and would answer a plain table the postcopy way, so its
-    /// connection is shut down, for the device to reconnect plain.
-    pub fn end_postcopy(&mut self) -> Result<()> {
-        if self
-            .faults
-            .as_ref()
-            .is_none_or(|faults| !faults.paging.settled())
-        {
-            return Ok(());
-        }
-        if self.postcopy_connection.take().is_none() {
-            return Ok(());
-        }
-        let Err(e) = self.vu.postcopy_end() else {
-            return Ok(());
-        };
-        let e = Error::VhostUserPostcopyEnd(e);
-        if !e.is_transport_lost() {
-            // SAFETY: shutting down the connection's own socket, which stays
-            // open until the handle is dropped.
-            let shut = unsafe { libc::shutdown(self.vu.as_raw_fd(), libc::SHUT_RDWR) };
-            if shut != 0 {
-                error!(
-                    "Failed shutting down a vhost-user connection still on the postcopy flow: {}",
-                    io::Error::last_os_error()
-                );
-            }
-        }
-        Err(e)
-    }
-
     /// Whether this connection's backend faults through the fault handler:
     /// on a device created while guest RAM was demand-paged, until it
     /// settles.
@@ -261,9 +224,6 @@ impl VhostUserHandle {
     }
 
     pub fn add_memory_region(&mut self, region: &Arc<GuestRegionMmap>) -> Result<()> {
-        // The device refuses a region while guest RAM is demand-paged; once
-        // it has settled, a backend still listening must not get one.
-        self.end_postcopy()?;
         let (mmap_handle, mmap_offset) = match region.file_offset() {
             Some(file_offset) => (file_offset.file().as_raw_fd(), file_offset.start()),
             None => return Err(Error::MissingRegionFd),
@@ -638,6 +598,7 @@ impl VhostUserHandle {
                 faults: faults.cloned(),
                 serves_faults: false,
                 postcopy_connection: None,
+                unadopted_uffd: None,
             };
             vhost_user
                 .vu
@@ -700,6 +661,7 @@ impl VhostUserHandle {
                         faults: faults.cloned(),
                         serves_faults: false,
                         postcopy_connection: None,
+                        unadopted_uffd: None,
                     })
                     .map_err(Error::VhostUserConnect);
 
@@ -1099,6 +1061,7 @@ mod tests {
     use std::thread;
 
     use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag};
+    use vmm_sys_util::sock_ctrl_msg::ScmSocket;
     use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
@@ -1144,20 +1107,17 @@ mod tests {
         stream.write_all(&value.to_ne_bytes()).unwrap();
     }
 
-    /// A backend's connection made while guest RAM is demand-paged: the
-    /// handshake that negotiates PAGEFAULT and REPLY_ACK, played by
-    /// `backend` on its end, which then goes on as the test needs. The
-    /// connection is marked as on the postcopy flow, as its first postcopy
-    /// table leaves it. Returns the frontend's handle, the demand paging it
-    /// shares, and the backend's thread.
+    /// A backend's connection made while guest RAM is `paging`'s to settle:
+    /// the handshake that negotiates PAGEFAULT and REPLY_ACK, played by
+    /// `backend` on its end, which then goes on as the test needs. With
+    /// `registered` the connection is registered on the postcopy flow, as
+    /// its first postcopy table leaves it. Returns the frontend's handle,
+    /// the backend's thread, and the directory of its socket.
     fn postcopy_connection(
+        paging: &Arc<DemandPaging>,
+        registered: bool,
         backend: impl FnOnce(UnixStream) + Send + 'static,
-    ) -> (
-        VhostUserHandle,
-        Arc<DemandPaging>,
-        thread::JoinHandle<()>,
-        TempDir,
-    ) {
+    ) -> (VhostUserHandle, thread::JoinHandle<()>, TempDir) {
         let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
         let offered = (VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::REPLY_ACK
@@ -1180,11 +1140,10 @@ mod tests {
             backend(stream);
         });
 
-        let paging = Arc::new(DemandPaging::default());
         let faults = BackendFaults {
             device: "_disk0".to_owned(),
             handler: Arc::new(Unused),
-            paging: Arc::clone(&paging),
+            paging: Arc::clone(paging),
         };
         let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let mut vu = VhostUserHandle::connect_vhost_user(
@@ -1203,55 +1162,132 @@ mod tests {
             },
         )
         .unwrap();
-        vu.postcopy_connection = Some(1);
-        (vu, paging, backend, dir)
+        if registered {
+            vu.postcopy_connection = Some(paging.register(&paging.hold(), &vu.vu));
+        }
+        (vu, backend, dir)
     }
 
-    /// The settle ends the postcopy flow on a connection on it, once: not
-    /// while guest RAM is still demand-paged, and not again after.
+    /// A guest memory of one 4 KiB page, backed by a file in `dir`.
+    fn guest_memory(dir: &TempDir) -> GuestMemoryMmap {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(dir.as_path().join("memory"))
+            .unwrap();
+        file.set_len(0x1000).unwrap();
+        GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            0x1000,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap()
+    }
+
+    /// Whether any connection is still registered on `paging`'s postcopy
+    /// flow.
+    fn any_on_the_flow(paging: &DemandPaging) -> bool {
+        !paging.connections.lock().unwrap().is_empty()
+    }
+
+    /// A settled verdict leaves no connection on the postcopy flow: the
+    /// settle ends it on every connection registered, one whose first
+    /// table failed after the backend advised its userfaultfd included,
+    /// before it records guest RAM as settled. A verdict of not yet ends
+    /// nothing, and a settle after the first sends nothing more.
     #[test]
-    fn the_settle_ends_the_postcopy_flow_once() {
-        let (mut vu, paging, backend, _dir) = postcopy_connection(|mut stream| {
+    fn a_settled_verdict_leaves_no_connection_in_postcopy() {
+        let paging = Arc::new(DemandPaging::default());
+        let ended = |mut stream: UnixStream| {
             assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
             reply(&mut stream, FrontendReq::POSTCOPY_END, 0);
             assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
-        });
+        };
+        let (advised, advised_backend, dir) =
+            postcopy_connection(&paging, false, move |mut stream| {
+                assert!(read_request(&mut stream, FrontendReq::POSTCOPY_ADVISE).is_empty());
+                let (uffd, _) = io::pipe().unwrap();
+                let header: Vec<u8> = [
+                    u32::from(FrontendReq::POSTCOPY_ADVISE),
+                    VhostUserHeaderFlag::REPLY.bits() | 1,
+                    0,
+                ]
+                .iter()
+                .flat_map(|field| field.to_ne_bytes())
+                .collect();
+                stream.send_with_fd(&header[..], uffd.as_raw_fd()).unwrap();
+                assert!(read_request(&mut stream, FrontendReq::POSTCOPY_LISTEN).is_empty());
+                reply(&mut stream, FrontendReq::POSTCOPY_LISTEN, 1);
+                ended(stream);
+            });
+        let mut advised = advised;
+        let (registered, registered_backend, _registered_dir) =
+            postcopy_connection(&paging, true, ended);
 
-        vu.end_postcopy().unwrap();
-        paging.settle(|| Ok::<_, ()>(true)).unwrap();
-        vu.end_postcopy().unwrap();
-        vu.end_postcopy().unwrap();
+        assert!(matches!(
+            advised.update_mem_table(&guest_memory(&dir)),
+            Err(Error::VhostUserPostcopyListen(_))
+        ));
+        assert!(!paging.settle(|| Ok::<_, ()>(false)).unwrap());
+        assert!(any_on_the_flow(&paging));
 
-        drop(vu);
-        backend.join().unwrap();
+        assert!(paging.settle(|| Ok::<_, ()>(true)).unwrap());
+        assert!(paging.settled());
+        assert!(!any_on_the_flow(&paging));
+        assert!(
+            paging
+                .settle(|| -> Result<bool> { panic!("a second exchange") })
+                .unwrap()
+        );
+
+        drop(advised);
+        drop(registered);
+        advised_backend.join().unwrap();
+        registered_backend.join().unwrap();
     }
 
     /// A backend that refuses to end the postcopy flow may still be
-    /// listening, so its connection is shut down.
+    /// listening, so the settle shuts its connection down, and settles.
     #[test]
     fn a_refused_end_shuts_the_connection_down() {
-        let (mut vu, paging, backend, _dir) = postcopy_connection(|mut stream| {
+        let paging = Arc::new(DemandPaging::default());
+        let (vu, backend, _dir) = postcopy_connection(&paging, true, |mut stream| {
             assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
             reply(&mut stream, FrontendReq::POSTCOPY_END, 1);
             assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
         });
 
-        paging.settle(|| Ok::<_, ()>(true)).unwrap();
-        assert!(matches!(
-            vu.end_postcopy(),
-            Err(Error::VhostUserPostcopyEnd(_))
-        ));
+        assert!(paging.settle(|| Ok::<_, ()>(true)).unwrap());
+        assert!(!any_on_the_flow(&paging));
 
         // The backend sees the connection close while the handle lives on.
         backend.join().unwrap();
         drop(vu);
     }
 
-    /// A memory table sent after the settle on a connection the settle has
-    /// not ended yet ends the flow first, and is a plain one.
+    /// A connection dropped before the settle leaves the register, and the
+    /// settle sends it nothing.
     #[test]
-    fn a_table_after_the_settle_ends_the_flow_first() {
-        let (mut vu, paging, backend, dir) = postcopy_connection(|mut stream| {
+    fn a_dropped_connection_leaves_the_register() {
+        let paging = Arc::new(DemandPaging::default());
+        let (vu, backend, _dir) = postcopy_connection(&paging, true, |mut stream| {
+            assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+        });
+        assert!(any_on_the_flow(&paging));
+
+        drop(vu);
+        assert!(!any_on_the_flow(&paging));
+        assert!(paging.settle(|| Ok::<_, ()>(true)).unwrap());
+        backend.join().unwrap();
+    }
+
+    /// A memory table sent after the settle, on a connection the settle
+    /// ended, is a plain one.
+    #[test]
+    fn a_table_after_the_settle_is_a_plain_one() {
+        let paging = Arc::new(DemandPaging::default());
+        let (mut vu, backend, dir) = postcopy_connection(&paging, true, |mut stream| {
             assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
             reply(&mut stream, FrontendReq::POSTCOPY_END, 0);
             assert_eq!(
@@ -1262,21 +1298,8 @@ mod tests {
             assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
         });
 
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(dir.as_path().join("memory"))
-            .unwrap();
-        file.set_len(0x1000).unwrap();
-        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
-            GuestAddress(0),
-            0x1000,
-            Some(FileOffset::new(file, 0)),
-        )])
-        .unwrap();
-        paging.settle(|| Ok::<_, ()>(true)).unwrap();
-        vu.update_mem_table(&mem).unwrap();
+        assert!(paging.settle(|| Ok::<_, ()>(true)).unwrap());
+        vu.update_mem_table(&guest_memory(&dir)).unwrap();
 
         drop(vu);
         backend.join().unwrap();

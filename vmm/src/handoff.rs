@@ -333,9 +333,11 @@ impl FaultSession {
     ///
     /// The exchange runs with no vhost-user memory table in flight (see
     /// [`DemandPaging`]): no backend maps guest RAM afresh while the handler
-    /// takes the backends' mappings off their userfaultfds, and each table
-    /// sent after a settled verdict is a plain one. `Vm::settle_memory` then
-    /// ends the postcopy flow on each backend connection on it.
+    /// takes the backends' mappings off their userfaultfds. A settled
+    /// verdict then ends the postcopy flow on every backend connection on
+    /// it before the settle is recorded, so no backend is registered for
+    /// missing faults once this returns `true`, and each table sent after is
+    /// a plain one.
     ///
     /// A handler that refuses the settle fails this call, and nothing has
     /// changed. An exchange that fails any other way is the loss of the
