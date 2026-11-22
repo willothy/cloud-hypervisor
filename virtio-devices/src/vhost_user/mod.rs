@@ -87,6 +87,15 @@ pub enum Error {
         "The backend of restored device {id} does not offer virtio features {missing:#x} the snapshot acked"
     )]
     RestoredFeaturesUnsupported { id: String, missing: u64 },
+    #[error(
+        "The backend of restored device {id} reports {field} {backend}, but the snapshot holds {saved}"
+    )]
+    RestoredConfigMismatch {
+        id: String,
+        field: &'static str,
+        saved: u64,
+        backend: u64,
+    },
     #[error("Protocol features {0:#x} saved without PROTOCOL_FEATURES acknowledged")]
     InconsistentProtocolFeatures(u64),
     #[error("Get vring base failed")]
