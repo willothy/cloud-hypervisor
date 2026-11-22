@@ -565,6 +565,38 @@ impl VhostUserHandle {
         Ok(())
     }
 
+    /// The handle of a new connection to a backend, before any message has
+    /// been exchanged on it.
+    fn new(vu: Frontend, faults: Option<&BackendFaults>) -> Self {
+        Self {
+            vu,
+            backend_features: 0,
+            ready: false,
+            supports_migration: false,
+            supports_device_state: false,
+            shm_log: None,
+            acked_features: 0,
+            vrings_info: None,
+            queue_indexes: Vec::new(),
+            vring_bases: None,
+            faults: faults.cloned(),
+            serves_faults: false,
+            postcopy_connection: None,
+            unadopted_uffd: None,
+        }
+    }
+
+    /// Claim the backend, read the features it offers, and run
+    /// `initialize`: what every new connection starts with.
+    fn handshake(&mut self, initialize: &mut impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
+        self.vu.set_owner().map_err(Error::VhostUserSetOwner)?;
+        self.backend_features = self
+            .vu
+            .get_features()
+            .map_err(Error::VhostUserGetFeatures)?;
+        initialize(self)
+    }
+
     pub fn connect_vhost_user(
         server: bool,
         socket_path: &str,
@@ -584,31 +616,8 @@ impl VhostUserHandle {
             info!("Waiting for incoming vhost-user connection...");
             let (stream, _) = listener.accept().map_err(Error::AcceptConnection)?;
 
-            let mut vhost_user = Self {
-                vu: Frontend::from_stream(stream, num_queues),
-                backend_features: 0,
-                ready: false,
-                supports_migration: false,
-                supports_device_state: false,
-                shm_log: None,
-                acked_features: 0,
-                vrings_info: None,
-                queue_indexes: Vec::new(),
-                vring_bases: None,
-                faults: faults.cloned(),
-                serves_faults: false,
-                postcopy_connection: None,
-                unadopted_uffd: None,
-            };
-            vhost_user
-                .vu
-                .set_owner()
-                .map_err(Error::VhostUserSetOwner)?;
-            vhost_user.backend_features = vhost_user
-                .vu
-                .get_features()
-                .map_err(Error::VhostUserGetFeatures)?;
-            initialize(&mut vhost_user)?;
+            let mut vhost_user = Self::new(Frontend::from_stream(stream, num_queues), faults);
+            vhost_user.handshake(&mut initialize)?;
             Ok(vhost_user)
         } else {
             const RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -647,36 +656,11 @@ impl VhostUserHandle {
 
             loop {
                 let connection = Frontend::connect(socket_path, num_queues)
-                    .map(|vu| Self {
-                        vu,
-                        backend_features: 0,
-                        ready: false,
-                        supports_migration: false,
-                        supports_device_state: false,
-                        shm_log: None,
-                        acked_features: 0,
-                        vrings_info: None,
-                        queue_indexes: Vec::new(),
-                        vring_bases: None,
-                        faults: faults.cloned(),
-                        serves_faults: false,
-                        postcopy_connection: None,
-                        unadopted_uffd: None,
-                    })
+                    .map(|vu| Self::new(vu, faults))
                     .map_err(Error::VhostUserConnect);
 
                 let (err, connect_failed) = match connection {
-                    Ok(mut vhost_user) => match vhost_user
-                        .vu
-                        .set_owner()
-                        .map_err(Error::VhostUserSetOwner)
-                        .and_then(|()| {
-                            vhost_user.backend_features = vhost_user
-                                .vu
-                                .get_features()
-                                .map_err(Error::VhostUserGetFeatures)?;
-                            initialize(&mut vhost_user)
-                        }) {
+                    Ok(mut vhost_user) => match vhost_user.handshake(&mut initialize) {
                         Ok(()) => return Ok(vhost_user),
                         Err(e) if e.is_transport_lost() => (e, false),
                         Err(e) => return Err(e),
