@@ -113,7 +113,9 @@ use crate::memory_manager::{
 };
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
-use crate::migration::{SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path};
+use crate::migration::{
+    RecvError, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE, get_vm_snapshot, url_to_path,
+};
 #[cfg(all(feature = "kvm", feature = "sev_snp", feature = "fw_cfg"))]
 use crate::sev::MeasuredBootInfo;
 use crate::util::flatten_error_chain_to_string;
@@ -177,6 +179,9 @@ pub enum Error {
 
     #[error("Error initializing VM")]
     InitializeVm(#[source] hypervisor::HypervisorVmError),
+
+    #[error("Error reading the snapshot")]
+    RecvSnapshot(#[source] RecvError),
 
     #[error("The hypervisor lacks a capability the VMM requires")]
     HypervisorExtensions(#[source] hypervisor::HypervisorError),
@@ -795,7 +800,7 @@ impl Vm {
             .map_err(Error::InitramfsFile)?;
 
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
-            let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::Restore)?;
+            let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::RecvSnapshot)?;
             vm_snapshot
                 .clock
                 .map(|state| {

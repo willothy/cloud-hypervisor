@@ -2120,9 +2120,9 @@ impl Vmm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
-                let snapshot = recv_vm_state(source_url).map_err(VmError::Restore)?;
+                let snapshot = recv_vm_state(source_url).map_err(VmError::RecvSnapshot)?;
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-                let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
+                let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::RecvSnapshot)?;
 
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
@@ -2757,7 +2757,7 @@ impl RequestHandler for Vmm {
                 let source_url = source_url.unwrap();
 
                 let vm_config = Arc::new(Mutex::new(
-                    recv_vm_config(source_url).map_err(VmError::Restore)?,
+                    recv_vm_config(source_url).map_err(VmError::RecvSnapshot)?,
                 ));
                 restore_cfg
                     .validate(&vm_config.lock().unwrap().clone())
