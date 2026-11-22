@@ -895,7 +895,9 @@ impl Cause {
                     evidence: Evidence::Refused,
                     ..Cause::at(RestoreSite::KvmSetMsrs)
                 },
-                MsrRefusal::Value(MsrValueCheck::Unexamined) => Cause::at(RestoreSite::KvmSetMsrs),
+                MsrRefusal::Value(MsrValueCheck::Unattributable | MsrValueCheck::Unexamined) => {
+                    Cause::at(RestoreSite::KvmSetMsrs)
+                }
             },
             #[cfg(target_arch = "x86_64")]
             HypervisorCpuError::IncompatibleVcpuState(incompatible) => {
@@ -1573,7 +1575,17 @@ mod tests {
             RestoreKind::Snapshot
         );
         assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::Unattributable)),
+            RestoreKind::Ambiguous
+        );
+        assert_eq!(
             msr(MsrRefusal::Value(MsrValueCheck::Unexamined)),
+            RestoreKind::Ambiguous
+        );
+        // KVM refuses every Hyper-V MSR when it can't allocate the vCPU's
+        // Hyper-V context, so a refused one can't be the snapshot's.
+        assert_eq!(
+            msr(MsrRefusal::Value(MsrValueCheck::of(0x40000021))),
             RestoreKind::Ambiguous
         );
         // A refused HWCR value is this host's kernel taking fewer bits than

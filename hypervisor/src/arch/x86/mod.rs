@@ -385,6 +385,12 @@ impl fmt::Display for MsrClass {
 /// Read from the `KVM_SET_MSRS` paths of Linux v6.18: `__kvm_set_msr()` and
 /// `kvm_set_msr_common()` in `arch/x86/kvm/x86.c`, `vmx_set_msr()`,
 /// `svm_set_msr()`, and the Hyper-V, MTRR and PMU handlers they call.
+///
+/// An MSR is [`MsrValueCheck::Content`] only when every way KVM refuses a
+/// value of it is the value's own fault. A refusal that can't be attributed
+/// leans towards the host or towards no one, never the snapshot, because a
+/// snapshot's fault is the only kind that destroys anything: it deletes the
+/// snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MsrValueCheck {
     /// What this host's processor or kernel supports: its features, its
@@ -396,6 +402,10 @@ pub enum MsrValueCheck {
     /// lets the MSR hold. No capture holds a value refused here, so the
     /// refusal is the snapshot's.
     Content,
+    /// The value's own content, or a failure on this host that KVM reports
+    /// the same way, such as an allocation it couldn't make, so the refusal
+    /// can't be attributed.
+    Unattributable,
     /// Not established from KVM's source: an MSR KVM v6.18 doesn't save or
     /// emulate, or one added since.
     Unexamined,
@@ -483,13 +493,14 @@ impl MsrValueCheck {
             | 0x11 // MSR_KVM_WALL_CLOCK
             | 0x12 // MSR_KVM_SYSTEM_TIME
             | 0x4b564d00..=0x4b564d02 // MSR_KVM_WALL_CLOCK_NEW, _SYSTEM_TIME_NEW, _ASYNC_PF_EN
-            | 0x4b564d04..=0x4b564d07 // MSR_KVM_PV_EOI_EN, _POLL_CONTROL, _ASYNC_PF_INT, _ASYNC_PF_ACK
-            // The Hyper-V MSRs other than the VP index: KVM takes what the
-            // host sets, refusing only values the Hyper-V ABI reserves,
-            // addresses outside the guest's memory, and SynIC state the
-            // checked SynIC capability already covers.
-            | 0x40000000..=0x40000001
-            | 0x40000003..=0x400001ff => MsrValueCheck::Content,
+            // MSR_KVM_PV_EOI_EN, _POLL_CONTROL, _ASYNC_PF_INT, _ASYNC_PF_ACK
+            | 0x4b564d04..=0x4b564d07 => MsrValueCheck::Content,
+            // The Hyper-V MSRs other than the VP index: KVM refuses values
+            // the Hyper-V ABI reserves, addresses outside the guest's memory
+            // and SynIC state the checked SynIC capability already covers,
+            // but also every one of them when it can't allocate the vCPU's
+            // Hyper-V context (kvm_hv_vcpu_init() in kvm_hv_set_msr_common()).
+            0x40000000..=0x40000001 | 0x40000003..=0x400001ff => MsrValueCheck::Unattributable,
             _ => MsrValueCheck::Unexamined,
         }
     }
@@ -662,6 +673,12 @@ mod tests {
         assert_eq!(
             MsrValueCheck::of(msr_index::MSR_IA32_CR_PAT),
             MsrValueCheck::Content
+        );
+        // KVM refuses a Hyper-V MSR the same way whether its value is
+        // reserved or KVM couldn't allocate the vCPU's Hyper-V context.
+        assert_eq!(
+            MsrValueCheck::of(0x40000021), // HV_X64_MSR_REFERENCE_TSC
+            MsrValueCheck::Unattributable
         );
         // VM_CR isn't among the MSRs KVM v6.18 saves or emulates.
         assert_eq!(MsrValueCheck::of(0xc0010114), MsrValueCheck::Unexamined);

@@ -429,7 +429,9 @@ impl fmt::Display for MsrRefusal {
                 "the host refused its value, which KVM checks against what this host supports"
             }
             MsrRefusal::Value(MsrValueCheck::Content) => "the host refused its value as invalid",
-            MsrRefusal::Value(MsrValueCheck::Unexamined) => "the host refused its value",
+            MsrRefusal::Value(MsrValueCheck::Unattributable | MsrValueCheck::Unexamined) => {
+                "the host refused its value"
+            }
         })
     }
 }
