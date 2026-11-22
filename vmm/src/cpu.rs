@@ -344,17 +344,17 @@ pub enum VcpuGateStatus {
 /// The gate a `Tenant` VM's vCPUs wait at, after their thread starts and
 /// before their seccomp filter and their first `KVM_RUN`, until the VMM's
 /// manager has given vcpu0 the tenant's core-scheduling cookie from outside
-/// the VMM and asked for the release ([`CpuManager::release_vcpus`]).
+/// the VMM and asked for the release ([`VcpuGate::release_vcpus`]).
 ///
 /// On release vcpu0 checks it holds a cookie, and every other vCPU takes
 /// vcpu0's (`PR_SCHED_CORE_SHARE_FROM`, within the thread group, so the
 /// VMM's unprivileged user may) and checks it holds it. Only once every gated
 /// vCPU has done so does any of them run: one failure fails the gate, and
-/// none runs. No thread but the
-/// vCPUs, and what KVM clones from them, ever holds the cookie, and no vCPU
-/// runs guest code, or has KVM clone a worker from it, without it. A vCPU
-/// started once the gate is open, by a hotplug, takes vcpu0's cookie as it
-/// starts.
+/// none runs. No thread but the vCPUs, and what KVM clones from them, ever
+/// holds the cookie, and no vCPU runs guest code, or has KVM clone a worker
+/// from it, without it; the one exception is a host with no SMT, which has
+/// no cookie to give (see [`VcpuGate::take_cookie`]). A vCPU started once
+/// the gate is open, by a hotplug, takes vcpu0's cookie as it starts.
 pub struct VcpuGate {
     state: Mutex<VcpuGateState>,
     changed: Condvar,
@@ -552,17 +552,26 @@ impl VcpuGate {
     /// Take the cookie of vcpu0's thread `leader` onto the calling vCPU thread,
     /// or check vcpu0 holds one when the calling thread is vcpu0, and check
     /// the calling thread holds it.
+    ///
+    /// On a host whose cores run no sibling threads (SMT off or absent) the
+    /// kernel answers every core-scheduling call with `ENODEV`: there is no
+    /// core a vCPU could share, and no cookie to hold, so the vCPU runs as
+    /// it is. The VMM's manager knows the host as the kernel does and gives
+    /// vcpu0 no cookie there.
     fn take_cookie(vcpu_id: u32, leader: i32) -> Result<()> {
-        if vcpu_id != 0 {
-            core_scheduling_take_from(leader).map_err(Error::CoreScheduling)?;
-        }
-        let leader_cookie = core_scheduling_cookie_of(leader).map_err(Error::CoreScheduling)?;
-        let own = core_scheduling_cookie_of(0).map_err(Error::CoreScheduling)?;
+        let leader_cookie = match core_scheduling_cookie_of(leader) {
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(()),
+            read => read.map_err(Error::CoreScheduling)?,
+        };
         if leader_cookie == 0 {
             return Err(Error::VcpuGate(
                 "vcpu0 holds no core-scheduling cookie".to_owned(),
             ));
         }
+        if vcpu_id != 0 {
+            core_scheduling_take_from(leader).map_err(Error::CoreScheduling)?;
+        }
+        let own = core_scheduling_cookie_of(0).map_err(Error::CoreScheduling)?;
         if own != leader_cookie {
             return Err(Error::VcpuGate(format!(
                 "vCPU {vcpu_id} holds {own:#x}, not vcpu0's {leader_cookie:#x}"
