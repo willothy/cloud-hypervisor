@@ -99,6 +99,8 @@ use crate::arch::x86::{
 };
 #[cfg(target_arch = "x86_64")]
 use crate::cpu::MsrRefusal;
+#[cfg(target_arch = "x86_64")]
+use crate::kvm::x86_64::restore::HostVcpuCapabilities;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::{CapturedClock, ClockRestoreMode};
 use crate::{
@@ -688,6 +690,9 @@ pub struct KvmVm {
     /// The system KVM handle, which answers what the host supports.
     #[cfg(target_arch = "x86_64")]
     kvm: Arc<Kvm>,
+    /// The host's `kvm.tsc_tolerance_ppm`, when the VMM was told it.
+    #[cfg(target_arch = "x86_64")]
+    tsc_tolerance_ppm: Option<u32>,
     #[cfg(feature = "sev_snp")]
     sev_fd: Option<x86_64::sev::SevFd>,
     #[cfg(feature = "sev_snp")]
@@ -1130,6 +1135,8 @@ impl vm::Vm for KvmVm {
             has_xcrs: self.check_extension(Cap::Xcrs),
             #[cfg(target_arch = "x86_64")]
             kvm: Arc::clone(&self.kvm),
+            #[cfg(target_arch = "x86_64")]
+            tsc_tolerance_ppm: self.tsc_tolerance_ppm,
             #[cfg(feature = "sev_snp")]
             vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
@@ -2089,6 +2096,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
                 fd: Arc::new(fd),
                 msrs,
                 kvm: Arc::clone(&self.kvm),
+                tsc_tolerance_ppm: _config.tsc_tolerance_ppm,
                 dirty_log_slots: RwLock::new(HashMap::new()),
                 #[cfg(feature = "sev_snp")]
                 sev_fd,
@@ -2238,6 +2246,9 @@ pub struct KvmVcpu {
     /// The system KVM handle, which answers what the host supports.
     #[cfg(target_arch = "x86_64")]
     kvm: Arc<Kvm>,
+    /// The host's `kvm.tsc_tolerance_ppm`, when the VMM was told it.
+    #[cfg(target_arch = "x86_64")]
+    tsc_tolerance_ppm: Option<u32>,
     #[cfg(feature = "sev_snp")]
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
@@ -3747,6 +3758,8 @@ impl cpu::Vcpu for KvmVcpu {
             move |source: errno::Error| cpu::HypervisorCpuError::SetVcpuState { ioctl, source }
         };
 
+        self.check_restorable(&state)?;
+
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             state.cpuid.iter().map(|e| (*e).into()).collect();
         let cpuid = <CpuId>::from_entries(&cpuid)
@@ -4248,6 +4261,56 @@ impl KvmVcpu {
 impl KvmVcpu {
     #[cfg(target_arch = "x86_64")]
     ///
+    /// Checks `state` against what the host can present before any of it
+    /// is set, so a restore the host lacks a capability for fails as
+    /// `IncompatibleVcpuState` rather than with the errno of whichever
+    /// ioctl refuses it.
+    ///
+    fn check_restorable(&self, state: &VcpuKvmState) -> cpu::Result<()> {
+        let failed = |ioctl: KvmIoctl| {
+            move |source: errno::Error| cpu::HypervisorCpuError::SetVcpuState { ioctl, source }
+        };
+        let host = HostVcpuCapabilities {
+            supported_cpuid: self
+                .kvm
+                .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                .map_err(failed(KvmIoctl::GetSupportedCpuid))?
+                .as_slice()
+                .iter()
+                .map(|e| (*e).into())
+                .collect(),
+            tsc_khz: self.fd.get_tsc_khz().map_err(failed(KvmIoctl::GetTscKhz))?,
+            tsc_scaling: self.kvm.check_extension(Cap::TscControl),
+            hyperv_synic: self.kvm.check_extension(Cap::HypervSynic),
+            nested_state: self.kvm.check_extension_int(Cap::NestedState) > 0,
+            smm: self.kvm.check_extension(Cap::X86Smm),
+        };
+
+        let incompatible = cpu::HypervisorCpuError::IncompatibleVcpuState;
+        if let Some(saved_khz) = state.tsc_khz {
+            host.check_tsc_khz(saved_khz, self.tsc_tolerance_ppm)
+                .map_err(incompatible)?;
+        }
+        host.check_cr4(state.sregs.cr4).map_err(incompatible)?;
+        host.check_xsave(&state.xsave).map_err(incompatible)?;
+        if self.has_xcrs {
+            host.check_xcrs(&state.xcrs).map_err(incompatible)?;
+        }
+        if state.hyperv_synic {
+            host.check_hyperv_synic().map_err(incompatible)?;
+        }
+        if let Some(nested) = &state.nested_state {
+            host.check_nested_state(nested).map_err(incompatible)?;
+        }
+        if state.guest_ssp.is_some() {
+            host.check_shadow_stack().map_err(incompatible)?;
+        }
+        host.check_vcpu_events(&state.vcpu_events)
+            .map_err(incompatible)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
     /// Decides whether a vCPU state restore can go on without `msr`, which
     /// KVM refused to set.
     ///
@@ -4521,6 +4584,8 @@ mod tests {
             has_xcrs: false,
             #[cfg(target_arch = "x86_64")]
             kvm: Arc::new(Kvm::new().unwrap()),
+            #[cfg(target_arch = "x86_64")]
+            tsc_tolerance_ppm: None,
             vm_fd,
             memory_slots: slots,
             memory_conversion_handler: Arc::new(OnceLock::new()),

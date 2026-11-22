@@ -263,6 +263,8 @@ impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
             #[cfg(feature = "sev_snp")]
             vmsa_features: 0,
             nested: _value.cpus.nested,
+            #[cfg(target_arch = "x86_64")]
+            tsc_tolerance_ppm: None,
             smt_enabled: _value
                 .cpus
                 .topology
@@ -2102,6 +2104,7 @@ impl Vmm {
             .map_err(MigratableError::MigrateReceive)
     }
 
+    #[cfg_attr(target_arch = "x86_64", expect(clippy::too_many_arguments))]
     fn vm_restore(
         &mut self,
         source_url: &str,
@@ -2110,6 +2113,7 @@ impl Vmm {
         memory_restore_mode: MemoryRestoreMode,
         restore_fault_socket: Option<&path::Path>,
         clock_restore_mode: GuestClockRestoreMode,
+        #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2165,6 +2169,8 @@ impl Vmm {
                     restore_fault_socket,
                     self.exit_reason.as_deref(),
                     Some(clock_restore_mode),
+                    #[cfg(target_arch = "x86_64")]
+                    tsc_tolerance_ppm,
                 )?;
 
                 if self
@@ -2611,6 +2617,8 @@ impl RequestHandler for Vmm {
                             None,
                             self.exit_reason.as_deref(),
                             None,
+                            #[cfg(target_arch = "x86_64")]
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2808,6 +2816,8 @@ impl RequestHandler for Vmm {
                     restore_cfg.memory_restore_mode,
                     restore_cfg.restore_fault_socket.as_deref(),
                     restore_cfg.clock_restore_mode,
+                    #[cfg(target_arch = "x86_64")]
+                    restore_cfg.tsc_tolerance_ppm,
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
@@ -2915,6 +2925,8 @@ impl RequestHandler for Vmm {
             None,
             None,
             self.exit_reason.as_deref(),
+            None,
+            #[cfg(target_arch = "x86_64")]
             None,
         )?;
 

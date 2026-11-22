@@ -1434,6 +1434,7 @@ impl Vm {
         restore_fault_socket: Option<&Path>,
         exit_reason: Option<&Path>,
         clock_restore_mode: Option<GuestClockRestoreMode>,
+        #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1466,6 +1467,10 @@ impl Vm {
             #[cfg(feature = "sev_snp")]
             if let Some(ref igvm) = igvm_file {
                 hv_config.vmsa_features = igvm_loader::extract_sev_features(igvm);
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                hv_config.tsc_tolerance_ppm = tsc_tolerance_ppm;
             }
             Self::create_hypervisor_vm(hypervisor.as_ref(), hv_config)?
         };

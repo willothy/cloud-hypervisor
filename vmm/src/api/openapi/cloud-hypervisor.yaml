@@ -1794,6 +1794,18 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/VmMemoryZoneUpdateData"
+        tsc_tolerance_ppm:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 4294967295
+          description: >
+            The host's kvm.tsc_tolerance_ppm: how far, in parts per million, a
+            guest's TSC rate may be from the host's for KVM to run it unscaled.
+            With it, a restore onto an x86_64 host that can't scale TSCs refuses
+            a saved rate outside that band before KVM is asked to set it, and
+            fails as incompatible; without it, KVM alone decides. Ignored on
+            other architectures.
 
     ReceiveMigrationData:
       required:

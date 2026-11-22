@@ -40,6 +40,10 @@ pub enum KvmIoctl {
     SetOneReg,
     /// `KVM_SET_VCPU_EVENTS`.
     SetVcpuEvents,
+    /// `KVM_GET_SUPPORTED_CPUID`.
+    GetSupportedCpuid,
+    /// `KVM_GET_TSC_KHZ`.
+    GetTscKhz,
 }
 
 impl KvmIoctl {
@@ -60,6 +64,8 @@ impl KvmIoctl {
             KvmIoctl::SetNestedState => "KVM_SET_NESTED_STATE",
             KvmIoctl::SetOneReg => "KVM_SET_ONE_REG",
             KvmIoctl::SetVcpuEvents => "KVM_SET_VCPU_EVENTS",
+            KvmIoctl::GetSupportedCpuid => "KVM_GET_SUPPORTED_CPUID",
+            KvmIoctl::GetTscKhz => "KVM_GET_TSC_KHZ",
         }
     }
 }

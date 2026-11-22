@@ -321,6 +321,12 @@ pub struct HypervisorVmConfig {
     pub vmsa_features: u64,
     pub nested: bool,
     pub smt_enabled: bool,
+    /// How far, in parts per million, a guest's TSC rate may be from the
+    /// host's for the host to run it unscaled: the host's
+    /// `kvm.tsc_tolerance_ppm`, when the VMM is told it. A vCPU state
+    /// restore checks a saved TSC rate against it.
+    #[cfg(target_arch = "x86_64")]
+    pub tsc_tolerance_ppm: Option<u32>,
 }
 
 #[derive(Copy, Clone)]

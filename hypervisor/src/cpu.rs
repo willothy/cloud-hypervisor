@@ -119,6 +119,12 @@ pub enum HypervisorCpuError {
         source: errno::Error,
     },
     ///
+    /// The host can't present part of a vCPU's saved state
+    ///
+    #[cfg(target_arch = "x86_64")]
+    #[error("The host can't present the saved vCPU state")]
+    IncompatibleVcpuState(#[source] IncompatibleVcpuState),
+    ///
     /// The saved vCPU state does not fit the hypervisor's structures
     ///
     #[error("Saved vCPU state does not fit the hypervisor's structures")]
@@ -350,6 +356,50 @@ pub enum HypervisorCpuError {
     Nmi(#[source] anyhow::Error),
     #[error("Failed to get nested guest state")]
     GetNestedState(#[source] anyhow::Error),
+}
+
+/// What a host lacks that a vCPU's saved state needs, found by comparing the
+/// state with the host's capabilities before restoring any of it.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum IncompatibleVcpuState {
+    /// The guest's TSC rate is beyond the band the host runs a TSC
+    /// unscaled within, and the host can't scale it.
+    #[error(
+        "The guest's TSC runs at {saved_khz} kHz, beyond {tolerance_ppm} ppm of the host's {host_khz} kHz, and the host can't scale it"
+    )]
+    TscRate {
+        saved_khz: u32,
+        host_khz: u32,
+        tolerance_ppm: u32,
+    },
+    /// CR4 has bits set the host doesn't let a guest set.
+    #[error("CR4 has bits {bits:#x} set that the host doesn't support")]
+    Cr4 { bits: u64 },
+    /// The XSAVE area holds state components the host doesn't support.
+    #[error("The XSAVE area holds state components {components:#x} the host doesn't support")]
+    XsaveComponents { components: u64 },
+    /// XCR0 enables state components the host doesn't support.
+    #[error("XCR0 enables state components {components:#x} the host doesn't support")]
+    Xcr0 { components: u64 },
+    /// The vCPU uses a Hyper-V synthetic interrupt controller the host
+    /// doesn't emulate.
+    #[error("The host doesn't emulate the Hyper-V synthetic interrupt controller the vCPU uses")]
+    HypervSynic,
+    /// The vCPU has nested state in a format the host doesn't restore.
+    #[error("The host doesn't restore nested state in format {format}")]
+    NestedState { format: u16 },
+    /// The vCPU has a CET shadow-stack pointer, and the host doesn't support
+    /// shadow stacks.
+    #[error("The host doesn't support the CET shadow stacks the vCPU uses")]
+    ShadowStack,
+    /// The vCPU's events carry flags for capabilities the VM doesn't enable.
+    #[error("The vCPU's events carry flags {flags:#x} for capabilities the VM doesn't enable")]
+    VcpuEvents { flags: u32 },
+    /// The vCPU is in or entering system-management mode, which the host
+    /// doesn't support.
+    #[error("The host doesn't support the system-management mode the vCPU is in")]
+    Smm,
 }
 
 /// Why KVM refused to set an MSR a vCPU's saved state carries.
