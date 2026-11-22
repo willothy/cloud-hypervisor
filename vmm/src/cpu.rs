@@ -209,7 +209,7 @@ pub enum Error {
     ApplySeccompFilter(#[source] seccompiler::Error),
 
     #[error("Error starting vCPU after restore")]
-    StartRestoreVcpu(#[source] anyhow::Error),
+    StartRestoreVcpu(#[source] Box<Error>),
 
     #[cfg(feature = "tdx")]
     #[error("Error initializing TDX")]
@@ -1669,9 +1669,7 @@ impl CpuManager {
 
     pub fn start_restored_vcpus(&mut self) -> Result<()> {
         self.activate_vcpus(self.vcpus.len() as u32, false, Some(true))
-            .map_err(|e| {
-                Error::StartRestoreVcpu(anyhow!("Failed to start restored vCPUs: {e:#?}"))
-            })?;
+            .map_err(|e| Error::StartRestoreVcpu(Box::new(e)))?;
 
         Ok(())
     }
