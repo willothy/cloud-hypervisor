@@ -319,6 +319,10 @@ pub enum MsrClass {
     /// A machine-check capability, control, status or bank register: what
     /// it holds is the record of hardware errors reported to the guest.
     MachineCheck,
+    /// A register reporting a fact about the host to the guest, which the
+    /// guest reads and never configures: the microcode revision, which a
+    /// host's microcode update changes, and the count of SMIs taken.
+    Informational,
     /// Any other MSR, which holds state the guest executes with, such as
     /// its system-call entry points, memory types, timers, paravirtual
     /// clock or speculation controls.
@@ -330,8 +334,9 @@ impl MsrClass {
     ///
     /// The ranges cover every counter KVM can expose: up to eight general
     /// purpose and four fixed counters on Intel, and the legacy four and the
-    /// six extended counters on AMD, and up to 32 machine-check banks. An
-    /// MSR is architectural unless it is listed here.
+    /// six extended counters on AMD, up to 32 machine-check banks, and the
+    /// two informational MSRs. An MSR is architectural unless it is listed
+    /// here.
     pub fn of(index: u32) -> Self {
         match index {
             // IA32_PMCx, IA32_PERFEVTSELx, the fixed counters and their
@@ -355,6 +360,7 @@ impl MsrClass {
             | msr_index::MSR_IA32_MCG_EXT_CTL
             | 0x280..=0x29f
             | 0x400..=0x47f => MsrClass::MachineCheck,
+            msr_index::MSR_IA32_UCODE_REV | msr_index::MSR_SMI_COUNT => MsrClass::Informational,
             _ => MsrClass::Architectural,
         }
     }
@@ -365,6 +371,7 @@ impl fmt::Display for MsrClass {
         f.write_str(match self {
             MsrClass::PerformanceMonitoring => "performance-monitoring",
             MsrClass::MachineCheck => "machine-check",
+            MsrClass::Informational => "informational",
             MsrClass::Architectural => "architectural",
         })
     }
@@ -480,7 +487,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_msr_class_tolerates_only_counters_and_machine_checks() {
+    fn test_msr_class_tolerates_only_counters_machine_checks_and_host_facts() {
         for index in [
             0xc1, 0xc8, 0x186, 0x18d, 0x309, 0x30c, 0x38d, 0x38f, 0x391, 0x3f1, 0x4c1, 0x600,
             0xc0010000, 0xc0010007, 0xc0010200, 0xc001020b, 0xc0000300, 0xc0000303,
@@ -493,6 +500,9 @@ mod tests {
         }
         for index in [0x179, 0x17a, 0x17b, 0x4d0, 0x280, 0x29f, 0x400, 0x47f] {
             assert_eq!(MsrClass::of(index), MsrClass::MachineCheck, "{index:#x}");
+        }
+        for index in [msr_index::MSR_IA32_UCODE_REV, msr_index::MSR_SMI_COUNT] {
+            assert_eq!(MsrClass::of(index), MsrClass::Informational, "{index:#x}");
         }
         for index in [
             msr_index::MSR_IA32_TSC,

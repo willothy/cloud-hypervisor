@@ -4350,8 +4350,9 @@ impl KvmVcpu {
     /// KVM refused to set.
     ///
     /// A performance-monitoring or machine-check MSR only records what the
-    /// guest observed, so the restore goes on without it, with a warning
-    /// naming it. Any other MSR is state the guest runs with, and the
+    /// guest observed, and an informational one reports a fact about the
+    /// host, so the restore goes on without it, with a warning naming it
+    /// and its class. Any other MSR is state the guest runs with, and the
     /// restore fails, saying whether this host lists the MSR at all, lists
     /// it as one describing a host capability, or lists it and refused its
     /// value. `hyperv_synic` says whether the state being restored has the
@@ -4362,7 +4363,7 @@ impl KvmVcpu {
         let class = MsrClass::of(msr.index);
         if class != MsrClass::Architectural {
             warn!(
-                "Restoring the vCPU without MSR {:#x}, a {class} MSR KVM refused to set",
+                "Restoring the vCPU without MSR {:#x} ({class}), which KVM refused to set",
                 msr.index
             );
             return Ok(());
