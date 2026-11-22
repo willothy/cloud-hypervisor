@@ -348,38 +348,34 @@ impl DemandPaging {
     /// and record that for good. Returns whether guest RAM is settled; once
     /// it is, without running `exchange` again.
     ///
-    /// A backend that refuses `POSTCOPY_END` may still be listening, and
-    /// would answer a plain memory table the postcopy way, so its
-    /// connection is shut down, for the device to reconnect plain. A
-    /// connection already lost has nothing left to end. Neither fails the
-    /// settle, which the fault handler has already made.
+    /// A connection already lost has nothing left to end: its backend's
+    /// userfaultfd went with it. A backend that refuses `POSTCOPY_END`, or
+    /// answers it any other way than with an acknowledgement, may still be
+    /// registered for missing faults on guest RAM that nothing serves any
+    /// more, and fails the settle with [`SettleError::EndRefused`], leaving
+    /// guest RAM recorded as demand-paged. Shutting its connection down
+    /// instead would leave the device to reconnect only if its worker is
+    /// running, which it is not once the guest has reset the device, so the
+    /// caller is left to fail the VM.
     pub fn settle<E>(
         &self,
         exchange: impl FnOnce() -> result::Result<bool, E>,
-    ) -> result::Result<bool, E> {
+    ) -> result::Result<bool, SettleError<E>> {
         let mut settled = self.settled.write().unwrap();
         if *settled {
             return Ok(true);
         }
-        if !exchange()? {
+        if !exchange().map_err(SettleError::Exchange)? {
             return Ok(false);
         }
         let connections = mem::take(&mut *self.connections.lock().unwrap());
         for (connection, mut frontend) in connections {
-            let Err(e) = frontend.postcopy_end() else {
-                continue;
-            };
-            error!("Failed ending the postcopy flow of vhost-user connection {connection}: {e:?}");
-            if vhost_error_is_transport_lost(&e) {
-                continue;
-            }
-            // SAFETY: shutting down the connection's own socket, which its
-            // frontend keeps open.
-            if unsafe { libc::shutdown(frontend.as_raw_fd(), libc::SHUT_RDWR) } != 0 {
-                error!(
-                    "Failed shutting down vhost-user connection {connection}, still on the postcopy flow: {}",
-                    io::Error::last_os_error()
-                );
+            match frontend.postcopy_end() {
+                Ok(()) => {}
+                Err(e) if vhost_error_is_transport_lost(&e) => warn!(
+                    "Vhost-user connection {connection} was lost before the settle ended its postcopy flow: {e:?}"
+                ),
+                Err(error) => return Err(SettleError::EndRefused { connection, error }),
             }
         }
         *settled = true;
@@ -418,6 +414,25 @@ impl DemandPaging {
             paging: Arc::clone(self),
         }
     }
+}
+
+/// Why [`DemandPaging::settle`] failed.
+#[derive(Debug, Error)]
+pub enum SettleError<E> {
+    /// The settle exchange with the fault handler failed, and nothing
+    /// changed.
+    #[error("the settle exchange with the fault handler failed")]
+    Exchange(#[source] E),
+    /// The fault handler settled guest RAM, but the backend of vhost-user
+    /// connection `connection` did not acknowledge the end of its postcopy
+    /// flow, so it may still be registered for missing faults that nothing
+    /// serves.
+    #[error("the backend of vhost-user connection {connection} did not end its postcopy flow")]
+    EndRefused {
+        connection: u64,
+        #[source]
+        error: VhostError,
+    },
 }
 
 /// A backend connection's place on the postcopy flow, registered with the

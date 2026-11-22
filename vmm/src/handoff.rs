@@ -53,7 +53,7 @@ use std::{io, process};
 use log::error;
 use serde::{Deserialize, Serialize};
 use virtio_devices::vhost_user::{
-    BackendFaultHandler, BackendFaults, BackendMapping, DemandPaging,
+    BackendFaultHandler, BackendFaults, BackendMapping, DemandPaging, SettleError,
 };
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
@@ -107,7 +107,8 @@ const MAX_CAPTURE_BODY_LEN: usize = 1 << 30;
 /// every other request for long.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The reason the VMM records when it exits because its fault session is gone.
+/// The reason the VMM records when it exits because its fault session is
+/// gone, or because a vhost-user backend did not leave it at the settle.
 /// Its manager settles a VMM that recorded this as failed, rather than as one
 /// that crashed and is restored from its latest checkpoint.
 const SESSION_LOST: &str = "session-lost";
@@ -343,7 +344,11 @@ impl FaultSession {
     /// changed. An exchange that fails any other way is the loss of the
     /// session (see [`Self::exchange_settle`]): the VMM records that and
     /// exits, as it does when the handler hangs up, which is also how a
-    /// handler that does not know the settle message answers one.
+    /// handler that does not know the settle message answers one. So is a
+    /// backend that does not end its postcopy flow once the handler has
+    /// settled: it may still be registered for missing faults on guest RAM
+    /// the handler no longer serves, and a device left to it could lose its
+    /// disk with the guest none the wiser.
     pub(crate) fn settle(&mut self) -> io::Result<bool> {
         if !self.demand_paged() {
             return Ok(true);
@@ -362,7 +367,17 @@ impl FaultSession {
                     HangupWatch::exit(self.exit_reason.as_deref())
                 }
             }
-        })?;
+        });
+        let settled = match settled {
+            Ok(settled) => settled,
+            Err(SettleError::Exchange(error)) => return Err(error),
+            Err(SettleError::EndRefused { connection, error }) => {
+                error!(
+                    "the backend of vhost-user connection {connection} did not end its postcopy flow once guest RAM settled, and may still wait on faults nothing serves: {error:?}"
+                );
+                HangupWatch::exit(self.exit_reason.as_deref())
+            }
+        };
         if settled {
             self.mode = RegistrationMode::WriteProtectOnly;
         }

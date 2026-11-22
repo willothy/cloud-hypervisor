@@ -1066,7 +1066,7 @@ mod tests {
 
     use super::*;
     use crate::GuestMemoryMmap;
-    use crate::vhost_user::{BackendFaultHandler, DemandPaging};
+    use crate::vhost_user::{BackendFaultHandler, DemandPaging, SettleError};
 
     /// A fault handler for tests whose backends never get a postcopy table.
     struct Unused;
@@ -1248,21 +1248,38 @@ mod tests {
     }
 
     /// A backend that refuses to end the postcopy flow may still be
-    /// listening, so the settle shuts its connection down, and settles.
+    /// registered for missing faults, so it fails the settle, naming its
+    /// connection, and guest RAM stays recorded as demand-paged.
     #[test]
-    fn a_refused_end_shuts_the_connection_down() {
+    fn a_refused_end_fails_the_settle() {
         let paging = Arc::new(DemandPaging::default());
         let (vu, backend, _dir) = postcopy_connection(&paging, true, |mut stream| {
             assert!(read_request(&mut stream, FrontendReq::POSTCOPY_END).is_empty());
             reply(&mut stream, FrontendReq::POSTCOPY_END, 1);
             assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
         });
+        let registered = vu.postcopy_connection.as_ref().unwrap().id();
+
+        match paging.settle(|| Ok::<_, ()>(true)) {
+            Err(SettleError::EndRefused { connection, .. }) => assert_eq!(connection, registered),
+            other => panic!("unexpected settle result: {other:?}"),
+        }
+        assert!(!paging.settled());
+
+        drop(vu);
+        backend.join().unwrap();
+    }
+
+    /// A connection lost before the settle ends it has nothing left to end,
+    /// and the settle goes through.
+    #[test]
+    fn a_lost_connection_does_not_fail_the_settle() {
+        let paging = Arc::new(DemandPaging::default());
+        let (vu, backend, _dir) = postcopy_connection(&paging, true, drop);
+        backend.join().unwrap();
 
         assert!(paging.settle(|| Ok::<_, ()>(true)).unwrap());
         assert!(!any_on_the_flow(&paging));
-
-        // The backend sees the connection close while the handle lives on.
-        backend.join().unwrap();
         drop(vu);
     }
 
