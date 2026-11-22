@@ -178,6 +178,28 @@ pub enum Error {
     #[error("Error initializing VM")]
     InitializeVm(#[source] hypervisor::HypervisorVmError),
 
+    #[error("The hypervisor lacks a capability the VMM requires")]
+    HypervisorExtensions(#[source] hypervisor::HypervisorError),
+
+    #[error("Error creating the hypervisor VM")]
+    CreateHypervisorVm(#[source] hypervisor::HypervisorError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error setting the VM's identity map address")]
+    SetIdentityMapAddress(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error setting the VM's TSS address")]
+    SetTssAddress(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error enabling the split irqchip")]
+    EnableSplitIrq(#[source] hypervisor::HypervisorVmError),
+
+    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+    #[error("Error enabling the x2APIC API")]
+    EnableX2ApicApi(#[source] hypervisor::HypervisorVmError),
+
     #[error("No device with id {0:?} to remove")]
     NoDeviceToRemove(String),
 
@@ -1477,7 +1499,7 @@ impl Vm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         if vm_config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
-            vm.enable_x2apic_api().unwrap();
+            vm.enable_x2apic_api().map_err(Error::EnableX2ApicApi)?;
         }
 
         let phys_bits = physical_bits(
@@ -1553,16 +1575,21 @@ impl Vm {
         hypervisor: &dyn hypervisor::Hypervisor,
         config: HypervisorVmConfig,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
-        hypervisor.check_required_extensions().unwrap();
+        hypervisor
+            .check_required_extensions()
+            .map_err(Error::HypervisorExtensions)?;
 
-        let vm = hypervisor.create_vm(config).unwrap();
+        let vm = hypervisor
+            .create_vm(config)
+            .map_err(Error::CreateHypervisorVm)?;
 
         #[cfg(target_arch = "x86_64")]
         {
             vm.set_identity_map_address(KVM_IDENTITY_MAP_START.0)
-                .unwrap();
-            vm.set_tss_address(KVM_TSS_START.0 as usize).unwrap();
-            vm.enable_split_irq().unwrap();
+                .map_err(Error::SetIdentityMapAddress)?;
+            vm.set_tss_address(KVM_TSS_START.0 as usize)
+                .map_err(Error::SetTssAddress)?;
+            vm.enable_split_irq().map_err(Error::EnableSplitIrq)?;
         }
 
         Ok(vm)

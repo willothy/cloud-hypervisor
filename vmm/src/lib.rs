@@ -1379,7 +1379,8 @@ impl Vmm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         if config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
-            vm.enable_x2apic_api().unwrap();
+            vm.enable_x2apic_api()
+                .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
         }
 
         let phys_bits = vm::physical_bits(
