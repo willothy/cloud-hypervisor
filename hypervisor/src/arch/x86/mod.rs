@@ -526,6 +526,7 @@ mod tests {
             0x4b564d01, // MSR_KVM_SYSTEM_TIME_NEW
             0xc0010008, // past the legacy AMD counters
             0x480,      // past the last machine-check bank
+            msr_index::MSR_K7_HWCR,
         ] {
             assert_eq!(MsrClass::of(index), MsrClass::Architectural, "{index:#x}");
         }
