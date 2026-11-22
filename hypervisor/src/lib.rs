@@ -59,9 +59,9 @@ use anyhow::anyhow;
 use concat_idents::concat_idents;
 #[cfg(target_arch = "x86_64")]
 pub use cpu::CpuVendor;
-#[cfg(target_arch = "x86_64")]
-pub use cpu::MsrRefusal;
 pub use cpu::{HypervisorCpuError, Vcpu, VmExit};
+#[cfg(target_arch = "x86_64")]
+pub use cpu::{IncompatibleVcpuState, MsrRefusal};
 pub use device::HypervisorDeviceError;
 pub use ioctl::KvmIoctl;
 #[cfg(all(feature = "kvm", target_arch = "aarch64"))]
