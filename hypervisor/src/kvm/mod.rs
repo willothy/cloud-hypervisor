@@ -91,6 +91,8 @@ pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
 #[cfg(target_arch = "x86_64")]
 use crate::ClockData;
 #[cfg(target_arch = "x86_64")]
+use crate::KvmIoctl;
+#[cfg(target_arch = "x86_64")]
 use crate::arch::x86::{
     CpuIdEntry, FpuState, LapicState, MTRR_ENABLE, MTRR_MEM_TYPE_WB, MTRR_MSR_INDICES, MsrEntry,
     NUM_IOAPIC_PINS, SpecialRegisters, VcpuMsrConfigUpdate, XsaveState, msr_index,
@@ -2778,16 +2780,7 @@ impl cpu::Vcpu for KvmVcpu {
     /// X86 specific call to enable HyperV SynIC
     ///
     fn enable_hyperv_synic(&self) -> cpu::Result<()> {
-        // Update the information about Hyper-V SynIC being enabled and
-        // emulated as it will influence later which MSRs should be saved.
-        self.hyperv_synic.store(true, Ordering::Release);
-
-        let cap = kvm_enable_cap {
-            cap: KVM_CAP_HYPERV_SYNIC,
-            ..Default::default()
-        };
-        self.fd
-            .enable_cap(&cap)
+        self.enable_hyperv_synic_cap()
             .map_err(|e| cpu::HypervisorCpuError::EnableHyperVSyncIc(e.into()))
     }
 
@@ -3734,10 +3727,27 @@ impl cpu::Vcpu for KvmVcpu {
     /// ```
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
-        self.set_cpuid2(&state.cpuid)?;
-        self.set_mp_state(state.mp_state.into())?;
-        self.set_regs(&state.regs.into())?;
-        self.set_sregs(&state.sregs.into())?;
+        let failed = |ioctl: KvmIoctl| {
+            move |source: errno::Error| cpu::HypervisorCpuError::SetVcpuState { ioctl, source }
+        };
+
+        let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+            state.cpuid.iter().map(|e| (*e).into()).collect();
+        let cpuid = <CpuId>::from_entries(&cpuid)
+            .context("Too many CPUID entries")
+            .map_err(cpu::HypervisorCpuError::MalformedVcpuState)?;
+        self.fd
+            .set_cpuid2(&cpuid)
+            .map_err(failed(KvmIoctl::SetCpuid2))?;
+        self.fd
+            .set_mp_state(state.mp_state)
+            .map_err(failed(KvmIoctl::SetMpState))?;
+        self.fd
+            .set_regs(&state.regs)
+            .map_err(failed(KvmIoctl::SetRegs))?;
+        self.fd
+            .set_sregs(&state.sregs)
+            .map_err(failed(KvmIoctl::SetSregs))?;
         if self.xsave_size > 0 {
             self.set_xsave2(&state.xsave)?;
         } else {
@@ -3746,15 +3756,23 @@ impl cpu::Vcpu for KvmVcpu {
         if self.has_xcrs {
             self.set_xcrs(&state.xcrs)?;
         }
-        self.set_lapic(&state.lapic_state)?;
-        self.set_fpu(&state.fpu)?;
+        self.fd
+            .set_lapic(&state.lapic_state.clone().into())
+            .map_err(failed(KvmIoctl::SetLapic))?;
+        self.fd
+            .set_fpu(&state.fpu.clone().into())
+            .map_err(failed(KvmIoctl::SetFpu))?;
 
         if let Some(freq) = state.tsc_khz {
-            self.set_tsc_khz(freq)?;
+            match self.fd.set_tsc_khz(freq) {
+                Err(e) if e.errno() == libc::EIO => {}
+                result => result.map_err(failed(KvmIoctl::SetTscKhz))?,
+            }
         }
 
         if state.hyperv_synic {
-            self.enable_hyperv_synic()?;
+            self.enable_hyperv_synic_cap()
+                .map_err(failed(KvmIoctl::EnableCap))?;
         }
 
         // Try to set all MSRs previously stored.
@@ -3762,8 +3780,15 @@ impl cpu::Vcpu for KvmVcpu {
         // expected amount, we fallback onto a slower method by setting MSRs
         // by chunks. This is the only way to make sure we try to set as many
         // MSRs as possible, even if some MSRs are not supported.
+        let set_msrs = |msrs: &[MsrEntry]| -> cpu::Result<usize> {
+            let msrs: Vec<kvm_msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
+            let msrs = MsrEntries::from_entries(&msrs)
+                .context("Too many MSR entries")
+                .map_err(cpu::HypervisorCpuError::MalformedVcpuState)?;
+            self.fd.set_msrs(&msrs).map_err(failed(KvmIoctl::SetMsrs))
+        };
         let expected_num_msrs = state.msrs.len();
-        let num_msrs = self.set_msrs(&state.msrs)?;
+        let num_msrs = set_msrs(&state.msrs)?;
         if num_msrs != expected_num_msrs {
             let mut faulty_msr_index = num_msrs;
             let mut required_feature_msr_not_set = false;
@@ -3784,7 +3809,7 @@ impl cpu::Vcpu for KvmVcpu {
 
                 let sub_msr_entries = &state.msrs[start_pos..];
 
-                let num_msrs = self.set_msrs(sub_msr_entries)?;
+                let num_msrs = set_msrs(sub_msr_entries)?;
 
                 if num_msrs == sub_msr_entries.len() {
                     break;
@@ -3804,7 +3829,7 @@ impl cpu::Vcpu for KvmVcpu {
         if let Some(ssp) = state.guest_ssp {
             self.fd
                 .set_one_reg(kvm_x86_reg_kvm(KVM_REG_GUEST_SSP), &ssp.to_le_bytes())
-                .map_err(|e| cpu::HypervisorCpuError::SetRegister(e.into()))?;
+                .map_err(failed(KvmIoctl::SetOneReg))?;
         }
 
         self.set_vcpu_events(&state.vcpu_events)?;
@@ -4252,6 +4277,22 @@ impl KvmVcpu {
 impl KvmVcpu {
     #[cfg(target_arch = "x86_64")]
     ///
+    /// Enables the Hyper-V synthetic interrupt controller on this vCPU.
+    ///
+    fn enable_hyperv_synic_cap(&self) -> result::Result<(), errno::Error> {
+        // Update the information about Hyper-V SynIC being enabled and
+        // emulated as it will influence later which MSRs should be saved.
+        self.hyperv_synic.store(true, Ordering::Release);
+
+        let cap = kvm_enable_cap {
+            cap: KVM_CAP_HYPERV_SYNIC,
+            ..Default::default()
+        };
+        self.fd.enable_cap(&cap)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
     /// X86 specific call that returns the vcpu's current "xsave struct".
     ///
     fn get_xsave(&self) -> cpu::Result<XsaveState> {
@@ -4270,13 +4311,16 @@ impl KvmVcpu {
         let xsave: kvm_bindings::kvm_xsave = (*xsave)
             .clone()
             .try_into()
-            .map_err(|e: XsaveStateError| cpu::HypervisorCpuError::GetXsaveState(e.into()))?;
+            .map_err(|e: XsaveStateError| cpu::HypervisorCpuError::MalformedVcpuState(e.into()))?;
         // SAFETY: Here we trust the kernel not to read past the end of the kvm_xsave struct
         // when calling the kvm-ioctl library function.
         unsafe {
             self.fd
                 .set_xsave(&xsave)
-                .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))
+                .map_err(|source| cpu::HypervisorCpuError::SetVcpuState {
+                    ioctl: KvmIoctl::SetXsave,
+                    source,
+                })
         }
     }
 
@@ -4318,12 +4362,15 @@ impl KvmVcpu {
         );
         let xsave = xsave_state
             .to_xsave2()
-            .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))?;
+            .map_err(|e| cpu::HypervisorCpuError::MalformedVcpuState(e.into()))?;
         // SAFETY: The caller guarantees that xsave contains valid data
         unsafe {
             self.fd
                 .set_xsave2(&xsave)
-                .map_err(|e| cpu::HypervisorCpuError::SetXsaveState(e.into()))
+                .map_err(|source| cpu::HypervisorCpuError::SetVcpuState {
+                    ioctl: KvmIoctl::SetXsave,
+                    source,
+                })
         }
     }
 
@@ -4344,7 +4391,10 @@ impl KvmVcpu {
     fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> cpu::Result<()> {
         self.fd
             .set_xcrs(xcrs)
-            .map_err(|e| cpu::HypervisorCpuError::SetXcsr(e.into()))
+            .map_err(|source| cpu::HypervisorCpuError::SetVcpuState {
+                ioctl: KvmIoctl::SetXcrs,
+                source,
+            })
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -4366,7 +4416,10 @@ impl KvmVcpu {
     fn set_vcpu_events(&self, events: &VcpuEvents) -> cpu::Result<()> {
         self.fd
             .set_vcpu_events(events)
-            .map_err(|e| cpu::HypervisorCpuError::SetVcpuEvents(e.into()))
+            .map_err(|source| cpu::HypervisorCpuError::SetVcpuState {
+                ioctl: KvmIoctl::SetVcpuEvents,
+                source,
+            })
     }
 
     /// Get the state of the nested guest from the current vCPU,
@@ -4398,7 +4451,10 @@ impl KvmVcpu {
     fn set_nested_state(&self, state: &KvmNestedStateBuffer) -> cpu::Result<()> {
         self.fd
             .set_nested_state(state)
-            .map_err(|e| cpu::HypervisorCpuError::GetNestedState(e.into()))
+            .map_err(|source| cpu::HypervisorCpuError::SetVcpuState {
+                ioctl: KvmIoctl::SetNestedState,
+                source,
+            })
     }
 }
 

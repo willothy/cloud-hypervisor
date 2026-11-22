@@ -17,6 +17,7 @@ use std::result;
 #[cfg(feature = "sev_snp")]
 use igvm::snp_defs::SevVmsa;
 use thiserror::Error;
+use vmm_sys_util::errno;
 #[cfg(not(target_arch = "riscv64"))]
 use {anyhow::anyhow, vm_memory::GuestAddress};
 
@@ -30,7 +31,7 @@ use crate::arch::aarch64::ExtendedReg;
 use crate::arch::x86::{CpuIdEntry, FpuState, LapicState, MsrEntry, SpecialRegisters, msr_index};
 #[cfg(feature = "tdx")]
 use crate::kvm::{TdxExitDetails, TdxExitStatus};
-use crate::{CpuState, HypervisorType, MpState, StandardRegisters};
+use crate::{CpuState, HypervisorType, KvmIoctl, MpState, StandardRegisters};
 
 #[cfg(target_arch = "x86_64")]
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -106,6 +107,20 @@ pub enum HypervisorCpuError {
     #[error("Failed to restore required feature MSR")]
     RestoreFeatureMsr,
     ///
+    /// A KVM ioctl restoring part of a vCPU's saved state failed
+    ///
+    #[error("Failed to restore vCPU state with {ioctl}")]
+    SetVcpuState {
+        ioctl: KvmIoctl,
+        #[source]
+        source: errno::Error,
+    },
+    ///
+    /// The saved vCPU state does not fit the hypervisor's structures
+    ///
+    #[error("Saved vCPU state does not fit the hypervisor's structures")]
+    MalformedVcpuState(#[source] anyhow::Error),
+    ///
     /// Getting Msr entries error
     ///
     #[error("Failed to get Msr entries")]
@@ -120,12 +135,6 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to get MP state")]
     GetMpState(#[source] anyhow::Error),
-    ///
-    /// Setting Saved Processor Extended States error
-    ///
-    #[cfg(feature = "kvm")]
-    #[error("Failed to set Saved Processor Extended States")]
-    SetXsaveState(#[source] anyhow::Error),
     ///
     /// Getting Saved Processor Extended States error
     ///

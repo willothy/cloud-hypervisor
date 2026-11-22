@@ -45,6 +45,9 @@ mod cpu;
 /// Device related module
 mod device;
 
+/// KVM ioctl names for error reporting
+mod ioctl;
+
 use std::result;
 use std::sync::Arc;
 #[cfg(target_arch = "x86_64")]
@@ -58,6 +61,7 @@ use concat_idents::concat_idents;
 pub use cpu::CpuVendor;
 pub use cpu::{HypervisorCpuError, Vcpu, VmExit};
 pub use device::HypervisorDeviceError;
+pub use ioctl::KvmIoctl;
 #[cfg(all(feature = "kvm", target_arch = "aarch64"))]
 pub use kvm::aarch64;
 #[cfg(all(feature = "kvm", target_arch = "riscv64"))]
