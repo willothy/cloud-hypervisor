@@ -17,7 +17,7 @@ use std::io::Write;
 use std::mem::zeroed;
 use std::os::unix::thread::JoinHandleExt;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Condvar, Mutex, MutexGuard, PoisonError};
 use std::{any, cmp, hint, io, panic, result, thread, time};
 
 #[cfg(target_arch = "aarch64")]
@@ -69,6 +69,7 @@ use libc::{c_void, siginfo_t};
 use linux_loader::elf::Elf64_Nhdr;
 use log::{debug, error, info, warn};
 use seccompiler::{BpfProgram, SeccompAction, apply_filter};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::BusDevice;
@@ -248,6 +249,9 @@ pub enum Error {
     #[error("Error enabling core scheduling")]
     CoreScheduling(#[source] io::Error),
 
+    #[error("The vCPUs' core-scheduling gate: {0}")]
+    VcpuGate(String),
+
     #[error("Error generating MSR configuration update")]
     MsrConfigurationUpdate(#[source] arch::Error),
 
@@ -337,6 +341,299 @@ fn core_scheduling_cookie() -> u64 {
         return 0;
     }
     cookie
+}
+
+/// Where a `Tenant` VM's vCPUs stand against their core-scheduling gate (see
+/// [`VcpuGate`]), as `vm.info` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum VcpuGateStatus {
+    /// The vCPUs wait, before running any guest code, for `vm.release-vcpus`.
+    Closed,
+    /// Every vCPU took vcpu0's cookie and runs.
+    Released,
+    /// A release failed: no vCPU of the VM runs guest code.
+    Failed,
+}
+
+/// The gate a `Tenant` VM's vCPUs wait at, after their thread starts and
+/// before their seccomp filter and their first `KVM_RUN`, until the VMM's
+/// manager has given vcpu0 the tenant's core-scheduling cookie from outside
+/// the VMM and asked for the release ([`VcpuGate::release_vcpus`]).
+///
+/// On release vcpu0 checks it holds a cookie, and every other vCPU takes
+/// vcpu0's (`PR_SCHED_CORE_SHARE_FROM`, within the thread group, so the
+/// VMM's unprivileged user may) and checks it holds it. Only once every gated
+/// vCPU has done so does any of them run: one failure fails the gate, and
+/// none runs. No thread but the vCPUs, and what KVM clones from them, ever
+/// holds the cookie, and no vCPU runs guest code, or has KVM clone a worker
+/// from it, without it; the one exception is a host with no SMT, which has
+/// no cookie to give (see [`VcpuGate::take_cookie`]). A vCPU started once
+/// the gate is open, by a hotplug, takes vcpu0's cookie as it starts.
+pub struct VcpuGate {
+    state: Mutex<VcpuGateState>,
+    changed: Condvar,
+}
+
+struct VcpuGateState {
+    status: VcpuGateStatus,
+    /// A release is under way: the gated vCPUs take the cookie and report,
+    /// then wait for the gate's verdict.
+    releasing: bool,
+    /// vcpu0's thread id, once its thread runs.
+    leader: Option<i32>,
+    /// The vCPU threads waiting at the gate, or past it, since it closed.
+    gated: usize,
+    /// Those that took the cookie on release.
+    passed: usize,
+    /// Why each of the others did not.
+    failures: Vec<String>,
+    /// The VMM is shutting down: waiting vCPUs leave without running.
+    abandoned: bool,
+}
+
+/// How a vCPU thread meets the gate as it starts.
+#[derive(Debug)]
+enum VcpuGateArrival {
+    /// The gate is closed: wait at it.
+    Gated,
+    /// The gate is open, with vcpu0's thread holding the cookie: take it now.
+    Open(i32),
+}
+
+impl VcpuGate {
+    /// How long a release waits for every gated vCPU to take the cookie.
+    const RELEASE_TIMEOUT: time::Duration = time::Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(VcpuGateState {
+                status: VcpuGateStatus::Closed,
+                releasing: false,
+                leader: None,
+                gated: 0,
+                passed: 0,
+                failures: Vec::new(),
+                abandoned: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, VcpuGateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The gate's status.
+    pub fn status(&self) -> VcpuGateStatus {
+        self.state().status
+    }
+
+    /// Release the gated vCPUs once vcpu0 holds the tenant's cookie: every
+    /// vCPU takes vcpu0's cookie, checks it holds it, and runs. Answers once
+    /// all have, and fails, running none, when vcpu0 holds no cookie or any
+    /// vCPU cannot take it within [`Self::RELEASE_TIMEOUT`].
+    pub fn release_vcpus(&self) -> Result<()> {
+        self.release(Self::RELEASE_TIMEOUT)
+    }
+
+    /// Meet the gate as vCPU `vcpu_id`'s thread `tid` starts, before the start
+    /// barrier, so every vCPU of an activation has arrived by the time it
+    /// returns.
+    fn arrive(&self, vcpu_id: u32, tid: i32) -> Result<VcpuGateArrival> {
+        let mut state = self.state();
+        match state.status {
+            VcpuGateStatus::Closed => {
+                if vcpu_id == 0 {
+                    state.leader = Some(tid);
+                }
+                state.gated += 1;
+                Ok(VcpuGateArrival::Gated)
+            }
+            VcpuGateStatus::Released => state
+                .leader
+                .map(VcpuGateArrival::Open)
+                .ok_or(Error::VcpuGate("the gate opened with no vcpu0".to_owned())),
+            VcpuGateStatus::Failed => {
+                Err(Error::VcpuGate("the VM's vCPU release failed".to_owned()))
+            }
+        }
+    }
+
+    /// Wait at the gate until a release starts, answering vcpu0's thread id,
+    /// or fail if the VMM is shutting down.
+    fn wait_for_release(&self) -> Result<i32> {
+        let state = self
+            .changed
+            .wait_while(self.state(), |state| {
+                !state.releasing && state.status == VcpuGateStatus::Closed && !state.abandoned
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        if state.abandoned {
+            return Err(Error::VcpuGate("the VMM is shutting down".to_owned()));
+        }
+        if !state.releasing {
+            return Err(Error::VcpuGate(format!(
+                "the vCPUs are {:?} with no release under way",
+                state.status
+            )));
+        }
+        state.leader.ok_or(Error::VcpuGate(
+            "a release started with no vcpu0".to_owned(),
+        ))
+    }
+
+    /// Report how a gated vCPU took the cookie on release, and wait for the
+    /// gate's verdict: `Ok` only once every gated vCPU took it, when the
+    /// calling vCPU may run.
+    fn report(&self, taken: Result<()>) -> Result<()> {
+        let mut state = self.state();
+        match taken {
+            Ok(()) => state.passed += 1,
+            Err(error) => state.failures.push(error.to_string()),
+        }
+        self.changed.notify_all();
+        let state = self
+            .changed
+            .wait_while(state, |state| {
+                state.status == VcpuGateStatus::Closed && !state.abandoned
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        match state.status {
+            VcpuGateStatus::Released if !state.abandoned => Ok(()),
+            VcpuGateStatus::Released | VcpuGateStatus::Closed => {
+                Err(Error::VcpuGate("the VMM is shutting down".to_owned()))
+            }
+            VcpuGateStatus::Failed => {
+                Err(Error::VcpuGate("the VM's vCPU release failed".to_owned()))
+            }
+        }
+    }
+
+    /// Open the gate, and wait until every gated vCPU has taken vcpu0's
+    /// cookie, or `timeout` passes. Every gated vCPU runs once all have taken
+    /// it; on any failure the gate fails and none runs.
+    fn release(&self, timeout: time::Duration) -> Result<()> {
+        let mut state = self.state();
+        if state.releasing {
+            return Err(Error::VcpuGate("a release is already under way".to_owned()));
+        }
+        if state.status != VcpuGateStatus::Closed {
+            return Err(Error::VcpuGate(format!(
+                "the vCPUs are already {:?}",
+                state.status
+            )));
+        }
+        if state.leader.is_none() {
+            return Err(Error::VcpuGate("vcpu0 has not started".to_owned()));
+        }
+        state.releasing = true;
+        self.changed.notify_all();
+        let (mut state, waited) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.passed + state.failures.len() < state.gated && !state.abandoned
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        let failure = if !state.failures.is_empty() {
+            Some(state.failures.join("; "))
+        } else if state.abandoned {
+            Some("the VMM is shutting down".to_owned())
+        } else if waited.timed_out() {
+            Some(format!(
+                "{} of {} vCPUs took the cookie within {timeout:?}",
+                state.passed, state.gated
+            ))
+        } else {
+            None
+        };
+        state.releasing = false;
+        state.status = if failure.is_some() {
+            VcpuGateStatus::Failed
+        } else {
+            VcpuGateStatus::Released
+        };
+        self.changed.notify_all();
+        failure.map_or(Ok(()), |failure| Err(Error::VcpuGate(failure)))
+    }
+
+    /// Let every waiting vCPU leave without running: the VMM is shutting
+    /// down.
+    fn abandon(&self) {
+        self.state().abandoned = true;
+        self.changed.notify_all();
+    }
+
+    /// Take the cookie of vcpu0's thread `leader` onto the calling vCPU thread,
+    /// or check vcpu0 holds one when the calling thread is vcpu0, and check
+    /// the calling thread holds it.
+    ///
+    /// On a host whose cores run no sibling threads (SMT off or absent) the
+    /// kernel answers every core-scheduling call with `ENODEV`: there is no
+    /// core a vCPU could share, and no cookie to hold, so the vCPU runs as
+    /// it is. The VMM's manager knows the host as the kernel does and gives
+    /// vcpu0 no cookie there.
+    fn take_cookie(vcpu_id: u32, leader: i32) -> Result<()> {
+        let leader_cookie = match core_scheduling_cookie_of(leader) {
+            Err(error) if error.raw_os_error() == Some(libc::ENODEV) => return Ok(()),
+            read => read.map_err(Error::CoreScheduling)?,
+        };
+        if leader_cookie == 0 {
+            return Err(Error::VcpuGate(
+                "vcpu0 holds no core-scheduling cookie".to_owned(),
+            ));
+        }
+        if vcpu_id != 0 {
+            core_scheduling_take_from(leader).map_err(Error::CoreScheduling)?;
+        }
+        let own = core_scheduling_cookie_of(0).map_err(Error::CoreScheduling)?;
+        if own != leader_cookie {
+            return Err(Error::VcpuGate(format!(
+                "vCPU {vcpu_id} holds {own:#x}, not vcpu0's {leader_cookie:#x}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Take the core-scheduling cookie thread `tid` holds onto the calling thread,
+/// failing on any error: a `Tenant` vCPU never runs without the cookie.
+fn core_scheduling_take_from(tid: i32) -> io::Result<()> {
+    // SAFETY: PR_SCHED_CORE_SHARE_FROM takes the source thread by id and the
+    // thread scope, and touches no memory of the caller's.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_SHARE_FROM,
+            tid,
+            PR_SCHED_CORE_SCOPE_THREAD,
+            0,
+        )
+    };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The core-scheduling cookie thread `tid` holds, 0 for none; `tid` 0 is the
+/// calling thread. Fails on any error.
+fn core_scheduling_cookie_of(tid: i32) -> io::Result<u64> {
+    let mut cookie: u64 = 0;
+    // SAFETY: PR_SCHED_CORE_GET writes one u64 through the pointer, which is
+    // this live, aligned local.
+    let ret = unsafe {
+        libc::prctl(
+            PR_SCHED_CORE,
+            PR_SCHED_CORE_GET,
+            tid,
+            PR_SCHED_CORE_SCOPE_THREAD,
+            &raw mut cookie,
+        )
+    };
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cookie)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -809,6 +1106,8 @@ pub struct CpuManager {
     sev_snp_enabled: bool,
     // State of the core scheduling group leader election (VM mode).
     core_scheduling_group_leader: Arc<AtomicI32>,
+    /// The gate `Tenant` vCPUs wait at until vcpu0 holds the tenant's cookie.
+    vcpu_gate: Arc<VcpuGate>,
     #[cfg(feature = "igvm")]
     igvm_enabled: bool,
 }
@@ -1047,6 +1346,7 @@ impl CpuManager {
             core_scheduling_group_leader: Arc::new(AtomicI32::new(
                 CoreSchedulingLeader::Initial as i32,
             )),
+            vcpu_gate: Arc::new(VcpuGate::new()),
             #[cfg(feature = "igvm")]
             igvm_enabled,
         })))
@@ -1290,6 +1590,8 @@ impl CpuManager {
 
         let core_scheduling = self.config.core_scheduling;
         let core_scheduling_group_leader = Arc::clone(&self.core_scheduling_group_leader);
+        let vcpu_gate = Arc::clone(&self.vcpu_gate);
+        let gate_vcpu_run_interrupted = Arc::clone(&vcpu_run_interrupted);
 
         #[cfg(target_arch = "x86_64")]
         let interrupt_controller_clone = self.interrupt_controller.as_ref().cloned();
@@ -1373,18 +1675,55 @@ impl CpuManager {
                                 }
                             }
                         }
-                        CoreScheduling::Off => {}
+                        CoreScheduling::Off | CoreScheduling::Tenant => {}
                     }
 
-                    if core_scheduling != CoreScheduling::Off {
+                    // A Tenant vCPU meets its gate before the start barrier:
+                    // one started once the gate is open takes vcpu0's cookie
+                    // now, and every other waits at it after the barrier.
+                    let gated = if core_scheduling == CoreScheduling::Tenant {
+                        // SAFETY: gettid() is always safe to call.
+                        let my_tid = unsafe { libc::gettid() };
+                        let arrival = vcpu_gate.arrive(vcpu_id, my_tid).and_then(|arrival| match arrival {
+                            VcpuGateArrival::Gated => Ok(true),
+                            VcpuGateArrival::Open(leader) => {
+                                VcpuGate::take_cookie(vcpu_id, leader).map(|()| false)
+                            }
+                        });
+                        match arrival {
+                            Ok(gated) => {
+                                // A gated vCPU counts as interrupted until it
+                                // runs, so a pause or a shutdown does not
+                                // wait on it.
+                                if gated {
+                                    gate_vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                }
+                                gated
+                            }
+                            Err(e) => {
+                                error!("vCPU {vcpu_id} cannot take the tenant's core-scheduling cookie: {e}");
+                                gate_vcpu_run_interrupted.store(true, Ordering::SeqCst);
+                                // The activation waits for every vCPU it
+                                // starts at the barrier: meet it, so a refused
+                                // hotplug fails rather than hangs the VMM.
+                                vcpu_thread_barrier.wait();
+                                return;
+                            }
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !matches!(core_scheduling, CoreScheduling::Off | CoreScheduling::Tenant) {
                         info!(
                             "vCPU {vcpu_id}: core scheduling cookie = {:#x}",
                             core_scheduling_cookie()
                         );
                     }
 
-                    // Apply seccomp filter for vcpu thread.
-                    if !vcpu_seccomp_filter.is_empty() &&  let Err(e) =
+                    // Apply seccomp filter for vcpu thread, unless it is gated:
+                    // a gated vCPU applies it once past the gate.
+                    if !gated && !vcpu_seccomp_filter.is_empty() &&  let Err(e) =
                             apply_filter(&vcpu_seccomp_filter).map_err(Error::ApplySeccompFilter)
                         {
                             error!("Error applying seccomp filter: {e:?}");
@@ -1397,6 +1736,27 @@ impl CpuManager {
                         .expect("Failed to register vcpu signal handler");
                     // Block until all CPUs are ready.
                     vcpu_thread_barrier.wait();
+
+                    // A gated vCPU runs no guest code, and makes no KVM_RUN
+                    // that KVM could clone a worker from, until it holds
+                    // vcpu0's cookie.
+                    if gated {
+                        let taken = vcpu_gate
+                            .wait_for_release()
+                            .and_then(|leader| VcpuGate::take_cookie(vcpu_id, leader));
+                        if let Err(e) = vcpu_gate.report(taken) {
+                            error!("vCPU {vcpu_id} does not run: {e}");
+                            return;
+                        }
+                        if !vcpu_seccomp_filter.is_empty()
+                            && let Err(e) =
+                                apply_filter(&vcpu_seccomp_filter).map_err(Error::ApplySeccompFilter)
+                        {
+                            error!("Error applying seccomp filter: {e:?}");
+                            return;
+                        }
+                        gate_vcpu_run_interrupted.store(false, Ordering::SeqCst);
+                    }
 
                     panic::catch_unwind(move || {
                         loop {
@@ -1739,6 +2099,9 @@ impl CpuManager {
         // Tell the vCPUs to stop themselves next time they go through the loop
         self.vcpus_kill_signalled.store(true, Ordering::SeqCst);
 
+        // Gated vCPUs leave their gate without running.
+        self.vcpu_gate.abandon();
+
         // Toggle the vCPUs pause boolean
         self.vcpus_pause_signalled.store(false, Ordering::SeqCst);
 
@@ -1771,6 +2134,25 @@ impl CpuManager {
 
     pub fn boot_vcpus(&self) -> u32 {
         self.config.boot_vcpus
+    }
+
+    /// The gate a `Tenant` VM's vCPUs wait at, so a release
+    /// ([`VcpuGate::release_vcpus`]) need not hold the manager's lock while
+    /// the vCPUs take the cookie. Fails for a VM of another mode.
+    pub fn vcpu_gate(&self) -> Result<Arc<VcpuGate>> {
+        if self.config.core_scheduling != CoreScheduling::Tenant {
+            return Err(Error::VcpuGate(format!(
+                "the VM's core scheduling is {:?}, not Tenant",
+                self.config.core_scheduling
+            )));
+        }
+        Ok(Arc::clone(&self.vcpu_gate))
+    }
+
+    /// Where a `Tenant` VM's vCPUs stand against their gate, or `None` for a VM
+    /// of another core-scheduling mode.
+    pub fn vcpu_gate_status(&self) -> Option<VcpuGateStatus> {
+        (self.config.core_scheduling == CoreScheduling::Tenant).then(|| self.vcpu_gate.status())
     }
 
     pub fn max_vcpus(&self) -> u32 {
@@ -3835,5 +4217,224 @@ mod tests {
 
         let state = vcpu.get_mp_state().unwrap();
         vcpu.set_mp_state(state).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod vcpu_gate_tests {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::{io, thread, time};
+
+    use super::{
+        PR_SCHED_CORE, PR_SCHED_CORE_CREATE, PR_SCHED_CORE_SCOPE_THREAD, VcpuGate, VcpuGateArrival,
+        VcpuGateStatus,
+    };
+
+    const WAIT: time::Duration = time::Duration::from_secs(5);
+
+    /// Gate vCPUs 0..`count` (thread ids 100..), and run each on a thread that
+    /// waits for the release and reports `outcome(vcpu_id)`, answering each
+    /// vCPU's verdict on the returned channel.
+    fn gate_vcpus(
+        gate: &Arc<VcpuGate>,
+        count: u32,
+        outcome: fn(u32) -> super::Result<()>,
+    ) -> mpsc::Receiver<(u32, super::Result<()>)> {
+        let (verdicts, received) = mpsc::channel();
+        for vcpu_id in 0..count {
+            let arrival = gate.arrive(vcpu_id, 100 + vcpu_id as i32).unwrap();
+            assert!(matches!(arrival, VcpuGateArrival::Gated));
+            let gate = Arc::clone(gate);
+            let verdicts = verdicts.clone();
+            thread::spawn(move || {
+                let leader = gate.wait_for_release();
+                let verdict = gate.report(
+                    leader
+                        .map(|leader| {
+                            assert_eq!(leader, 100);
+                        })
+                        .and_then(|()| outcome(vcpu_id)),
+                );
+                verdicts.send((vcpu_id, verdict)).unwrap();
+            });
+        }
+        received
+    }
+
+    #[test]
+    fn a_release_runs_every_vcpu_once_all_took_the_cookie() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 3, |_| Ok(()));
+        assert_eq!(gate.status(), VcpuGateStatus::Closed);
+
+        gate.release(WAIT).unwrap();
+
+        assert_eq!(gate.status(), VcpuGateStatus::Released);
+        for _ in 0..3 {
+            let (vcpu_id, verdict) = verdicts.recv_timeout(WAIT).unwrap();
+            verdict.unwrap_or_else(|e| panic!("vCPU {vcpu_id} does not run: {e}"));
+        }
+    }
+
+    #[test]
+    fn one_vcpu_failing_to_take_the_cookie_runs_none() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 3, |vcpu_id| {
+            if vcpu_id == 2 {
+                Err(super::Error::VcpuGate("vCPU 2 holds 0x0".to_owned()))
+            } else {
+                Ok(())
+            }
+        });
+
+        let failure = gate.release(WAIT).unwrap_err();
+
+        assert!(
+            failure.to_string().contains("vCPU 2 holds 0x0"),
+            "{failure}"
+        );
+        assert_eq!(gate.status(), VcpuGateStatus::Failed);
+        for _ in 0..3 {
+            let (vcpu_id, verdict) = verdicts.recv_timeout(WAIT).unwrap();
+            assert!(
+                verdict.is_err(),
+                "vCPU {vcpu_id} runs after a failed release"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vcpu_that_never_reports_fails_the_release_and_runs_none() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 1, |_| Ok(()));
+        gate.arrive(1, 101).unwrap();
+
+        let failure = gate.release(time::Duration::from_millis(200)).unwrap_err();
+
+        assert!(failure.to_string().contains("1 of 2 vCPUs"), "{failure}");
+        assert_eq!(gate.status(), VcpuGateStatus::Failed);
+        let (_, verdict) = verdicts.recv_timeout(WAIT).unwrap();
+        assert!(verdict.is_err(), "vCPU 0 runs after a failed release");
+    }
+
+    #[test]
+    fn a_shutdown_lets_gated_vcpus_leave_without_running() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 2, |_| Ok(()));
+
+        gate.abandon();
+
+        for _ in 0..2 {
+            let (vcpu_id, verdict) = verdicts.recv_timeout(WAIT).unwrap();
+            assert!(verdict.is_err(), "vCPU {vcpu_id} runs after a shutdown");
+        }
+        assert_eq!(gate.status(), VcpuGateStatus::Closed);
+    }
+
+    #[test]
+    fn a_release_needs_vcpu0_and_happens_once() {
+        let gate = Arc::new(VcpuGate::new());
+        gate.arrive(1, 101).unwrap();
+        gate.release(WAIT).unwrap_err();
+        assert_eq!(gate.status(), VcpuGateStatus::Closed);
+
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 1, |_| Ok(()));
+        gate.release(WAIT).unwrap();
+        verdicts.recv_timeout(WAIT).unwrap().1.unwrap();
+        gate.release(WAIT).unwrap_err();
+        assert_eq!(gate.status(), VcpuGateStatus::Released);
+    }
+
+    #[test]
+    fn a_vcpu_hotplugged_after_the_release_takes_vcpu0s_cookie_at_start() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 2, |_| Ok(()));
+        gate.release(WAIT).unwrap();
+        verdicts.recv_timeout(WAIT).unwrap().1.unwrap();
+        verdicts.recv_timeout(WAIT).unwrap().1.unwrap();
+
+        assert!(matches!(
+            gate.arrive(2, 102).unwrap(),
+            VcpuGateArrival::Open(100)
+        ));
+    }
+
+    #[test]
+    fn no_vcpu_starts_after_a_failed_release() {
+        let gate = Arc::new(VcpuGate::new());
+        let verdicts = gate_vcpus(&gate, 1, |_| {
+            Err(super::Error::VcpuGate(
+                "vcpu0 holds no core-scheduling cookie".to_owned(),
+            ))
+        });
+        gate.release(WAIT).unwrap_err();
+        verdicts.recv_timeout(WAIT).unwrap().1.unwrap_err();
+
+        gate.arrive(1, 101).unwrap_err();
+    }
+
+    /// Run `work` on a new thread that first creates a core-scheduling cookie
+    /// of its own when `cookied`, handing it the thread's id, and keep that
+    /// thread alive until `work` returns.
+    fn with_leader<T: Send + 'static>(
+        cookied: bool,
+        work: impl FnOnce(i32) -> T + Send + 'static,
+    ) -> T {
+        let (tid_sender, tid) = mpsc::channel();
+        let (done_sender, done) = mpsc::channel::<()>();
+        let leader = thread::spawn(move || {
+            if cookied {
+                // SAFETY: PR_SCHED_CORE_CREATE on the calling thread touches no
+                // memory of the caller's.
+                let ret = unsafe {
+                    libc::prctl(
+                        PR_SCHED_CORE,
+                        PR_SCHED_CORE_CREATE,
+                        0,
+                        PR_SCHED_CORE_SCOPE_THREAD,
+                        0,
+                    )
+                };
+                assert_eq!(
+                    ret,
+                    0,
+                    "PR_SCHED_CORE_CREATE: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            // SAFETY: gettid() is always safe to call.
+            tid_sender.send(unsafe { libc::gettid() }).unwrap();
+            done.recv().unwrap();
+        });
+        let tid = tid.recv_timeout(WAIT).unwrap();
+        let answer = thread::spawn(move || work(tid)).join().unwrap();
+        done_sender.send(()).unwrap();
+        leader.join().unwrap();
+        answer
+    }
+
+    #[test]
+    #[ignore = "needs a host with SMT active and core scheduling"]
+    fn a_vcpu_takes_and_checks_vcpu0s_cookie() {
+        with_leader(true, |leader| VcpuGate::take_cookie(1, leader)).unwrap();
+        with_leader(true, |leader| {
+            super::core_scheduling_take_from(leader).unwrap();
+            VcpuGate::take_cookie(0, 0)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs a host with SMT active and core scheduling"]
+    fn a_vcpu0_without_a_cookie_fails_the_release() {
+        let failure = with_leader(false, |leader| VcpuGate::take_cookie(1, leader)).unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("vcpu0 holds no core-scheduling cookie"),
+            "{failure}"
+        );
     }
 }

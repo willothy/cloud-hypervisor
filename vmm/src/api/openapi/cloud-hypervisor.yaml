@@ -184,6 +184,28 @@ paths:
         500:
           description: No VM is running, or the fault handler refused the settle.
 
+  /vm.release-vcpus:
+    put:
+      summary: Let the vCPUs of a VM with core scheduling "Tenant" run once vcpu0 holds the tenant's core-scheduling cookie.
+      description: >-
+        The vCPUs of a VM whose core scheduling is "Tenant" wait at a gate,
+        before running any guest code, until this call. Before making it the
+        VM's manager gives vcpu0's thread its tenant's core-scheduling cookie
+        from outside the VMM. On the call every vCPU takes vcpu0's cookie and
+        checks it holds it, and the call answers once all have; none runs
+        until then. When vcpu0 holds no cookie, or any vCPU cannot take it
+        within ten seconds, the gate fails and no vCPU ever runs: the
+        manager ends the VMM. vm.info reports the gate as "vcpu_gate". A vCPU
+        hot-plugged after the release takes vcpu0's cookie as it starts.
+      operationId: releaseVcpusVM
+      responses:
+        204:
+          description: Every vCPU holds vcpu0's cookie and runs.
+        500:
+          description: >-
+            No VM is running, its core scheduling is not "Tenant", its vCPUs
+            were already released, or the release failed.
+
   /vm.shutdown:
     put:
       summary: Shut the VM instance down.
@@ -714,7 +736,17 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/DeviceNode"
+        vcpu_gate:
+          $ref: "#/components/schemas/VcpuGateStatus"
       description: Virtual Machine information
+
+    VcpuGateStatus:
+      type: string
+      enum: ["Closed", "Released", "Failed"]
+      description: >-
+        Where the vCPUs of a VM with core scheduling "Tenant" stand against
+        their core-scheduling gate: waiting for vm.release-vcpus, released and
+        running, or failed with none running. Absent for every other mode.
 
     DeviceNode:
       type: object
@@ -987,7 +1019,7 @@ components:
 
     CoreSchedulingMode:
       type: string
-      enum: ["Vm", "Vcpu", "Off"]
+      enum: ["Vm", "Vcpu", "Off", "Tenant"]
       default: "Vm"
 
     CpusConfig:

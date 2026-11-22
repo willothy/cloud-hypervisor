@@ -58,6 +58,7 @@ use crate::config::{
     RestoreConfig, RestoredVfioConfig, SnapshotZeroPages, VmMemoryZoneUpdateData,
     deserialize_restored_fd,
 };
+use crate::cpu::VcpuGateStatus;
 use crate::device_tree::DeviceTree;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
@@ -143,6 +144,10 @@ pub enum ApiError {
     /// The VM could not settle its guest memory.
     #[error("The VM could not settle its guest memory")]
     VmSettleMemory(#[source] VmError),
+
+    /// The VM's vCPUs could not be released from their core-scheduling gate.
+    #[error("The VM's vCPUs could not be released from their core-scheduling gate")]
+    VmReleaseVcpus(#[source] VmError),
 
     /// The VM could not be restored.
     #[error("The VM could not be restored")]
@@ -238,6 +243,10 @@ pub struct VmInfoResponse {
     pub state: VmState,
     pub memory_actual_size: u64,
     pub device_tree: Option<DeviceTree>,
+    /// Where a `Tenant` VM's vCPUs stand against their core-scheduling gate;
+    /// none for a VM of another core-scheduling mode.
+    #[serde(default)]
+    pub vcpu_gate: Option<VcpuGateStatus>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -968,6 +977,8 @@ pub trait RequestHandler {
 
     fn vm_settle_memory(&mut self) -> Result<Option<Vec<u8>>, VmError>;
 
+    fn vm_release_vcpus(&mut self) -> Result<(), VmError>;
+
     fn vm_live_checkpoint(
         &mut self,
         destination_url: &str,
@@ -1602,6 +1613,39 @@ impl ApiAction for VmDirtyPageCount {
                 .vm_dirty_page_count()
                 .map_err(ApiError::VmDirtyPageCount)
                 .map(ApiResponsePayload::VmAction);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmReleaseVcpus;
+
+impl ApiAction for VmReleaseVcpus {
+    type RequestBody = ();
+    type ResponseBody = Option<Body>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmReleaseVcpus");
+
+            let response = vmm
+                .vm_release_vcpus()
+                .map_err(ApiError::VmReleaseVcpus)
+                .map(|()| ApiResponsePayload::Empty);
 
             response_sender
                 .send(response)

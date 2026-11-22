@@ -121,6 +121,10 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(None)
     }
 
+    fn vm_release_vcpus(&mut self) -> Result<(), VmError> {
+        Ok(())
+    }
+
     fn vm_live_checkpoint(&mut self, _: &str, _: CaptureScope, _: bool) -> Result<(), VmError> {
         Ok(())
     }
@@ -236,6 +240,7 @@ impl RequestHandler for StubApiRequestHandler {
             state: VmState::Running,
             memory_actual_size: 0,
             device_tree: None,
+            vcpu_gate: None,
         })
     }
 
