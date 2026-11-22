@@ -18,6 +18,7 @@ use vmm::api::{
     VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
+use vmm::restore_failure::RestoreFailure;
 use vmm::vm::{Error as VmError, VmState};
 use vmm::vm_config::*;
 use vmm::{EpollContext, EpollDispatch};
@@ -129,7 +130,7 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
-    fn vm_restore(&mut self, _: RestoreConfig) -> Result<(), VmError> {
+    fn vm_restore(&mut self, _: RestoreConfig) -> Result<(), RestoreFailure> {
         Ok(())
     }
 
