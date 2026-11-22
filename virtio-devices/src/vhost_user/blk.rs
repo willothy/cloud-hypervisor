@@ -264,15 +264,31 @@ impl Blk {
     ) -> Result<Blk> {
         let num_queues = vu_cfg.num_queues;
 
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            false,
-            &vu_cfg.socket,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            faults.as_ref(),
-            |_| Ok(()),
-        )?;
+        // A restore is made against backends that are already serving, so it
+        // connects once: a socket that is missing or refuses is a fault to
+        // report, not one to wait out.
+        let mut vu = if state.is_some() {
+            VhostUserHandle::connect_vhost_user_once(
+                &vu_cfg.socket,
+                num_queues as u64,
+                faults.as_ref(),
+            )
+            .map_err(|e| Error::RestoreConnect {
+                id: id.clone(),
+                socket: vu_cfg.socket.clone(),
+                source: Box::new(e),
+            })?
+        } else {
+            VhostUserHandle::connect_vhost_user(
+                false,
+                &vu_cfg.socket,
+                num_queues as u64,
+                false,
+                &exit_evt,
+                faults.as_ref(),
+                |_| Ok(()),
+            )?
+        };
 
         let (
             avail_features,
@@ -614,9 +630,69 @@ impl Migratable for Blk {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+
     use virtio_bindings::virtio_blk::VIRTIO_BLK_F_DISCARD;
+    use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
+
+    /// Restore a device whose backend should be at `socket`, and check it
+    /// fails at once, naming the device and the socket.
+    fn assert_restore_fails_at_once(socket: &str) {
+        let exit_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let started = Instant::now();
+        let result = Blk::new(
+            "base".to_owned(),
+            VhostUserConfig {
+                socket: socket.to_owned(),
+                num_queues: 1,
+                queue_size: 128,
+            },
+            SeccompAction::Allow,
+            exit_evt,
+            false,
+            Some(State::default()),
+            None,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the restore waited {:?} for its backend",
+            started.elapsed()
+        );
+        match result {
+            Err(Error::RestoreConnect {
+                id,
+                socket: named,
+                source,
+            }) => {
+                assert_eq!(id, "base");
+                assert_eq!(named, socket);
+                assert!(
+                    matches!(*source, Error::VhostUserConnect(_)),
+                    "expected a connect error, got {source:?}"
+                );
+            }
+            Err(other) => panic!("expected RestoreConnect, got {other:?}"),
+            Ok(_) => panic!("the restore connected to a backend that isn't serving"),
+        }
+    }
+
+    #[test]
+    fn a_restore_does_not_wait_for_a_missing_socket() {
+        let dir = TempDir::new_with_prefix("/tmp/vhost-user-blk-restore-").unwrap();
+        let socket = dir.as_path().join("backend.sock");
+        assert_restore_fails_at_once(socket.to_str().unwrap());
+    }
+
+    #[test]
+    fn a_restore_does_not_wait_for_a_refusing_socket() {
+        let dir = TempDir::new_with_prefix("/tmp/vhost-user-blk-restore-").unwrap();
+        let socket = dir.as_path().join("backend.sock");
+        drop(UnixListener::bind(&socket).unwrap());
+        assert_restore_fails_at_once(socket.to_str().unwrap());
+    }
 
     #[test]
     fn restore_accepts_a_backend_offering_every_acked_feature() {
