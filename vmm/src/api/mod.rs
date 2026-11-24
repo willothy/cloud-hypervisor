@@ -32,6 +32,7 @@
 #[cfg(feature = "dbus_api")]
 pub mod dbus;
 pub mod http;
+mod restore_timing;
 
 use std::collections::HashSet;
 use std::io;
@@ -41,7 +42,7 @@ use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
-use log::{debug, info, warn};
+use log::{Level, debug, info, log_enabled, warn};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ use vmm_sys_util::eventfd::EventFd;
 #[cfg(feature = "dbus_api")]
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
+pub use self::restore_timing::RestoreTiming;
 use crate::Error as VmmError;
 use crate::config::{
     RestoreConfig, RestoredVfioConfig, SnapshotZeroPages, VmMemoryZoneUpdateData,
@@ -986,7 +988,11 @@ pub trait RequestHandler {
         leave_paused: bool,
     ) -> Result<(), VmError>;
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> Result<(), RestoreFailure>;
+    fn vm_restore(
+        &mut self,
+        restore_cfg: RestoreConfig,
+        timing: Option<&mut RestoreTiming>,
+    ) -> Result<(), RestoreFailure>;
 
     #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn vm_coredump(&mut self, destination_url: &str) -> Result<(), VmError>;
@@ -2137,14 +2143,23 @@ impl ApiAction for VmRestore {
         Box::new(move |vmm| {
             info!("API request event: VmRestore {config:?}");
 
+            let resumed = config.resume;
+            let memory_mode = config.memory_restore_mode;
+            let mut timing = log_enabled!(target: RestoreTiming::LOG_TARGET, Level::Info)
+                .then(RestoreTiming::start);
             let response = vmm
-                .vm_restore(config)
+                .vm_restore(config, timing.as_mut())
                 .map_err(ApiError::VmRestore)
                 .map(|_| ApiResponsePayload::Empty);
+            let timing = timing.filter(|_| response.is_ok());
 
             response_sender
                 .send(response)
                 .map_err(VmmError::ApiResponseSend)?;
+
+            if let Some(timing) = timing {
+                timing.log(memory_mode, resumed);
+            }
 
             Ok(false)
         })

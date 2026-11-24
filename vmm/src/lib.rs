@@ -48,8 +48,8 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, TimeoutStrategy,
-    VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, BalloonStatsResponse, MigrationMode, RequestHandler, RestoreTiming,
+    TimeoutStrategy, VmInfoResponse, VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
 };
 use crate::config::{
     GuestClockRestoreMode, MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config,
@@ -1507,6 +1507,7 @@ impl Vmm {
                 GuestClockRestoreMode::Advance,
                 #[cfg(feature = "igvm")]
                 None,
+                None,
             )
             .map_err(|e| {
                 MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {e:?}"))
@@ -2121,7 +2122,11 @@ impl Vmm {
 
     /// Restores a VM as `restore_cfg` asks, failing with the `VmError` of
     /// the step that failed; [`RequestHandler::vm_restore`] classifies it.
-    fn restore_vm(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+    fn restore_vm(
+        &mut self,
+        restore_cfg: RestoreConfig,
+        mut timing: Option<&mut RestoreTiming>,
+    ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
@@ -2200,10 +2205,12 @@ impl Vmm {
                     restore_cfg.clock_restore_mode,
                     #[cfg(target_arch = "x86_64")]
                     restore_cfg.tsc_tolerance_ppm,
+                    timing.as_deref_mut(),
                 )
                 .and_then(|()| {
                     if restore_cfg.resume {
-                        self.vm_resume()
+                        let finish_resume = RestoreTiming::phase(timing.map(|t| &mut t.resume));
+                        self.vm_resume().inspect(|()| finish_resume())
                     } else {
                         Ok(())
                     }
@@ -2221,7 +2228,7 @@ impl Vmm {
         }
     }
 
-    #[cfg_attr(target_arch = "x86_64", expect(clippy::too_many_arguments))]
+    #[expect(clippy::too_many_arguments)]
     fn vm_restore(
         &mut self,
         source_url: &str,
@@ -2231,6 +2238,7 @@ impl Vmm {
         restore_fault_socket: Option<&path::Path>,
         clock_restore_mode: GuestClockRestoreMode,
         #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
+        mut timing: Option<&mut RestoreTiming>,
     ) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
@@ -2244,11 +2252,18 @@ impl Vmm {
                 self.vm_check_cpuid_compatibility(&vm_config, &vm_snapshot.common_cpuid)
                     .map_err(VmError::CpuidCompatibility)?;
 
+                if let Some(timing) = timing.as_deref_mut() {
+                    timing.snapshot_and_cpuid = timing.started.elapsed();
+                }
+
                 self.vm_config = Some(Arc::clone(&vm_config));
 
+                let finish_devices =
+                    RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
                 // Always re-populate the 'console_info' based on the new 'vm_config'
                 self.console_info =
                     Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+                finish_devices();
 
                 let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
                 let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
@@ -2288,6 +2303,7 @@ impl Vmm {
                     Some(clock_restore_mode),
                     #[cfg(target_arch = "x86_64")]
                     tsc_tolerance_ppm,
+                    timing.as_deref_mut(),
                 )?;
 
                 if self
@@ -2304,7 +2320,9 @@ impl Vmm {
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
+                let finish_state = RestoreTiming::phase(timing.map(|t| &mut t.state_restore));
                 vm.restore()?;
+                finish_state();
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
             }
@@ -2736,6 +2754,7 @@ impl RequestHandler for Vmm {
                             None,
                             #[cfg(target_arch = "x86_64")]
                             None,
+                            None,
                         )?;
 
                         let r = vm.boot();
@@ -2864,8 +2883,12 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), RestoreFailure> {
-        self.restore_vm(restore_cfg).map_err(|e| {
+    fn vm_restore(
+        &mut self,
+        restore_cfg: RestoreConfig,
+        timing: Option<&mut RestoreTiming>,
+    ) -> result::Result<(), RestoreFailure> {
+        self.restore_vm(restore_cfg, timing).map_err(|e| {
             let failure = RestoreFailure::of_vm_error(e);
             error!(
                 "VM Restore failed at {} ({}): {:?}",
@@ -2965,6 +2988,7 @@ impl RequestHandler for Vmm {
             self.exit_reason.as_deref(),
             None,
             #[cfg(target_arch = "x86_64")]
+            None,
             None,
         )?;
 

@@ -90,7 +90,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::api::CaptureScope;
+use crate::api::{CaptureScope, RestoreTiming};
 use crate::config::{
     GuestClockRestoreMode, MemoryRestoreMode, SnapshotZeroPages, ValidationError, add_to_config,
 };
@@ -694,6 +694,7 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         clock_restore_mode: GuestClockRestoreMode,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
+        mut timing: Option<&mut RestoreTiming>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
 
@@ -745,6 +746,7 @@ impl Vm {
         Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
 
         // Create device manager
+        let finish_devices = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
         let device_manager = Self::create_device_manager(
             io_bus,
             mmio_bus,
@@ -764,6 +766,7 @@ impl Vm {
             timestamp,
             snapshot,
         )?;
+        finish_devices();
 
         // Perform hypervisor-specific initialization
         let load_payload_handle = Self::hypervisor_specific_init(
@@ -779,6 +782,7 @@ impl Vm {
             snapshot,
             #[cfg(feature = "igvm")]
             igvm_file,
+            timing.as_deref_mut(),
         )?;
 
         // Load files needed directly by the VMM.
@@ -803,6 +807,7 @@ impl Vm {
             .transpose()
             .map_err(Error::InitramfsFile)?;
 
+        let finish_state = RestoreTiming::phase(timing.map(|t| &mut t.state_restore));
         let saved_clock = if let Some(snapshot) = snapshot.as_ref() {
             let vm_snapshot = get_vm_snapshot(snapshot).map_err(Error::RecvSnapshot)?;
             vm_snapshot
@@ -821,6 +826,7 @@ impl Vm {
         } else {
             None
         };
+        finish_state();
 
         let state = if snapshot.is_some() {
             VmState::Paused
@@ -1013,6 +1019,7 @@ impl Vm {
         original_termios: &Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
+        mut timing: Option<&mut RestoreTiming>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
         #[cfg(feature = "mshv")]
         let is_mshv = matches!(
@@ -1048,12 +1055,15 @@ impl Vm {
                 original_termios,
                 snapshot,
                 igvm_file,
+                timing,
             );
         }
 
         // MSHV initialization (create interrupt controller and devices)
         #[cfg(feature = "mshv")]
         if is_mshv {
+            let finish_devices =
+                RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
             Self::init_mshv(
                 vm,
                 device_manager,
@@ -1062,14 +1072,17 @@ impl Vm {
                 original_termios,
                 snapshot,
             )?;
+            finish_devices();
         }
 
         // Allocate address space for non-SEV-SNP guests
+        let finish_memory = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.memory_uffd));
         memory_manager
             .lock()
             .unwrap()
             .allocate_address_space()
             .map_err(Error::MemoryManager)?;
+        finish_memory();
 
         // Load payload asynchronously
         let load_payload_handle = if snapshot.is_none() {
@@ -1086,15 +1099,20 @@ impl Vm {
         };
 
         // Create boot vCPUs
+        let finish_state =
+            RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.state_restore));
         cpu_manager
             .lock()
             .unwrap()
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
+        finish_state();
 
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
         if is_kvm {
+            let finish_devices =
+                RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
             Self::init_kvm(
                 vm,
                 device_manager,
@@ -1103,11 +1121,16 @@ impl Vm {
                 Arc::clone(original_termios),
                 snapshot,
             )?;
+            finish_devices();
         }
 
         // Create fw_cfg device if configured
         #[cfg(feature = "fw_cfg")]
-        Self::create_fw_cfg_if_enabled(config, device_manager)?;
+        {
+            let finish_devices = RestoreTiming::phase(timing.map(|t| &mut t.devices));
+            Self::create_fw_cfg_if_enabled(config, device_manager)?;
+            finish_devices();
+        }
 
         Ok(load_payload_handle)
     }
@@ -1126,13 +1149,17 @@ impl Vm {
         original_termios: &Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
         igvm_file: Option<IgvmFile>,
+        mut timing: Option<&mut RestoreTiming>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
         // Create boot vCPUs before SEV-SNP initialization
+        let finish_state =
+            RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.state_restore));
         cpu_manager
             .lock()
             .unwrap()
             .create_boot_vcpus(snapshot_from_id(snapshot, CPU_MANAGER_SNAPSHOT_ID))
             .map_err(Error::CpuManager)?;
+        finish_state();
 
         // Extract guest policy from IGVM if available, otherwise use default.
         let guest_policy = igvm_file
@@ -1151,6 +1178,7 @@ impl Vm {
         };
 
         // Create interrupt controller and devices for MSHV
+        let finish_devices = RestoreTiming::phase(timing.map(|t| &mut t.devices));
         let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
@@ -1176,6 +1204,7 @@ impl Vm {
         #[cfg(feature = "fw_cfg")]
         Self::create_fw_cfg_if_enabled(config, device_manager)?;
 
+        finish_devices();
         Ok(load_payload_handle)
     }
 
@@ -1466,6 +1495,7 @@ impl Vm {
         exit_reason: Option<&Path>,
         clock_restore_mode: Option<GuestClockRestoreMode>,
         #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
+        mut timing: Option<&mut RestoreTiming>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1526,6 +1556,7 @@ impl Vm {
             memory_restore_mode = MemoryRestoreMode::Copy;
         }
 
+        let finish_memory = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.memory_uffd));
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
                 MemoryManager::new_from_snapshot(
@@ -1555,6 +1586,7 @@ impl Vm {
                 )
                 .map_err(Error::MemoryManager)?
             };
+        finish_memory();
 
         Vm::new_from_memory_manager(
             vm_config,
@@ -1577,6 +1609,7 @@ impl Vm {
             clock_restore_mode.unwrap_or_default(),
             #[cfg(feature = "igvm")]
             igvm_file,
+            timing,
         )
     }
 

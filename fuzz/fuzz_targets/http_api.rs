@@ -14,7 +14,7 @@ use micro_http::Request;
 use vm_migration::MigratableError;
 use vmm::api::http::*;
 use vmm::api::{
-    ApiRequest, BalloonStatsResponse, CaptureScope, RequestHandler, VmInfoResponse,
+    ApiRequest, BalloonStatsResponse, CaptureScope, RequestHandler, RestoreTiming, VmInfoResponse,
     VmReceiveMigrationData, VmSendMigrationData, VmSnapshotConfig, VmmPingResponse,
 };
 use vmm::config::RestoreConfig;
@@ -130,7 +130,11 @@ impl RequestHandler for StubApiRequestHandler {
         Ok(())
     }
 
-    fn vm_restore(&mut self, _: RestoreConfig) -> Result<(), RestoreFailure> {
+    fn vm_restore(
+        &mut self,
+        _: RestoreConfig,
+        _: Option<&mut RestoreTiming>,
+    ) -> Result<(), RestoreFailure> {
         Ok(())
     }
 
