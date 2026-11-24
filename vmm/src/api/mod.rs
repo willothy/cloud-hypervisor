@@ -42,7 +42,7 @@ use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
 use std::time::Duration;
 
-use log::{Level, debug, info, log_enabled, warn};
+use log::{debug, info, warn};
 use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
@@ -2145,8 +2145,7 @@ impl ApiAction for VmRestore {
 
             let resumed = config.resume;
             let memory_mode = config.memory_restore_mode;
-            let mut timing = log_enabled!(target: RestoreTiming::LOG_TARGET, Level::Info)
-                .then(RestoreTiming::start);
+            let mut timing = RestoreTiming::start();
             let response = vmm
                 .vm_restore(config, timing.as_mut())
                 .map_err(ApiError::VmRestore)

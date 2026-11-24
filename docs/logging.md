@@ -9,6 +9,10 @@ The target audience of this document is both:
 
 The number of `-v` parameters passed to the `cloud-hypervisor` binary will determine the log level. Currently the default is log messages up to `WARN:` (`warn!`) are included by default. The `--log-file` allows the log to be sent to a location other than `stderr`.
 
+`--restore-timing` opts in to one `INFO` record after each successful
+`vm.restore` reply handoff to the API thread. It also works with `-q`:
+all other records still follow the normal verbosity settings.
+
 ## Levels
 
 ### `error!()`

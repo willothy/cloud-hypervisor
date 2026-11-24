@@ -509,6 +509,11 @@ fn get_cli_options_sorted(
             .help(RestoreConfig::SYNTAX)
             .num_args(1)
             .group("vmm-config"),
+        Arg::new("restore-timing")
+            .long("restore-timing")
+            .help("Log one timing record per successful restore, even in quiet mode")
+            .action(ArgAction::SetTrue)
+            .group("logging"),
         Arg::new("rng")
             .long("rng")
             .help(RngConfig::SYNTAX)
@@ -656,6 +661,9 @@ fn start_vmm(
     log::set_boxed_logger(Box::new(logger))
         .map(|()| log::set_max_level(level))
         .map_err(Error::LoggerSetup)?;
+    if cmd_arguments.get_flag("restore-timing") {
+        api::RestoreTiming::enable();
+    }
 
     let (api_request_sender, api_request_receiver) = channel();
     let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
@@ -1115,6 +1123,10 @@ mod tests {
         };
         assert_eq!(level(&[]).unwrap(), log::LevelFilter::Warn);
         assert_eq!(level(&["-q"]).unwrap(), log::LevelFilter::Error);
+        assert_eq!(
+            level(&["-q", "--restore-timing"]).unwrap(),
+            log::LevelFilter::Error
+        );
         assert_eq!(level(&["--quiet"]).unwrap(), log::LevelFilter::Error);
         assert_eq!(level(&["-v"]).unwrap(), log::LevelFilter::Info);
         assert_eq!(level(&["-vv"]).unwrap(), log::LevelFilter::Debug);

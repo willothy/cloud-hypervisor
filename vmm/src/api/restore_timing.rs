@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use log::info;
-
 use crate::config::MemoryRestoreMode;
+
+static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Wall time on the VMM thread for a successful `vm.restore` API dispatch.
 /// Starts after the API request log and ends at the internal reply handoff,
@@ -25,17 +26,21 @@ pub struct RestoreTiming {
 }
 
 impl RestoreTiming {
-    pub(super) const LOG_TARGET: &str = "vmm::api::restore_timing";
+    /// Opt in for this process after installing the logger. This does not
+    /// change the log level for any other record.
+    pub fn enable() {
+        ENABLED.store(true, Ordering::Relaxed);
+    }
 
-    pub(super) fn start() -> Self {
-        Self {
+    pub(super) fn start() -> Option<Self> {
+        ENABLED.load(Ordering::Relaxed).then(|| Self {
             started: Instant::now(),
             snapshot_and_cpuid: Duration::ZERO,
             memory_uffd: Duration::ZERO,
             devices: Duration::ZERO,
             state_restore: Duration::ZERO,
             resume: Duration::ZERO,
-        }
+        })
     }
 
     /// Add a disjoint interval on success, without reading the clock when
@@ -60,18 +65,28 @@ impl RestoreTiming {
         )
     }
 
+    /// Use the installed logger without applying the ordinary verbosity
+    /// threshold to this explicitly enabled record.
     pub(super) fn log(self, memory_mode: MemoryRestoreMode, resumed: bool) {
         let total = self.started.elapsed();
-        info!(
-            target: Self::LOG_TARGET,
-            "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={}",
-            total.as_nanos(),
-            self.snapshot_and_cpuid.as_nanos(),
-            self.memory_uffd.as_nanos(),
-            self.devices.as_nanos(),
-            self.state_restore.as_nanos(),
-            self.resume.as_nanos(),
-            self.other(total).as_nanos(),
+        log::logger().log(
+            &log::Record::builder()
+                .level(log::Level::Info)
+                .target(module_path!())
+                .module_path(Some(module_path!()))
+                .file(Some(file!()))
+                .line(Some(line!()))
+                .args(format_args!(
+                    "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={}",
+                    total.as_nanos(),
+                    self.snapshot_and_cpuid.as_nanos(),
+                    self.memory_uffd.as_nanos(),
+                    self.devices.as_nanos(),
+                    self.state_restore.as_nanos(),
+                    self.resume.as_nanos(),
+                    self.other(total).as_nanos(),
+                ))
+                .build(),
         );
     }
 }
