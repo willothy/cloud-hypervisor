@@ -2258,11 +2258,12 @@ impl Vmm {
 
                 self.vm_config = Some(Arc::clone(&vm_config));
 
-                let finish_devices =
-                    RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
+                let (finish_devices, setup) = RestoreTiming::devices_phase(timing.as_deref_mut());
+                let finish_console = RestoreTiming::phase(setup.map(|t| &mut t.console));
                 // Always re-populate the 'console_info' based on the new 'vm_config'
                 self.console_info =
                     Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+                finish_console();
                 finish_devices();
 
                 let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;

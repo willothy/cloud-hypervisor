@@ -4,6 +4,7 @@
 use std::mem::offset_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant};
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -253,6 +254,7 @@ pub struct Blk {
 
 impl Blk {
     /// Create a new vhost-user-blk device
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         vu_cfg: VhostUserConfig,
@@ -261,12 +263,14 @@ impl Blk {
         access_platform_enabled: bool,
         state: Option<State>,
         faults: Option<super::BackendFaults>,
+        connect_elapsed: Option<&mut Duration>,
     ) -> Result<Blk> {
         let num_queues = vu_cfg.num_queues;
 
         // A restore is made against backends that are already serving, so it
         // connects once: a socket that is missing or refuses is a fault to
         // report, not one to wait out.
+        let connect = connect_elapsed.map(|elapsed| (elapsed, Instant::now()));
         let mut vu = if state.is_some() {
             VhostUserHandle::connect_vhost_user_once(
                 &vu_cfg.socket,
@@ -289,6 +293,9 @@ impl Blk {
                 |_| Ok(()),
             )?
         };
+        if let Some((elapsed, start)) = connect {
+            *elapsed += start.elapsed();
+        }
 
         let (
             avail_features,
@@ -631,7 +638,6 @@ impl Migratable for Blk {
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
-    use std::time::{Duration, Instant};
 
     use virtio_bindings::virtio_blk::VIRTIO_BLK_F_DISCARD;
     use vmm_sys_util::tempdir::TempDir;
@@ -654,6 +660,7 @@ mod tests {
             exit_evt,
             false,
             Some(State::default()),
+            None,
             None,
         );
         assert!(

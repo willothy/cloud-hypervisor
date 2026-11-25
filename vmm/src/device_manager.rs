@@ -146,6 +146,7 @@ use vm_virtio::{AccessPlatform, VirtioDeviceType};
 use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
+use crate::api::{DeviceSetupTiming, RestoreTiming};
 use crate::console_devices::{ConsoleInfo, ConsoleTransport};
 use crate::cpu::{AcpiCpuHotplugController, CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
@@ -1486,21 +1487,25 @@ impl DeviceManager {
         self.console.resize_pipe.clone()
     }
 
-    pub fn create_interrupt_controller(
+    pub(crate) fn create_interrupt_controller(
         &mut self,
         snapshot: Option<&Snapshot>,
+        timing: Option<&mut DeviceSetupTiming>,
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
+        let finish = RestoreTiming::phase(timing.map(|t| &mut t.interrupt_controller));
         self.add_interrupt_controller(snapshot)
+            .inspect(|_| finish())
     }
 
     #[expect(clippy::needless_pass_by_value)]
-    pub fn create_devices(
+    pub(crate) fn create_devices(
         &mut self,
         console_info: Option<ConsoleInfo>,
         console_resize_pipe: Option<Arc<File>>,
         original_termios_opt: Arc<Mutex<Option<termios>>>,
         interrupt_controller: Arc<Mutex<dyn InterruptController>>,
         snapshot: Option<&Snapshot>,
+        mut timing: Option<&mut DeviceSetupTiming>,
     ) -> DeviceManagerResult<()> {
         trace_scoped!("create_devices");
 
@@ -1554,12 +1559,14 @@ impl DeviceManager {
 
         self.original_termios_opt = original_termios_opt;
 
+        let finish_console = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.console));
         self.add_console_devices(
             legacy_interrupt_manager.as_ref(),
             console_info,
             console_resize_pipe,
             snapshot,
         )?;
+        finish_console();
 
         #[cfg(not(target_arch = "riscv64"))]
         if let Some(tpm) = Arc::clone(&self.config).lock().unwrap().tpm.as_ref() {
@@ -1569,7 +1576,7 @@ impl DeviceManager {
         }
         self.legacy_interrupt_manager = Some(legacy_interrupt_manager);
 
-        self.make_virtio_devices(snapshot)?;
+        self.make_virtio_devices(snapshot, timing)?;
         self.add_pci_devices(snapshot)?;
 
         // Add pvmemcontrol if required
@@ -2788,10 +2795,14 @@ impl DeviceManager {
         Ok(())
     }
 
-    fn make_virtio_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+    fn make_virtio_devices(
+        &mut self,
+        snapshot: Option<&Snapshot>,
+        mut timing: Option<&mut DeviceSetupTiming>,
+    ) -> DeviceManagerResult<()> {
         // Create "standard" virtio devices (net/block/rng)
-        self.make_virtio_block_devices(snapshot)?;
-        self.make_virtio_net_devices(snapshot)?;
+        self.make_virtio_block_devices(snapshot, timing.as_deref_mut())?;
+        self.make_virtio_net_devices(snapshot, timing.as_deref_mut())?;
         self.make_virtio_rng_devices(snapshot)?;
 
         // Add generic vhost-user if required
@@ -2804,7 +2815,7 @@ impl DeviceManager {
         self.make_virtio_pmem_devices(snapshot)?;
 
         // Add virtio-vsock if required
-        self.make_virtio_vsock_devices(snapshot)?;
+        self.make_virtio_vsock_devices(snapshot, timing)?;
 
         self.make_virtio_mem_devices(snapshot)?;
 
@@ -2851,6 +2862,7 @@ impl DeviceManager {
         disk_cfg: &mut DiskConfig,
         is_hotplug: bool,
         snapshot: Option<&Snapshot>,
+        timing: Option<&mut DeviceSetupTiming>,
     ) -> DeviceManagerResult<MetaVirtioDevice> {
         let id = match disk_cfg.pci_common.id.as_ref() {
             Some(id) => id.clone(),
@@ -2885,6 +2897,7 @@ impl DeviceManager {
                     state_from_id(snapshot, id.as_str())
                         .map_err(DeviceManagerError::RestoreGetState)?,
                     self.vhost_user_backend_faults(&id)?,
+                    timing.map(|t| t.disks.next()),
                 ) {
                     Ok(vub_device) => vub_device,
                     Err(e) => {
@@ -3038,11 +3051,17 @@ impl DeviceManager {
     fn make_virtio_block_devices(
         &mut self,
         snapshot: Option<&Snapshot>,
+        mut timing: Option<&mut DeviceSetupTiming>,
     ) -> DeviceManagerResult<()> {
         let mut block_devices = self.config.lock().unwrap().disks.take();
         if let Some(disk_list_cfg) = &mut block_devices {
             for disk_cfg in disk_list_cfg.iter_mut() {
-                let device = self.make_virtio_block_device(disk_cfg, false, snapshot)?;
+                let device = self.make_virtio_block_device(
+                    disk_cfg,
+                    false,
+                    snapshot,
+                    timing.as_deref_mut(),
+                )?;
                 self.virtio_devices.push(device);
             }
         }
@@ -3212,11 +3231,17 @@ impl DeviceManager {
     }
 
     /// Add virto-net and vhost-user-net devices
-    fn make_virtio_net_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
+    fn make_virtio_net_devices(
+        &mut self,
+        snapshot: Option<&Snapshot>,
+        mut timing: Option<&mut DeviceSetupTiming>,
+    ) -> DeviceManagerResult<()> {
         let mut net_devices = self.config.lock().unwrap().net.take();
         if let Some(net_list_cfg) = &mut net_devices {
             for net_cfg in net_list_cfg.iter_mut() {
+                let finish = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.net));
                 let device = self.make_virtio_net_device(net_cfg, snapshot)?;
+                finish();
                 self.virtio_devices.push(device);
             }
         }
@@ -3712,10 +3737,13 @@ impl DeviceManager {
     fn make_virtio_vsock_devices(
         &mut self,
         snapshot: Option<&Snapshot>,
+        timing: Option<&mut DeviceSetupTiming>,
     ) -> DeviceManagerResult<()> {
         let mut vsock = self.config.lock().unwrap().vsock.take();
         if let Some(vsock_cfg) = &mut vsock {
+            let finish = RestoreTiming::phase(timing.map(|t| &mut t.vsock));
             let device = self.make_virtio_vsock_device(vsock_cfg, snapshot)?;
+            finish();
             self.virtio_devices.push(device);
         }
         self.config.lock().unwrap().vsock = vsock;
@@ -5950,7 +5978,7 @@ impl DeviceManager {
             return Err(DeviceManagerError::InvalidIommuHotplug);
         }
 
-        let device = self.make_virtio_block_device(disk_cfg, true, None)?;
+        let device = self.make_virtio_block_device(disk_cfg, true, None, None)?;
         self.hotplug_virtio_pci_device(device)
     }
 

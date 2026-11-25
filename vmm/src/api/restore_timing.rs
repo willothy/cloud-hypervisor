@@ -1,11 +1,72 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::config::MemoryRestoreMode;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Non-overlapping child spans of the device setup phase.
+#[derive(Default)]
+pub(crate) struct DeviceSetupTiming {
+    pub(crate) disks: DiskConnectTiming,
+    pub(crate) net: Duration,
+    pub(crate) vsock: Duration,
+    pub(crate) console: Duration,
+    pub(crate) interrupt_controller: Duration,
+}
+
+impl DeviceSetupTiming {
+    fn other(&self, total: Duration) -> Duration {
+        total.saturating_sub(
+            self.disks.ordinals.iter().sum::<Duration>()
+                + self.disks.overflow
+                + self.net
+                + self.vsock
+                + self.console
+                + self.interrupt_controller,
+        )
+    }
+}
+
+/// The first eight vhost-user disk connects, in config order. Further
+/// connects share one aggregate so the log line stays bounded.
+#[derive(Default)]
+pub(crate) struct DiskConnectTiming {
+    ordinals: [Duration; 8],
+    count: usize,
+    overflow: Duration,
+}
+
+impl DiskConnectTiming {
+    pub(crate) fn next(&mut self) -> &mut Duration {
+        let ordinal = self.count;
+        self.count += 1;
+        self.ordinals.get_mut(ordinal).unwrap_or(&mut self.overflow)
+    }
+
+    fn overflow_count(&self) -> usize {
+        self.count.saturating_sub(self.ordinals.len())
+    }
+}
+
+impl fmt::Display for DiskConnectTiming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[")?;
+        for (i, elapsed) in self.ordinals[..self.count.min(self.ordinals.len())]
+            .iter()
+            .enumerate()
+        {
+            if i != 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{}", elapsed.as_nanos())?;
+        }
+        f.write_str("]")
+    }
+}
 
 /// Wall time on the VMM thread for a successful `vm.restore` API dispatch.
 /// Starts after the API request log and ends at the internal reply handoff,
@@ -21,6 +82,7 @@ pub struct RestoreTiming {
     pub(crate) snapshot_and_cpuid: Duration,
     pub(crate) memory_uffd: Duration,
     pub(crate) devices: Duration,
+    device_setup: DeviceSetupTiming,
     pub(crate) state_restore: Duration,
     pub(crate) resume: Duration,
 }
@@ -38,9 +100,21 @@ impl RestoreTiming {
             snapshot_and_cpuid: Duration::ZERO,
             memory_uffd: Duration::ZERO,
             devices: Duration::ZERO,
+            device_setup: DeviceSetupTiming::default(),
             state_restore: Duration::ZERO,
             resume: Duration::ZERO,
         })
+    }
+
+    /// Start a device setup interval and lend its nested timing accumulator
+    /// separately from its outer elapsed counter.
+    pub(crate) fn devices_phase(
+        timing: Option<&mut Self>,
+    ) -> (impl FnOnce() + '_, Option<&mut DeviceSetupTiming>) {
+        let (total, setup) = timing
+            .map(|t| (Some(&mut t.devices), Some(&mut t.device_setup)))
+            .unwrap_or_default();
+        (Self::phase(total), setup)
     }
 
     /// Add a disjoint interval on success, without reading the clock when
@@ -77,7 +151,7 @@ impl RestoreTiming {
                 .file(Some(file!()))
                 .line(Some(line!()))
                 .args(format_args!(
-                    "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={}",
+                    "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={} devices_vhost_user_blk_connect_ns={} devices_vhost_user_blk_connect_overflow_count={} devices_vhost_user_blk_connect_overflow_ns={} devices_net_ns={} devices_vsock_ns={} devices_console_ns={} devices_interrupt_controller_ns={} devices_other_ns={}",
                     total.as_nanos(),
                     self.snapshot_and_cpuid.as_nanos(),
                     self.memory_uffd.as_nanos(),
@@ -85,6 +159,14 @@ impl RestoreTiming {
                     self.state_restore.as_nanos(),
                     self.resume.as_nanos(),
                     self.other(total).as_nanos(),
+                    self.device_setup.disks,
+                    self.device_setup.disks.overflow_count(),
+                    self.device_setup.disks.overflow.as_nanos(),
+                    self.device_setup.net.as_nanos(),
+                    self.device_setup.vsock.as_nanos(),
+                    self.device_setup.console.as_nanos(),
+                    self.device_setup.interrupt_controller.as_nanos(),
+                    self.device_setup.other(self.devices).as_nanos(),
                 ))
                 .build(),
         );
@@ -103,11 +185,34 @@ mod tests {
                 snapshot_and_cpuid: Duration::from_nanos(3),
                 memory_uffd: Duration::from_nanos(5),
                 devices: Duration::from_nanos(7),
+                device_setup: DeviceSetupTiming::default(),
                 state_restore: Duration::from_nanos(11),
                 resume,
             };
             let total = Duration::from_nanos(39) + resume;
             assert_eq!(timing.other(total), Duration::from_nanos(13));
         }
+    }
+
+    #[test]
+    fn device_accounting_keeps_eight_disk_ordinals_and_sums_overflow() {
+        let mut setup = DeviceSetupTiming {
+            net: Duration::from_nanos(1),
+            vsock: Duration::from_nanos(2),
+            console: Duration::from_nanos(3),
+            interrupt_controller: Duration::from_nanos(4),
+            ..Default::default()
+        };
+        assert_eq!(setup.disks.to_string(), "[]");
+        for ns in 1..=10 {
+            *setup.disks.next() += Duration::from_nanos(ns);
+        }
+        assert_eq!(setup.disks.to_string(), "[1,2,3,4,5,6,7,8]");
+        assert_eq!(setup.disks.overflow_count(), 2);
+        assert_eq!(setup.disks.overflow, Duration::from_nanos(19));
+        assert_eq!(
+            setup.other(Duration::from_nanos(70)),
+            Duration::from_nanos(5)
+        );
     }
 }

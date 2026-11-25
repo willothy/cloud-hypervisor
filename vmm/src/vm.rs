@@ -90,7 +90,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::api::{CaptureScope, RestoreTiming};
+use crate::api::{CaptureScope, DeviceSetupTiming, RestoreTiming};
 use crate::config::{
     GuestClockRestoreMode, MemoryRestoreMode, SnapshotZeroPages, ValidationError, add_to_config,
 };
@@ -1062,8 +1062,7 @@ impl Vm {
         // MSHV initialization (create interrupt controller and devices)
         #[cfg(feature = "mshv")]
         if is_mshv {
-            let finish_devices =
-                RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
+            let (finish_devices, setup) = RestoreTiming::devices_phase(timing.as_deref_mut());
             Self::init_mshv(
                 vm,
                 device_manager,
@@ -1071,6 +1070,7 @@ impl Vm {
                 console_resize_pipe,
                 original_termios,
                 snapshot,
+                setup,
             )?;
             finish_devices();
         }
@@ -1111,8 +1111,7 @@ impl Vm {
         // KVM-specific initialization
         #[cfg(feature = "kvm")]
         if is_kvm {
-            let finish_devices =
-                RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.devices));
+            let (finish_devices, setup) = RestoreTiming::devices_phase(timing.as_deref_mut());
             Self::init_kvm(
                 vm,
                 device_manager,
@@ -1120,6 +1119,7 @@ impl Vm {
                 console_resize_pipe.cloned(),
                 Arc::clone(original_termios),
                 snapshot,
+                setup,
             )?;
             finish_devices();
         }
@@ -1178,12 +1178,12 @@ impl Vm {
         };
 
         // Create interrupt controller and devices for MSHV
-        let finish_devices = RestoreTiming::phase(timing.map(|t| &mut t.devices));
+        let (finish_devices, mut setup) = RestoreTiming::devices_phase(timing);
         let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller(dm_snapshot)
+            .create_interrupt_controller(dm_snapshot, setup.as_deref_mut())
             .map_err(Error::DeviceManager)?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1198,6 +1198,7 @@ impl Vm {
                 Arc::clone(original_termios),
                 ic,
                 dm_snapshot,
+                setup,
             )
             .map_err(Error::DeviceManager)?;
 
@@ -1217,12 +1218,13 @@ impl Vm {
         console_resize_pipe: Option<&Arc<File>>,
         original_termios: &Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        mut setup: Option<&mut DeviceSetupTiming>,
     ) -> Result<()> {
         let dm_snapshot = snapshot_from_id(snapshot, DEVICE_MANAGER_SNAPSHOT_ID);
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller(dm_snapshot)
+            .create_interrupt_controller(dm_snapshot, setup.as_deref_mut())
             .map_err(Error::DeviceManager)?;
 
         #[cfg(target_arch = "aarch64")]
@@ -1237,6 +1239,7 @@ impl Vm {
                 Arc::clone(original_termios),
                 ic,
                 dm_snapshot,
+                setup,
             )
             .map_err(Error::DeviceManager)?;
 
@@ -1252,6 +1255,7 @@ impl Vm {
         console_resize_pipe: Option<Arc<File>>,
         original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<&Snapshot>,
+        mut setup: Option<&mut DeviceSetupTiming>,
     ) -> Result<()> {
         // For KVM, create interrupt controller after boot vcpus
         // because GIC state is restored from snapshot during vcpu creation
@@ -1259,7 +1263,7 @@ impl Vm {
         let ic = device_manager
             .lock()
             .unwrap()
-            .create_interrupt_controller(dm_snapshot)
+            .create_interrupt_controller(dm_snapshot, setup.as_deref_mut())
             .map_err(Error::DeviceManager)?;
 
         vm.init().map_err(Error::InitializeVm)?;
@@ -1273,6 +1277,7 @@ impl Vm {
                 original_termios,
                 ic,
                 dm_snapshot,
+                setup,
             )
             .map_err(Error::DeviceManager)?;
 
