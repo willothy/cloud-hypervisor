@@ -503,6 +503,7 @@ pub fn start_vmm_thread(
     no_shutdown: bool,
     exit_reason: Option<PathBuf>,
     landlock_enable: bool,
+    prefault_installed_workset: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
@@ -543,6 +544,7 @@ pub fn start_vmm_thread(
                     exit_event,
                     no_shutdown,
                     exit_reason,
+                    prefault_installed_workset,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -746,6 +748,8 @@ pub struct Vmm {
     /// Where to record why the VMM exits, when it was asked to: a guest
     /// reset then exits the VMM instead of rebooting the guest in place.
     exit_reason: Option<PathBuf>,
+    /// Whether the launching daemon opted into the v1 page-server receipt.
+    prefault_installed_workset: bool,
     check_migration_evt: EventFd,
 }
 
@@ -925,6 +929,7 @@ impl Vmm {
         exit_evt: EventFd,
         no_shutdown: bool,
         exit_reason: Option<PathBuf>,
+        prefault_installed_workset: bool,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -986,6 +991,7 @@ impl Vmm {
             console_socket_listener: None,
             no_shutdown,
             exit_reason,
+            prefault_installed_workset,
             check_migration_evt,
         })
     }
@@ -1514,7 +1520,7 @@ impl Vmm {
             })?;
 
             // Create VM
-            vm.restore().map_err(|e| {
+            vm.restore(None).map_err(|e| {
                 // Inner error cannot be wrapped in anyhow::Error => print it
                 MigratableError::MigrateReceive(anyhow!(
                     "Failed restoring the VM: {}",
@@ -2300,6 +2306,7 @@ impl Vmm {
                     Some(prefault),
                     Some(memory_restore_mode),
                     restore_fault_socket,
+                    self.prefault_installed_workset,
                     self.exit_reason.as_deref(),
                     Some(clock_restore_mode),
                     #[cfg(target_arch = "x86_64")]
@@ -2321,8 +2328,8 @@ impl Vmm {
 
                 // Now we can restore the rest of the VM.
                 // PANIC: won't panic, we just checked that the VM is there.
-                let finish_state = RestoreTiming::phase(timing.map(|t| &mut t.state_restore));
-                vm.restore()?;
+                let (finish_state, workset_timing) = RestoreTiming::state_phase(timing);
+                vm.restore(workset_timing)?;
                 finish_state();
                 self.vm = VmOwnership::Owned(vm);
                 Ok(())
@@ -2751,6 +2758,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            false,
                             self.exit_reason.as_deref(),
                             None,
                             #[cfg(target_arch = "x86_64")]
@@ -2986,6 +2994,7 @@ impl RequestHandler for Vmm {
             None,
             None,
             None,
+            false,
             self.exit_reason.as_deref(),
             None,
             #[cfg(target_arch = "x86_64")]
@@ -3824,6 +3833,7 @@ mod tests {
             EventFd::new(EFD_NONBLOCK).unwrap(),
             false,
             None,
+            false,
         )
         .unwrap()
     }

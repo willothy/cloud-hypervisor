@@ -7,6 +7,8 @@
 use std::env::consts;
 
 use hypervisor::HypervisorType;
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use hypervisor::kvm::KVM_PRE_FAULT_MEMORY;
 use libc::{
     BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, FIOCLEX, FIONBIO, SIOCGIFFLAGS, SIOCGIFHWADDR,
     SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFHWADDR, SIOCSIFMTU, SIOCSIFNETMASK,
@@ -254,7 +256,7 @@ fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, Backe
 
 #[cfg(feature = "kvm")]
 fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, BackendError> {
-    Ok(or![
+    let rules = or![
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_DEVICE,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_IRQCHIP,)?],
@@ -298,7 +300,19 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_START)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_UPDATE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_FINISH)?],
-    ])
+    ];
+    #[cfg(target_arch = "x86_64")]
+    let rules = {
+        let mut rules = rules;
+        rules.push(and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_PRE_FAULT_MEMORY()
+        )?]);
+        rules
+    };
+    Ok(rules)
 }
 
 fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendError> {

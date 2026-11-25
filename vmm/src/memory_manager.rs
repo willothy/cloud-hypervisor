@@ -59,7 +59,7 @@ use crate::config::{MemoryRestoreMode, SnapshotZeroPages};
 use crate::coredump::{
     CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
 };
-use crate::handoff::{self, FaultSession};
+use crate::handoff::{self, FaultSession, InstalledWorkset};
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
 use crate::sparse::{next_data_extent, write_region_sparse};
@@ -1195,7 +1195,24 @@ impl MemoryManager {
         &mut self,
         socket_path: &Path,
         saved_regions: &MemoryRangeTable,
+        report_installed: bool,
     ) -> Result<(), Error> {
+        if report_installed {
+            let memory = self.guest_memory.memory();
+            for range in saved_regions.ranges() {
+                let valid = memory
+                    .find_region(GuestAddress(range.gpa))
+                    .is_some_and(|region| {
+                        range.length <= region.len() - (range.gpa - region.start_addr().raw_value())
+                    });
+                if !valid {
+                    return Err(Error::FaultSession(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "working-set handoff crosses a guest RAM region boundary",
+                    )));
+                }
+            }
+        }
         let mut file_offset: u64 = 0;
         let Some(uffd) = self.prepare_uffd(
             saved_regions,
@@ -1220,11 +1237,20 @@ impl MemoryManager {
             uffd.into_fd(),
             &memfds,
             self.exit_reason.as_deref(),
+            report_installed.then_some(gpas.as_slice()),
         )
         .map_err(Error::FaultSession)?;
         self.fault_session = Some(session);
         info!("UFFD restore: demand-paged restore handed to the fault handler");
         Ok(())
+    }
+
+    /// Take the one validated startup receipt while keeping its session
+    /// available to check for queued input before launching vCPUs.
+    pub(crate) fn take_installed_workset(&mut self) -> Option<(&FaultSession, InstalledWorkset)> {
+        let session = self.fault_session.as_mut()?;
+        let workset = session.take_installed_workset()?;
+        Some((session, workset))
     }
 
     /// How the backend of vhost-user device `device` serves faults:
@@ -1534,6 +1560,7 @@ impl MemoryManager {
             uffd_fd,
             &memfds,
             self.exit_reason.as_deref(),
+            None,
         )
         .map_err(Error::FaultSession)?;
         self.fault_session = Some(session);
@@ -2947,6 +2974,7 @@ impl MemoryManager {
         prefault: bool,
         memory_restore_mode: MemoryRestoreMode,
         restore_fault_socket: Option<&Path>,
+        report_installed: bool,
         phys_bits: u8,
         exit_evt: &EventFd,
         exit_reason: Option<&Path>,
@@ -2976,10 +3004,11 @@ impl MemoryManager {
                     // fault handler; without one they are read from the
                     // snapshot file.
                     MemoryRestoreMode::OnDemand => match restore_fault_socket {
-                        Some(socket_path) => mm
-                            .lock()
-                            .unwrap()
-                            .restore_by_uffd_socket(socket_path, &mem_snapshot.memory_ranges)?,
+                        Some(socket_path) => mm.lock().unwrap().restore_by_uffd_socket(
+                            socket_path,
+                            &mem_snapshot.memory_ranges,
+                            report_installed,
+                        )?,
                         None => mm.lock().unwrap().restore_by_uffd(
                             &memory_file_path,
                             &mem_snapshot.memory_ranges,
@@ -4818,6 +4847,7 @@ mod tests {
             uffd_stand_in,
             &[],
             None,
+            None,
         )
         .unwrap();
         _handler = listener.accept().unwrap().0;
@@ -4879,6 +4909,7 @@ mod tests {
             Vec::new(),
             uffd_stand_in,
             &[],
+            None,
             None,
         )
         .unwrap();

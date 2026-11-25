@@ -150,6 +150,8 @@ restore_sites! {
     EventFdClone => "eventfd-clone",
     /// The host lacks a KVM capability the VMM requires.
     KvmExtensions => "kvm-extensions",
+    /// Probing KVM's prefault capability or populating stage-2 mappings.
+    KvmPrefault => "kvm-prefault",
     /// Creating the KVM VM (`KVM_CREATE_VM` and the capabilities it is
     /// created with).
     KvmCreateVm => "kvm-create-vm",
@@ -405,6 +407,7 @@ impl RestoreSite {
             | RestoreSite::KvmTss
             | RestoreSite::KvmSplitIrqchip
             | RestoreSite::KvmMemorySlot
+            | RestoreSite::KvmPrefault
             | RestoreSite::VmInit
             | RestoreSite::VcpuHostCapabilities
             | RestoreSite::KvmSetRegs
@@ -558,6 +561,9 @@ impl Cause {
             VmError::InvalidNumaConfig => Cause::at(RestoreSite::Numa),
             VmError::ApplyMemoryZoneUpdate(_) => Cause::at(RestoreSite::MemoryZoneUpdate),
             VmError::MemoryManager(error) => Cause::of_memory_manager_error(error),
+            VmError::PrefaultInstalledWorkset(error) => {
+                Cause::chain(RestoreSite::KvmPrefault, error)
+            }
             VmError::CpuManager(error) => Cause::of_cpu_error(error),
             VmError::DeviceManager(error) => Cause::of_device_manager_error(error),
             VmError::LockingError(error) => Cause::chain(RestoreSite::DiskLock, error),
@@ -1415,6 +1421,7 @@ mod tests {
             | RestoreSite::KvmTss
             | RestoreSite::KvmSplitIrqchip
             | RestoreSite::KvmMemorySlot
+            | RestoreSite::KvmPrefault
             | RestoreSite::VmInit
             | RestoreSite::VcpuHostCapabilities
             | RestoreSite::KvmSetRegs

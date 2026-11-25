@@ -54,8 +54,8 @@ use vmm_sys_util::eventfd::EventFd;
 #[cfg(feature = "dbus_api")]
 pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
-pub(crate) use self::restore_timing::DeviceSetupTiming;
 pub use self::restore_timing::RestoreTiming;
+pub(crate) use self::restore_timing::{DeviceSetupTiming, WorksetTiming};
 use crate::Error as VmmError;
 use crate::config::{
     RestoreConfig, RestoredVfioConfig, SnapshotZeroPages, VmMemoryZoneUpdateData,

@@ -68,6 +68,13 @@ impl fmt::Display for DiskConnectTiming {
     }
 }
 
+/// Child spans of memory/UFFD setup (receipt) and state restore (prefault).
+pub(crate) struct WorksetTiming {
+    pub(crate) receipt: Duration,
+    pub(crate) prefault: Duration,
+    pub(crate) bytes: u64,
+}
+
 /// Wall time on the VMM thread for a successful `vm.restore` API dispatch.
 /// Starts after the API request log and ends at the internal reply handoff,
 /// before emitting the timing record. It does not time the HTTP/DBus reply.
@@ -84,6 +91,7 @@ pub struct RestoreTiming {
     pub(crate) devices: Duration,
     device_setup: DeviceSetupTiming,
     pub(crate) state_restore: Duration,
+    workset: Option<WorksetTiming>,
     pub(crate) resume: Duration,
 }
 
@@ -102,6 +110,7 @@ impl RestoreTiming {
             devices: Duration::ZERO,
             device_setup: DeviceSetupTiming::default(),
             state_restore: Duration::ZERO,
+            workset: None,
             resume: Duration::ZERO,
         })
     }
@@ -115,6 +124,16 @@ impl RestoreTiming {
             .map(|t| (Some(&mut t.devices), Some(&mut t.device_setup)))
             .unwrap_or_default();
         (Self::phase(total), setup)
+    }
+
+    /// Time the state-restore phase while recording its prefault child span.
+    pub(crate) fn state_phase(
+        timing: Option<&mut Self>,
+    ) -> (impl FnOnce() + '_, Option<&mut Option<WorksetTiming>>) {
+        let (total, workset) = timing
+            .map(|t| (Some(&mut t.state_restore), Some(&mut t.workset)))
+            .unwrap_or_default();
+        (Self::phase(total), workset)
     }
 
     /// Add a disjoint interval on success, without reading the clock when
@@ -143,6 +162,14 @@ impl RestoreTiming {
     /// threshold to this explicitly enabled record.
     pub(super) fn log(self, memory_mode: MemoryRestoreMode, resumed: bool) {
         let total = self.started.elapsed();
+        let workset = self.workset.as_ref().map(|workset| {
+            format!(
+                " workset_receipt_ns={} workset_prefault_ns={} workset_prefault_bytes={}",
+                workset.receipt.as_nanos(),
+                workset.prefault.as_nanos(),
+                workset.bytes,
+            )
+        });
         log::logger().log(
             &log::Record::builder()
                 .level(log::Level::Info)
@@ -151,7 +178,7 @@ impl RestoreTiming {
                 .file(Some(file!()))
                 .line(Some(line!()))
                 .args(format_args!(
-                    "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={} devices_vhost_user_blk_connect_ns={} devices_vhost_user_blk_connect_overflow_count={} devices_vhost_user_blk_connect_overflow_ns={} devices_net_ns={} devices_vsock_ns={} devices_console_ns={} devices_interrupt_controller_ns={} devices_other_ns={}",
+                    "vm_restore_timing requested_memory_mode={memory_mode:?} resumed={resumed} total_ns={} snapshot_and_cpuid_ns={} memory_uffd_ns={} devices_ns={} state_restore_ns={} resume_ns={} other_ns={} devices_vhost_user_blk_connect_ns={} devices_vhost_user_blk_connect_overflow_count={} devices_vhost_user_blk_connect_overflow_ns={} devices_net_ns={} devices_vsock_ns={} devices_console_ns={} devices_interrupt_controller_ns={} devices_other_ns={}{}",
                     total.as_nanos(),
                     self.snapshot_and_cpuid.as_nanos(),
                     self.memory_uffd.as_nanos(),
@@ -167,6 +194,7 @@ impl RestoreTiming {
                     self.device_setup.console.as_nanos(),
                     self.device_setup.interrupt_controller.as_nanos(),
                     self.device_setup.other(self.devices).as_nanos(),
+                    workset.as_deref().unwrap_or_default(),
                 ))
                 .build(),
         );
@@ -187,6 +215,7 @@ mod tests {
                 devices: Duration::from_nanos(7),
                 device_setup: DeviceSetupTiming::default(),
                 state_restore: Duration::from_nanos(11),
+                workset: None,
                 resume,
             };
             let total = Duration::from_nanos(39) + resume;

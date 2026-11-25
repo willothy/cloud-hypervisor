@@ -40,8 +40,14 @@
 //! that it answers that it is not yet, and nothing changes. The settle
 //! message carries the version of the exchange the VMM speaks, which a
 //! handler speaking another refuses.
+//!
+//! A demand-paged handoff can explicitly request a `WorksetInstalled`
+//! receipt (type 8). It must be the peer's first and only startup frame
+//! and list only template working-set pages it has already installed. The
+//! peer sends an empty receipt for a non-template restore.
 
 use std::fs::{self, File};
+use std::mem::zeroed;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -72,6 +78,8 @@ const MSG_BACKEND_VERDICT: u32 = 5;
 const MSG_SETTLE: u32 = 6;
 /// Header discriminant of a settle-verdict message.
 const MSG_SETTLE_VERDICT: u32 = 7;
+/// Header discriminant of an installed working-set receipt.
+const MSG_WORKSET_INSTALLED: u32 = 8;
 
 /// The version of the settle exchange this VMM speaks, sent in every settle
 /// message. A handler that speaks another version refuses the message with
@@ -85,6 +93,11 @@ const HEADER_LEN: usize = 8;
 /// defending the length-prefixed read against a corrupt peer. Its messages
 /// carry at most an error string.
 const MAX_RECEIVED_LEN: u32 = 1024 * 1024;
+
+const MAX_WORKSET_BODY_LEN: u32 = 512 * 1024;
+const MAX_WORKSET_PAGES: u64 = 8192;
+const WORKSET_PAGE_SIZE: u64 = 4096;
+const WORKSET_RECEIPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The most bytes of a capture body the fault handler reads, mirroring its own
 /// bound (`crucible-pageserver`'s `protocol::MAX_BODY_LEN`, the wire
@@ -150,6 +163,133 @@ pub(crate) struct HandoffRegion {
 struct Handoff {
     mode: RegistrationMode,
     regions: Vec<HandoffRegion>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    report_installed: bool,
+}
+
+impl Handoff {
+    /// Bind the receipt to this handoff's own, disjoint host/GPA mappings.
+    fn workset_layout(&self, gpas: &[u64]) -> io::Result<Vec<(u64, &HandoffRegion)>> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid working-set handoff layout",
+            )
+        };
+        if self.mode != RegistrationMode::MissingAndWriteProtect || gpas.len() != self.regions.len()
+        {
+            return Err(invalid());
+        }
+        let mut layout = Vec::with_capacity(gpas.len());
+        for (&gpa, region) in gpas.iter().zip(&self.regions) {
+            if region.length == 0
+                || !gpa.is_multiple_of(WORKSET_PAGE_SIZE)
+                || !region.length.is_multiple_of(WORKSET_PAGE_SIZE)
+                || !region.vmm_addr.is_multiple_of(WORKSET_PAGE_SIZE)
+                || region.vmm_addr.checked_add(region.length).is_none()
+                || gpa.checked_add(region.length).is_none()
+            {
+                return Err(invalid());
+            }
+            layout.push((gpa, region));
+        }
+        layout.sort_unstable_by_key(|(gpa, _)| *gpa);
+        if layout
+            .windows(2)
+            .any(|pair| pair[0].0 + pair[0].1.length > pair[1].0)
+        {
+            return Err(invalid());
+        }
+        layout.sort_unstable_by_key(|(_, region)| region.vmm_addr);
+        if layout.windows(2).any(|pair| {
+            let (_, first) = pair[0];
+            let (_, second) = pair[1];
+            first.vmm_addr + first.length > second.vmm_addr
+        }) {
+            return Err(invalid());
+        }
+        Ok(layout)
+    }
+}
+
+/// Installed bytes in the VMM's virtual address space.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledRange {
+    vmm_addr: u64,
+    length: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorksetInstalled {
+    ranges: Vec<InstalledRange>,
+}
+
+/// The one startup receipt, consumed before the restored vCPUs can run.
+pub(crate) struct InstalledWorkset {
+    pub(crate) gpa_ranges: Vec<(u64, u64)>,
+    pub(crate) bytes: u64,
+    pub(crate) receipt_time: Duration,
+}
+
+impl WorksetInstalled {
+    /// Translate only whole, aligned, non-overlapping ranges within the
+    /// exact 4 KiB-backed registrations sent in the handoff.
+    fn into_guest_ranges(
+        mut self,
+        regions: &[(u64, &HandoffRegion)],
+        receipt_started: Instant,
+    ) -> io::Result<InstalledWorkset> {
+        let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
+        if self.ranges.len() > MAX_WORKSET_PAGES as usize {
+            return Err(invalid("too many installed working-set ranges"));
+        }
+        self.ranges.sort_unstable_by_key(|range| range.vmm_addr);
+        let mut previous_end = 0;
+        let mut bytes = 0u64;
+        let mut regions = regions.iter().peekable();
+        let mut gpa_ranges = Vec::with_capacity(self.ranges.len());
+        for range in self.ranges {
+            let end = range
+                .vmm_addr
+                .checked_add(range.length)
+                .filter(|_| {
+                    range.vmm_addr >= previous_end
+                        && range.length != 0
+                        && range.vmm_addr.is_multiple_of(WORKSET_PAGE_SIZE)
+                        && range.length.is_multiple_of(WORKSET_PAGE_SIZE)
+                })
+                .ok_or_else(|| invalid("invalid installed working-set range"))?;
+            bytes = bytes
+                .checked_add(range.length)
+                .filter(|&bytes| bytes <= MAX_WORKSET_PAGES * WORKSET_PAGE_SIZE)
+                .ok_or_else(|| invalid("installed working set exceeds the page limit"))?;
+            while regions
+                .peek()
+                .is_some_and(|(_, region)| region.vmm_addr + region.length <= range.vmm_addr)
+            {
+                regions.next();
+            }
+            let (gpa, region) = regions
+                .peek()
+                .filter(|(_, region)| {
+                    region.page_size == WORKSET_PAGE_SIZE
+                        && range.vmm_addr >= region.vmm_addr
+                        && end <= region.vmm_addr + region.length
+                })
+                .ok_or_else(|| {
+                    invalid("installed working-set range is outside its registration")
+                })?;
+            gpa_ranges.push((gpa + (range.vmm_addr - region.vmm_addr), range.length));
+            previous_end = end;
+        }
+        Ok(InstalledWorkset {
+            gpa_ranges,
+            bytes,
+            receipt_time: receipt_started.elapsed(),
+        })
+    }
 }
 
 /// One write-protect-armed range of a live capture, and where its pages land
@@ -245,6 +385,7 @@ pub(crate) struct FaultSession {
     stream: UnixStream,
     uffd: OwnedFd,
     mode: RegistrationMode,
+    installed_workset: Option<InstalledWorkset>,
     /// Serializes whole messages onto the connection: captures are sent from
     /// here, and backend handoffs from the [`BackendFaultRelay`]s of
     /// vhost-user devices, which can connect at any time.
@@ -273,23 +414,81 @@ impl FaultSession {
         uffd: OwnedFd,
         memfds: &[RawFd],
         exit_reason: Option<&Path>,
+        report_installed_for_gpas: Option<&[u64]>,
     ) -> io::Result<Self> {
+        let handoff = Handoff {
+            mode,
+            regions,
+            report_installed: report_installed_for_gpas.is_some(),
+        };
+        let workset_layout = report_installed_for_gpas
+            .map(|gpas| handoff.workset_layout(gpas))
+            .transpose()?;
         let stream = UnixStream::connect(socket)?;
-        let body = serde_json::to_vec(&Handoff { mode, regions })?;
+        let body = serde_json::to_vec(&handoff)?;
         let mut fds = Vec::with_capacity(memfds.len() + 1);
         fds.push(uffd.as_raw_fd());
         fds.extend_from_slice(memfds);
         send_message(&stream, MSG_HANDOFF, &body, &fds)?;
+        let installed_workset = if let Some(layout) = workset_layout {
+            let started = Instant::now();
+            let body = receive_message(
+                &stream,
+                MSG_WORKSET_INSTALLED,
+                Some(started + WORKSET_RECEIPT_TIMEOUT),
+            )?;
+            let receipt: WorksetInstalled = serde_json::from_slice(&body).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid installed working-set receipt",
+                )
+            })?;
+            let workset = receipt.into_guest_ranges(&layout, started)?;
+            Self::check_startup_stream(&stream)?;
+            Some(workset)
+        } else {
+            None
+        };
         let hangup = HangupWatch::spawn(stream.try_clone()?, exit_reason)?;
         Ok(Self {
             _hangup: hangup,
             stream,
             uffd,
             mode,
+            installed_workset,
             write: Arc::new(Mutex::new(())),
             paging: Arc::new(DemandPaging::default()),
             exit_reason: exit_reason.map(Path::to_path_buf),
         })
+    }
+
+    /// Take the receipt once. Later readers still require the message type
+    /// for their own exchange, so a delayed second receipt cannot be used.
+    pub(crate) fn take_installed_workset(&mut self) -> Option<InstalledWorkset> {
+        self.installed_workset.take()
+    }
+
+    /// No second frame (or disconnect) is permitted before the restore
+    /// starts the vCPUs. Check queued input without waiting for future bytes.
+    pub(crate) fn check_workset_stream(&self) -> io::Result<()> {
+        Self::check_startup_stream(&self.stream)
+    }
+
+    fn check_startup_stream(stream: &UnixStream) -> io::Result<()> {
+        let mut fd = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: polling one initialized pollfd whose descriptor stays open.
+        match unsafe { libc::poll(&mut fd, 1, 0) } {
+            0 => Ok(()),
+            -1 => Err(io::Error::last_os_error()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected input or disconnect after the installed working-set receipt",
+            )),
+        }
     }
 
     /// Whether guest RAM is demand-paged through this session, as opposed to
@@ -713,6 +912,13 @@ fn receive_message(
     expected: u32,
     deadline: Option<Instant>,
 ) -> io::Result<Vec<u8>> {
+    let strict = expected == MSG_WORKSET_INSTALLED;
+    let timed_out = || {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the fault handler did not send its message in time",
+        )
+    };
     // Read through recvmsg, which every thread that waits on the handler
     // (the vmm thread, and the vhost-user workers on reconnect) is allowed,
     // unlike the recvfrom a plain read of a socket makes.
@@ -722,10 +928,11 @@ fn receive_message(
             if let Some(deadline) = deadline {
                 // Whole milliseconds, rounded up: the wait never ends
                 // before the deadline.
-                let left = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_nanos()
-                    .div_ceil(1_000_000);
+                let left = deadline.saturating_duration_since(Instant::now());
+                if strict && left.is_zero() {
+                    return Err(timed_out());
+                }
+                let left = left.as_nanos().div_ceil(1_000_000);
                 let mut fd = libc::pollfd {
                     fd: stream.as_raw_fd(),
                     events: libc::POLLIN,
@@ -743,26 +950,34 @@ fn receive_message(
                     return Err(error);
                 }
                 if ready == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the fault handler did not send its message in time",
-                    ));
+                    return Err(timed_out());
                 }
             }
-            match stream.recv_with_fd(&mut buf[read..]) {
-                Ok((0, _)) => {
+            let received = if strict {
+                receive_workset_bytes(stream, &mut buf[read..])
+            } else {
+                stream
+                    .recv_with_fd(&mut buf[read..])
+                    .map(|(len, _)| len)
+                    .map_err(|error| {
+                        if error.errno() == libc::EINTR {
+                            io::Error::from(io::ErrorKind::Interrupted)
+                        } else {
+                            io::Error::other(format!("recvmsg from the fault handler: {error}"))
+                        }
+                    })
+            };
+            match received {
+                Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "the fault handler closed the connection mid-message",
                     ));
                 }
-                Ok((more, _)) => read += more,
-                Err(e) if e.errno() == libc::EINTR => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "recvmsg from the fault handler: {e}"
-                    )));
-                }
+                Ok(more) => read += more,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if strict && e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
             }
         }
         Ok(())
@@ -777,7 +992,12 @@ fn receive_message(
             format!("unexpected message type {message_type} from the fault handler"),
         ));
     }
-    if body_len > MAX_RECEIVED_LEN {
+    let max = if strict {
+        MAX_WORKSET_BODY_LEN
+    } else {
+        MAX_RECEIVED_LEN
+    };
+    if body_len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("message body of {body_len} bytes from the fault handler exceeds the bound"),
@@ -785,7 +1005,37 @@ fn receive_message(
     }
     let mut body = vec![0u8; body_len as usize];
     read_exact(&mut body)?;
+    if strict && deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(timed_out());
+    }
     Ok(body)
+}
+
+/// Receive data without a control buffer. Linux drops SCM_RIGHTS instead
+/// of installing descriptors and marks the message truncated when
+/// ancillary data was present. Nonblocking recv cannot overrun the poll
+/// deadline, and unlike changing O_NONBLOCK affects only this call.
+fn receive_workset_bytes(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<usize> {
+    let mut iov = libc::iovec {
+        iov_base: bytes.as_mut_ptr().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: null pointers and zero lengths denote absent name and control buffers.
+    let mut msg: libc::msghdr = unsafe { zeroed() };
+    msg.msg_iov = &raw mut iov;
+    msg.msg_iovlen = 1;
+    // SAFETY: msg points to a live iovec over the caller's writable buffer.
+    let read = unsafe { libc::recvmsg(stream.as_raw_fd(), &raw mut msg, libc::MSG_DONTWAIT) };
+    if read < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "truncated data or unexpected descriptors in the working-set receipt",
+        ));
+    }
+    Ok(read as usize)
 }
 
 /// Test support: the fault handler's side of the settle exchange.
@@ -803,11 +1053,251 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
+    use std::thread;
 
     use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
+
+    fn workset_region(vmm_addr: u64, length: u64, page_size: u64) -> HandoffRegion {
+        HandoffRegion {
+            vmm_addr,
+            length,
+            source_offset: 0,
+            page_size,
+            memfd: 0,
+            memfd_offset: 0,
+        }
+    }
+
+    #[test]
+    fn workset_receipt_translates_only_whole_backed_ranges() {
+        let handoff = Handoff {
+            mode: RegistrationMode::MissingAndWriteProtect,
+            regions: vec![
+                workset_region(0x8000, 0x4000, 4096),
+                workset_region(0x4000, 0x2000, 4096),
+                workset_region(0x6000, 0x1000, 8192),
+            ],
+            report_installed: true,
+        };
+        for gpas in [
+            &[0, 0x1000, 0x20000][..],
+            &[0, 0x10000],
+            &[u64::MAX - 0xfff, 0x10000, 0x20000],
+        ] {
+            assert_eq!(
+                handoff.workset_layout(gpas).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        let layout = handoff.workset_layout(&[0, 0x10000, 0x20000]).unwrap();
+        let receipt = |ranges: &[(u64, u64)]| {
+            WorksetInstalled {
+                ranges: ranges
+                    .iter()
+                    .map(|&(vmm_addr, length)| InstalledRange { vmm_addr, length })
+                    .collect(),
+            }
+            .into_guest_ranges(&layout, Instant::now())
+        };
+        let installed = receipt(&[(0x9000, 0x2000), (0x5000, 0x1000)]).unwrap();
+        assert_eq!(installed.gpa_ranges, [(0x11000, 0x1000), (0x1000, 0x2000)]);
+        assert_eq!(installed.bytes, 0x3000);
+        assert_eq!(receipt(&[]).unwrap().bytes, 0);
+        for ranges in [
+            &[(0x4000, 0)][..],
+            &[(0x4001, 0x1000)],
+            &[(0x4000, 0x1001)],
+            &[(0x5000, 0x2000)],
+            &[(0x6000, 0x1000)],
+            &[(0x7000, 0x1000)],
+            &[(0x8000, 0x2000), (0x9000, 0x1000)],
+            &[(u64::MAX - 0xfff, 0x1000)],
+        ] {
+            assert!(matches!(receipt(ranges), Err(e) if e.kind() == io::ErrorKind::InvalidData));
+        }
+    }
+
+    #[test]
+    fn workset_receipt_caps_both_range_count_and_total_pages() {
+        let base = 0x100000000;
+        let byte_limit = MAX_WORKSET_PAGES * WORKSET_PAGE_SIZE;
+        let handoff = Handoff {
+            mode: RegistrationMode::MissingAndWriteProtect,
+            regions: vec![workset_region(base, byte_limit * 2, WORKSET_PAGE_SIZE)],
+            report_installed: true,
+        };
+        let layout = handoff.workset_layout(&[0]).unwrap();
+        let pages = |count| WorksetInstalled {
+            ranges: (0..count)
+                .map(|page| InstalledRange {
+                    vmm_addr: base + page * WORKSET_PAGE_SIZE,
+                    length: WORKSET_PAGE_SIZE,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            pages(MAX_WORKSET_PAGES)
+                .into_guest_ranges(&layout, Instant::now())
+                .unwrap()
+                .bytes,
+            byte_limit
+        );
+        assert!(
+            pages(MAX_WORKSET_PAGES + 1)
+                .into_guest_ranges(&layout, Instant::now())
+                .is_err()
+        );
+        assert!(
+            WorksetInstalled {
+                ranges: vec![InstalledRange {
+                    vmm_addr: base,
+                    length: byte_limit + WORKSET_PAGE_SIZE,
+                }],
+            }
+            .into_guest_ranges(&layout, Instant::now())
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workset_frames_refuse_wrong_type_oversize_or_ancillary_data() {
+        let body = br#"{"ranges":[]}"#;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let file = tempfile::tempfile().unwrap();
+        let raw = file.as_raw_fd();
+        let full_header = [
+            &MSG_WORKSET_INSTALLED.to_le_bytes()[..],
+            &(body.len() as u32).to_le_bytes(),
+        ]
+        .concat();
+        let (ours, mut peer) = UnixStream::pair().unwrap();
+        peer.write_all(&MSG_WORKSET_INSTALLED.to_le_bytes())
+            .unwrap();
+        peer.write_all(&(MAX_WORKSET_BODY_LEN + 1).to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            receive_message(&ours, MSG_WORKSET_INSTALLED, Some(deadline))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        for fds in [&[][..], &[raw], &[raw, raw, raw, raw]] {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            if fds.is_empty() {
+                send_message(&peer, MSG_SETTLE_VERDICT, body, fds).unwrap();
+            } else {
+                peer.write_all(&full_header).unwrap();
+                assert_eq!(peer.send_with_fds(&[&body[..]], fds).unwrap(), body.len());
+            }
+            assert_eq!(
+                receive_message(&ours, MSG_WORKSET_INSTALLED, Some(deadline))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[test]
+    fn workset_frames_require_a_complete_message_before_the_deadline() {
+        let body = br#"{"ranges":[]}"#;
+        let (ours, peer) = UnixStream::pair().unwrap();
+        send_message(&peer, MSG_WORKSET_INSTALLED, body, &[]).unwrap();
+        assert_eq!(
+            receive_message(&ours, MSG_WORKSET_INSTALLED, Some(Instant::now()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            receive_message(
+                &ours,
+                MSG_WORKSET_INSTALLED,
+                Some(Instant::now() + Duration::from_secs(1))
+            )
+            .unwrap(),
+            body
+        );
+        for partial_body in [false, true] {
+            let (ours, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(&MSG_WORKSET_INSTALLED.to_le_bytes())
+                .unwrap();
+            if partial_body {
+                peer.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+                peer.write_all(&body[..5]).unwrap();
+            }
+            assert_eq!(
+                receive_message(
+                    &ours,
+                    MSG_WORKSET_INSTALLED,
+                    Some(Instant::now() + Duration::from_millis(10))
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+        let (ours, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert_eq!(
+            receive_message(
+                &ours,
+                MSG_WORKSET_INSTALLED,
+                Some(Instant::now() + Duration::from_secs(1))
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn opted_in_session_takes_one_empty_receipt_and_rejects_a_later_frame() {
+        let dir = TempDir::new_with_prefix("/tmp/fault-session-workset-").unwrap();
+        let socket = dir.as_path().join("fault.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let body = br#"{"ranges":[]}"#;
+        let server = thread::spawn(move || {
+            let peer = listener.accept().unwrap().0;
+            let handoff: Handoff =
+                serde_json::from_slice(&receive_message(&peer, MSG_HANDOFF, None).unwrap())
+                    .unwrap();
+            assert!(handoff.report_installed);
+            send_message(&peer, MSG_WORKSET_INSTALLED, body, &[]).unwrap();
+            peer
+        });
+        let mut session = FaultSession::establish(
+            &socket,
+            RegistrationMode::MissingAndWriteProtect,
+            Vec::new(),
+            OwnedFd::from(tempfile::tempfile().unwrap()),
+            &[],
+            None,
+            Some(&[]),
+        )
+        .unwrap();
+        let peer = server.join().unwrap();
+        assert!(
+            session
+                .take_installed_workset()
+                .unwrap()
+                .gpa_ranges
+                .is_empty()
+        );
+        assert!(session.take_installed_workset().is_none());
+        session.check_workset_stream().unwrap();
+        send_message(&peer, MSG_WORKSET_INSTALLED, body, &[]).unwrap();
+        assert!(session.check_workset_stream().is_err());
+        assert_eq!(
+            FaultSession::wait_done(&session.stream).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(session);
+    }
 
     /// A demand-paged fault session and the stand-in handler's end of its
     /// connection, the handoff already read off it. The handler's end comes
@@ -824,10 +1314,13 @@ mod tests {
             OwnedFd::from(tempfile::tempfile().unwrap()),
             &[],
             None,
+            None,
         )
         .unwrap();
         let handler = listener.accept().unwrap().0;
-        receive_message(&handler, MSG_HANDOFF, None).unwrap();
+        let handoff: serde_json::Value =
+            serde_json::from_slice(&receive_message(&handler, MSG_HANDOFF, None).unwrap()).unwrap();
+        assert!(handoff.get("report_installed").is_none());
         (handler, session)
     }
 

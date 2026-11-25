@@ -12,9 +12,8 @@
 
 #[cfg(target_arch = "x86_64")]
 use std::fmt;
-#[cfg(feature = "tdx")]
-use std::io;
-use std::result;
+use std::time::Instant;
+use std::{io, result};
 
 #[cfg(feature = "sev_snp")]
 use igvm::snp_defs::SevVmsa;
@@ -703,6 +702,12 @@ pub trait Vcpu: Send + Sync {
     ///
     fn tsc_khz(&self) -> Result<Option<u32>> {
         Ok(None)
+    }
+    /// Populate stage-2 mappings for already-backed guest memory without
+    /// running the vCPU. The caller must ensure its state has been restored
+    /// and no vCPU can run concurrently.
+    fn prefault_memory(&self, _gpa: u64, _size: u64, _deadline: Instant) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
     #[cfg(target_arch = "x86_64")]
     ///

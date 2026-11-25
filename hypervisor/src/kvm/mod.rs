@@ -32,7 +32,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 #[cfg(target_arch = "x86_64")]
-use std::time::Duration;
+use std::thread;
+#[cfg(target_arch = "x86_64")]
+use std::time::{Duration, Instant};
 #[cfg(target_arch = "aarch64")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{fs, io, result};
@@ -158,10 +160,10 @@ pub use kvm_ioctls::{self, Cap, Kvm, VcpuExit};
 use log::error;
 use thiserror::Error;
 use vfio_ioctls::VfioDeviceFd;
-#[cfg(target_arch = "x86_64")]
-use vmm_sys_util::ioctl::ioctl_with_ref;
 #[cfg(feature = "tdx")]
 use vmm_sys_util::ioctl::ioctl_with_val;
+#[cfg(target_arch = "x86_64")]
+use vmm_sys_util::ioctl::{ioctl_with_mut_ref, ioctl_with_ref};
 #[cfg(target_arch = "x86_64")]
 use vmm_sys_util::{fam::FamStruct, ioctl_io_nr, ioctl_iow_nr, ioctl_iowr_nr};
 
@@ -222,6 +224,13 @@ const CLOCK_TSC_PAIRING_ATTEMPTS: usize = 8;
 
 #[cfg(target_arch = "x86_64")]
 ioctl_io_nr!(KVM_NMI, kvm_bindings::KVMIO, 0x9a);
+#[cfg(target_arch = "x86_64")]
+ioctl_iowr_nr!(
+    KVM_PRE_FAULT_MEMORY,
+    kvm_bindings::KVMIO,
+    0xd5,
+    kvm_bindings::kvm_pre_fault_memory
+);
 // kvm-ioctls does not wrap KVM_CLEAR_DIRTY_LOG, needed to clear (and re-protect)
 // the dirty bitmap under manual dirty-log protect.
 #[cfg(target_arch = "x86_64")]
@@ -705,6 +714,19 @@ pub struct KvmVm {
 }
 
 impl KvmVm {
+    /// Probe on this VM fd so the request reflects the VM's capabilities.
+    #[cfg(target_arch = "x86_64")]
+    pub fn supports_prefault_memory(&self) -> io::Result<bool> {
+        match self
+            .fd
+            .check_extension_raw(kvm_bindings::KVM_CAP_PRE_FAULT_MEMORY as libc::c_ulong)
+        {
+            0 => Ok(false),
+            result if result > 0 => Ok(true),
+            _ => Err(io::Error::last_os_error()),
+        }
+    }
+
     /// How many nanoseconds the guest TSC takes to count `ticks` at
     /// `tsc_khz`.
     ///
@@ -2421,6 +2443,76 @@ impl KvmVcpu {
 
 #[cfg(target_arch = "x86_64")]
 impl KvmVcpu {
+    /// KVM updates gpa and size to the unprocessed suffix, even on short
+    /// success. Limit the size of a single synchronous ioctl and use one
+    /// deadline for all work and retries. The deadline cannot interrupt an
+    /// ioctl in the kernel; the caller must supply only already-backed RAM.
+    fn prefault_range(
+        gpa: u64,
+        size: u64,
+        deadline: Instant,
+        mut ioctl: impl FnMut(&mut kvm_bindings::kvm_pre_fault_memory) -> io::Result<()>,
+    ) -> io::Result<()> {
+        const PAGE_SIZE: u64 = 4096;
+        const MAX_IOCTL_BYTES: u64 = 2 * 1024 * 1024;
+        const RETRY_DELAY: Duration = Duration::from_millis(1);
+
+        let end = gpa
+            .checked_add(size)
+            .filter(|_| {
+                size != 0 && gpa.is_multiple_of(PAGE_SIZE) && size.is_multiple_of(PAGE_SIZE)
+            })
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid prefault range"))?;
+        let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "KVM prefault deadline expired");
+        let mut next = gpa;
+        let mut limit = gpa;
+        while next < end {
+            if Instant::now() >= deadline {
+                return Err(timed_out());
+            }
+            if next == limit {
+                limit += (end - next).min(MAX_IOCTL_BYTES);
+            }
+            let mut range = kvm_bindings::kvm_pre_fault_memory {
+                gpa: next,
+                size: limit - next,
+                ..Default::default()
+            };
+            let result = ioctl(&mut range);
+            match result {
+                Ok(()) => {
+                    if range.gpa < next
+                        || !range.gpa.is_multiple_of(PAGE_SIZE)
+                        || range.gpa.checked_add(range.size) != Some(limit)
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "KVM returned an invalid prefault suffix",
+                        ));
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    range.gpa = next;
+                }
+                Err(error) => return Err(error),
+            }
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(timed_out)?;
+            if range.gpa == next {
+                thread::sleep(RETRY_DELAY.min(left));
+            }
+            next = range.gpa;
+        }
+        Ok(())
+    }
+
     /// Device attribute selecting the vCPU's L1 TSC offset, `addr` pointing at
     /// the caller's `u64` buffer.
     fn tsc_offset_attr(addr: u64) -> DeviceAttr {
@@ -2456,6 +2548,22 @@ impl KvmVcpu {
 /// let vcpu = vm.create_vcpu(0, None, #[cfg(target_arch = "x86_64")] Default::default()).unwrap();
 /// ```
 impl cpu::Vcpu for KvmVcpu {
+    #[cfg(target_arch = "x86_64")]
+    fn prefault_memory(&self, gpa: u64, size: u64, deadline: Instant) -> io::Result<()> {
+        Self::prefault_range(gpa, size, deadline, |range| {
+            // SAFETY: the ioctl takes a writable, initialized kvm_pre_fault_memory.
+            let result = unsafe { ioctl_with_mut_ref(&self.fd, KVM_PRE_FAULT_MEMORY(), range) };
+            match result {
+                0 => Ok(()),
+                -1 => Err(io::Error::last_os_error()),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "KVM returned an invalid prefault status",
+                )),
+            }
+        })
+    }
+
     ///
     /// Returns StandardRegisters with default value set
     ///
@@ -4579,6 +4687,109 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefault_follows_partial_progress_and_caps_ioctl_size() {
+        use super::*;
+
+        let mut calls = Vec::new();
+        KvmVcpu::prefault_range(
+            0x1000,
+            0x201000,
+            Instant::now() + Duration::from_secs(1),
+            |range| {
+                calls.push((range.gpa, range.size));
+                assert_eq!(range.flags, 0);
+                assert_eq!(range.padding, [0; 5]);
+                let installed = if calls.len() == 1 { 0x1000 } else { range.size };
+                range.gpa += installed;
+                range.size -= installed;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls,
+            [(0x1000, 0x200000), (0x2000, 0x1ff000), (0x201000, 0x1000)]
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefault_checks_progress_and_preserves_fatal_errno() {
+        use super::*;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        for (gpa, size) in [(0, 0), (1, 0x1000), (0, 1), (u64::MAX - 0xfff, 0x1000)] {
+            assert_eq!(
+                KvmVcpu::prefault_range(gpa, size, deadline, |_| unreachable!())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        for (gpa, size) in [(0, 0x2000), (0x2001, 0xfff), (0x3000, 0x1000)] {
+            assert_eq!(
+                KvmVcpu::prefault_range(0x1000, 0x2000, deadline, |range| {
+                    range.gpa = gpa;
+                    range.size = size;
+                    Ok(())
+                })
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        for errno in [libc::EOPNOTSUPP, libc::EFAULT, libc::ENOENT] {
+            assert_eq!(
+                KvmVcpu::prefault_range(0x1000, 0x2000, deadline, |_| {
+                    Err(io::Error::from_raw_os_error(errno))
+                })
+                .unwrap_err()
+                .raw_os_error(),
+                Some(errno)
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn prefault_retries_without_advancing_and_honors_the_deadline() {
+        use super::*;
+
+        let mut calls = 0;
+        KvmVcpu::prefault_range(
+            0x1000,
+            0x1000,
+            Instant::now() + Duration::from_secs(1),
+            |range| {
+                assert_eq!((range.gpa, range.size), (0x1000, 0x1000));
+                calls += 1;
+                match calls {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => Err(io::Error::from_raw_os_error(libc::EAGAIN)),
+                    3 => Ok(()),
+                    4 => {
+                        range.gpa += range.size;
+                        range.size = 0;
+                        Ok(())
+                    }
+                    _ => unreachable!(),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, 4);
+        for deadline in [Instant::now(), Instant::now() + Duration::from_millis(5)] {
+            assert_eq!(
+                KvmVcpu::prefault_range(0x1000, 0x1000, deadline, |_| Ok(()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "sev_snp")]
     fn test_validate_gpa_range() {

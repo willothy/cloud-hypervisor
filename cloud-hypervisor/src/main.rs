@@ -477,6 +477,12 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        Arg::new("prefault-installed-workset-v1")
+            .long("prefault-installed-workset-v1")
+            .help("Prefault installed template pages on external on-demand restore; requires a v1 fault handler")
+            .action(ArgAction::SetTrue)
+            .group("vmm-config"),
         #[cfg(feature = "pvmemcontrol")]
         Arg::new("pvmemcontrol")
             .long("pvmemcontrol")
@@ -842,6 +848,10 @@ fn start_vmm(
         no_shutdown,
         exit_reason,
         landlock_enable,
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        cmd_arguments.get_flag("prefault-installed-workset-v1"),
+        #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+        false,
     )
     .map_err(Error::StartVmmThread)?;
 

@@ -23,8 +23,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
-#[cfg(not(target_arch = "riscv64"))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{any, cmp, result, str, thread};
 
 use anyhow::{Context, anyhow};
@@ -49,6 +48,8 @@ use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use hypervisor::arch::x86;
+#[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+use hypervisor::kvm::KvmVm;
 #[cfg(all(feature = "kvm", feature = "sev_snp"))]
 use hypervisor::kvm::{
     BOOTLOADER_SIZE, BOOTLOADER_START, KVM_VMSA_PAGE_ADDRESS, KVM_VMSA_PAGE_SIZE,
@@ -90,7 +91,7 @@ use vm_migration::{
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
-use crate::api::{CaptureScope, DeviceSetupTiming, RestoreTiming};
+use crate::api::{CaptureScope, DeviceSetupTiming, RestoreTiming, WorksetTiming};
 use crate::config::{
     GuestClockRestoreMode, MemoryRestoreMode, SnapshotZeroPages, ValidationError, add_to_config,
 };
@@ -253,6 +254,9 @@ pub enum Error {
 
     #[error("Memory manager error")]
     MemoryManager(#[source] MemoryManagerError),
+
+    #[error("Cannot prefault the installed working set")]
+    PrefaultInstalledWorkset(#[source] io::Error),
 
     #[error("Cannot snapshot VM")]
     Snapshot(#[source] MigratableError),
@@ -1497,6 +1501,7 @@ impl Vm {
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
         restore_fault_socket: Option<&Path>,
+        prefault_installed_workset: bool,
         exit_reason: Option<&Path>,
         clock_restore_mode: Option<GuestClockRestoreMode>,
         #[cfg(target_arch = "x86_64")] tsc_tolerance_ppm: Option<u32>,
@@ -1561,6 +1566,25 @@ impl Vm {
             memory_restore_mode = MemoryRestoreMode::Copy;
         }
 
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        let report_installed = if prefault_installed_workset
+            && memory_restore_mode == MemoryRestoreMode::OnDemand
+            && restore_fault_socket.is_some()
+        {
+            vm.as_any()
+                .downcast_ref::<KvmVm>()
+                .map(KvmVm::supports_prefault_memory)
+                .transpose()
+                .map_err(Error::PrefaultInstalledWorkset)?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        #[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+        let report_installed = {
+            let _ = prefault_installed_workset;
+            false
+        };
         let finish_memory = RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.memory_uffd));
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
@@ -1572,6 +1596,7 @@ impl Vm {
                     prefault.unwrap_or(false),
                     memory_restore_mode,
                     restore_fault_socket,
+                    report_installed,
                     phys_bits,
                     &exit_evt,
                     exit_reason,
@@ -3382,7 +3407,10 @@ impl Vm {
             .send_session_capture(ranges, &memory_path)
     }
 
-    pub fn restore(&mut self) -> Result<()> {
+    pub(crate) fn restore(
+        &mut self,
+        workset_timing: Option<&mut Option<WorksetTiming>>,
+    ) -> Result<()> {
         event!("vm", "restoring");
 
         // We acquire all advisory disk image locks again.
@@ -3424,6 +3452,8 @@ impl Vm {
             .regenerate_vmgenid()
             .map_err(Error::DeviceManager)?;
 
+        self.prefault_restored_workset(workset_timing)?;
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
@@ -3445,6 +3475,51 @@ impl Vm {
         self.device_log_active = true;
 
         event!("vm", "restored");
+        Ok(())
+    }
+
+    /// Populate stage-2 mappings after the vCPU state restore and before
+    /// creating any vCPU worker. An empty receipt still checks for a
+    /// protocol error, but makes no KVM calls.
+    fn prefault_restored_workset(&self, timing: Option<&mut Option<WorksetTiming>>) -> Result<()> {
+        let mut memory = self.memory_manager.lock().unwrap();
+        let Some((session, workset)) = memory.take_installed_workset() else {
+            return Ok(());
+        };
+        session
+            .check_workset_stream()
+            .map_err(MemoryManagerError::FaultSession)
+            .map_err(Error::MemoryManager)?;
+        let started = Instant::now();
+        if !workset.gpa_ranges.is_empty() {
+            let vcpu = self
+                .cpu_manager
+                .lock()
+                .unwrap()
+                .boot_vcpu()
+                .ok_or_else(|| {
+                    Error::PrefaultInstalledWorkset(io::Error::other("no restored boot vCPU"))
+                })?;
+            let vcpu = vcpu.lock().unwrap();
+            let deadline = started + Duration::from_secs(5);
+            for (gpa, size) in workset.gpa_ranges {
+                vcpu.hypervisor_vcpu()
+                    .prefault_memory(gpa, size, deadline)
+                    .map_err(Error::PrefaultInstalledWorkset)?;
+            }
+        }
+        let prefault = started.elapsed();
+        session
+            .check_workset_stream()
+            .map_err(MemoryManagerError::FaultSession)
+            .map_err(Error::MemoryManager)?;
+        if let Some(timing) = timing {
+            *timing = Some(WorksetTiming {
+                receipt: workset.receipt_time,
+                prefault,
+                bytes: workset.bytes,
+            });
+        }
         Ok(())
     }
 
