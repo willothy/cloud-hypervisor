@@ -1102,6 +1102,20 @@ impl Vm {
             None
         };
 
+        // A restored VM tracks the pages written to guest RAM from before its
+        // vCPUs' state is set, since setting it writes guest RAM: KVM writes
+        // the wall clock into the page the guest named for it as soon as
+        // that MSR is set. The next live memory checkpoint captures only the
+        // pages written since the restore, so a write missed here would leave
+        // a stale page in it.
+        if snapshot.is_some() {
+            memory_manager
+                .lock()
+                .unwrap()
+                .start_dirty_log()
+                .map_err(Error::StartDirtyLog)?;
+        }
+
         // Create boot vCPUs
         let finish_state =
             RestoreTiming::phase(timing.as_deref_mut().map(|t| &mut t.state_restore));
@@ -3420,15 +3434,8 @@ impl Vm {
             .try_lock_disks()
             .map_err(Error::LockingError)?;
 
-        // Track dirtied guest pages before any vCPU runs: the next live
-        // memory checkpoint captures incrementally against the checkpoint
-        // this VM was restored from, so a write missed here would let it
-        // reuse a stale chunk for a changed page.
-        self.memory_manager
-            .lock()
-            .unwrap()
-            .start_dirty_log()
-            .map_err(Error::StartDirtyLog)?;
+        // Dirtied guest pages are tracked already, from before the vCPUs'
+        // state was set as the VM was built from its snapshot.
 
         // One uffd owns guest RAM: a demand-paged restore's handoff already
         // established the fault session (this is a no-op then); a restore
