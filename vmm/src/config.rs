@@ -73,8 +73,8 @@ pub enum Error {
     #[error("Error parsing --generic-vhost-user: queue size missing")]
     ParseGenericVhostUserQueueSizeMissing,
     /// Missing persistent memory file parameter.
-    #[error("Error parsing --pmem: file missing")]
-    ParsePmemFileMissing,
+    #[error("Error parsing --pmem: file or fd missing")]
+    ParsePmemFileOrFdMissing,
     /// Missing vsock socket path parameter.
     #[error("Error parsing --vsock: socket missing")]
     ParseVsockSockMissing,
@@ -341,6 +341,15 @@ pub enum ValidationError {
     /// A DeviceConfig specified both `path` and `fd`.
     #[error("VFIO device config must specify at most one of `path=` or `fd=`")]
     VfioDeviceBothPathAndFd,
+    /// A PmemConfig specified neither `file` nor `fd`.
+    #[error("pmem device config must specify `file=` or `fd=`")]
+    PmemNeitherFileNorFd,
+    /// A PmemConfig specified both `file` and `fd`.
+    #[error("pmem device config must specify at most one of `file=` or `fd=`")]
+    PmemBothFileAndFd,
+    /// A PmemConfig's backing FD is a reserved (stdio) or invalid number.
+    #[error("Reserved or invalid pmem fd number (<= 2): {0}")]
+    PmemReservedFd(i32),
     /// FD-based VFIO requires an externally-supplied iommufd FD so the
     /// cdev's bind state can survive across an in-process VM reboot.
     #[error("VFIO device `fd=` requires platform `iommufd_fd=<fd>`")]
@@ -2416,7 +2425,7 @@ impl FwCfgItem {
 
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
-    \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
+    \"file=<backing_file_path>,fd=<backing_file_fd>,size=<persistent_memory_size>,iommu=off|virtio,\
     discard_writes=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
@@ -2425,12 +2434,19 @@ impl PmemConfig {
         parser
             .add("size")
             .add("file")
+            .add("fd")
             .add("discard_writes")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(pmem).map_err(Error::ParsePersistentMemory)?;
 
         let pci_common = PciDeviceCommonConfig::parse(pmem)?;
-        let file = PathBuf::from(parser.get("file").ok_or(Error::ParsePmemFileMissing)?);
+        let file = parser.get("file").map(PathBuf::from);
+        let fd = parser
+            .convert::<i32>("fd")
+            .map_err(Error::ParsePersistentMemory)?;
+        if file.is_none() && fd.is_none() {
+            return Err(Error::ParsePmemFileOrFdMissing);
+        }
         let size = parser
             .convert::<ByteSized>("size")
             .map_err(Error::ParsePersistentMemory)?
@@ -2444,13 +2460,21 @@ impl PmemConfig {
         Ok(PmemConfig {
             pci_common,
             file,
+            fd,
             size,
             discard_writes,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        self.pci_common.validate(vm_config, true)
+        self.pci_common.validate(vm_config, true)?;
+
+        match (&self.file, self.fd) {
+            (None, None) => Err(ValidationError::PmemNeitherFileNorFd),
+            (Some(_), Some(_)) => Err(ValidationError::PmemBothFileAndFd),
+            (None, Some(fd)) if fd <= 2 => Err(ValidationError::PmemReservedFd(fd)),
+            (None, Some(_)) | (Some(_), None) => Ok(()),
+        }
     }
 }
 
@@ -5225,7 +5249,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     fn pmem_fixture() -> PmemConfig {
         PmemConfig {
             pci_common: PciDeviceCommonConfig::default(),
-            file: PathBuf::from("/tmp/pmem"),
+            file: Some(PathBuf::from("/tmp/pmem")),
+            fd: None,
             size: Some(128 << 20),
             discard_writes: false,
         }
@@ -5262,7 +5287,42 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
 
+        // `fd=` is accepted alongside or in place of `file=`; exclusivity
+        // is enforced by PmemConfig::validate, not by the parser.
+        assert_eq!(
+            PmemConfig::parse("fd=7,discard_writes=on")?,
+            PmemConfig {
+                file: None,
+                fd: Some(7),
+                size: None,
+                discard_writes: true,
+                ..pmem_fixture()
+            }
+        );
+        assert_eq!(
+            PmemConfig::parse("file=/tmp/pmem,fd=7,size=128M")?,
+            PmemConfig {
+                fd: Some(7),
+                ..pmem_fixture()
+            }
+        );
+        // Non-integer fd fails at parse time.
+        PmemConfig::parse("fd=seven").unwrap_err();
+
         Ok(())
+    }
+
+    #[test]
+    fn test_pmem_fd_is_not_deserialized() {
+        // An fd in a serialized config is never a live descriptor in the
+        // receiving process, so it deserializes as -1.
+        let pmem: PmemConfig = serde_json::from_str(r#"{"fd":7,"discard_writes":true}"#).unwrap();
+        assert_eq!(pmem.fd, Some(-1));
+        assert_eq!(pmem.file, None);
+
+        let pmem: PmemConfig = serde_json::from_str(r#"{"file":"/tmp/pmem"}"#).unwrap();
+        assert_eq!(pmem.fd, None);
+        assert_eq!(pmem.file, Some(PathBuf::from("/tmp/pmem")));
     }
 
     #[test]
@@ -7554,6 +7614,49 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             neither_path_nor_fd.validate(),
             Err(ValidationError::VfioDeviceNeitherPathNorFd),
         ));
+
+        // A pmem device is backed by exactly one of a file and an fd.
+        let mut pmem_fd_config = valid_config.clone();
+        pmem_fd_config.pmem = Some(vec![PmemConfig {
+            file: None,
+            fd: Some(7),
+            discard_writes: true,
+            ..pmem_fixture()
+        }]);
+        pmem_fd_config.validate().unwrap();
+
+        let mut pmem_both_file_and_fd = valid_config.clone();
+        pmem_both_file_and_fd.pmem = Some(vec![PmemConfig {
+            fd: Some(7),
+            ..pmem_fixture()
+        }]);
+        assert_eq!(
+            pmem_both_file_and_fd.validate(),
+            Err(ValidationError::PmemBothFileAndFd),
+        );
+
+        let mut pmem_neither_file_nor_fd = valid_config.clone();
+        pmem_neither_file_nor_fd.pmem = Some(vec![PmemConfig {
+            file: None,
+            fd: None,
+            ..pmem_fixture()
+        }]);
+        assert_eq!(
+            pmem_neither_file_nor_fd.validate(),
+            Err(ValidationError::PmemNeitherFileNorFd),
+        );
+
+        // A deserialized (stale) fd is -1 and must be replaced before use.
+        let mut pmem_stale_fd = valid_config.clone();
+        pmem_stale_fd.pmem = Some(vec![PmemConfig {
+            file: None,
+            fd: Some(-1),
+            ..pmem_fixture()
+        }]);
+        assert_eq!(
+            pmem_stale_fd.validate(),
+            Err(ValidationError::PmemReservedFd(-1)),
+        );
         #[cfg(feature = "sev_snp")]
         {
             let mut sev_snp_config = valid_config.clone();

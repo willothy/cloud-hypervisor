@@ -697,17 +697,45 @@ impl ApplyLandlock for GenericVhostUserConfig {
 pub struct PmemConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
-    pub file: PathBuf,
+    /// Path of the backing file, or of a directory in which an anonymous
+    /// backing file is created. Exactly one of `file` and `fd` is set.
+    #[serde(default)]
+    pub file: Option<PathBuf>,
+    /// Externally-opened backing file descriptor, passed via SCM_RIGHTS.
+    /// FDs are not serialized and any deserialized value is invalid; see
+    /// NetConfig::fds.
+    #[serde(default, deserialize_with = "deserialize_pmemconfig_fd")]
+    pub fd: Option<i32>,
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
     pub discard_writes: bool,
 }
 
+fn deserialize_pmemconfig_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let invalid_fd: Option<i32> = Option::deserialize(d)?;
+    if invalid_fd.is_some() {
+        debug!(
+            "FD in 'PmemConfig' won't be deserialized as it is most likely invalid now. Deserializing it as -1."
+        );
+        Ok(Some(-1))
+    } else {
+        Ok(None)
+    }
+}
+
 impl ApplyLandlock for PmemConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        // When the backing file is supplied via an externally-opened FD,
+        // there is no path to grant access to: the file is already open.
+        let Some(file) = self.file.as_deref() else {
+            return Ok(());
+        };
         let access = if self.discard_writes { "r" } else { "rw" };
-        landlock.add_rule_with_access(&self.file, access)?;
+        landlock.add_rule_with_access(file, access)?;
         Ok(())
     }
 }

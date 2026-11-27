@@ -1516,12 +1516,15 @@ components:
           format: uint32
 
     PmemConfig:
-      required:
-        - file
       type: object
       properties:
         file:
           type: string
+          description: |
+            Path of the backing file. Exactly one of `file` or an
+            externally-opened backing file FD must be supplied; an FD is
+            passed out of band via SCM_RIGHTS on the UNIX domain socket,
+            never in this body.
         size:
           type: integer
           format: int64

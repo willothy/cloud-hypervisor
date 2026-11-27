@@ -359,6 +359,10 @@ pub enum DeviceManagerError {
     #[error("Cannot set persistent memory file size")]
     PmemFileSetLen(#[source] io::Error),
 
+    /// Failed to duplicate an externally-provided persistent memory FD
+    #[error("Failed to duplicate persistent memory FD")]
+    PmemDupFd(#[source] io::Error),
+
     /// Cannot find a memory range for persistent memory
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
@@ -3531,21 +3535,43 @@ impl DeviceManager {
             None
         };
 
-        let (custom_flags, set_len) = if pmem_cfg.file.is_dir() {
-            if pmem_cfg.size.is_none() {
-                return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
-            }
-            (O_TMPFILE, true)
-        } else {
-            (0, false)
-        };
+        let (mut file, set_len) = match (&pmem_cfg.file, pmem_cfg.fd) {
+            (Some(path), None) => {
+                let (custom_flags, set_len) = if path.is_dir() {
+                    if pmem_cfg.size.is_none() {
+                        return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
+                    }
+                    (O_TMPFILE, true)
+                } else {
+                    (0, false)
+                };
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(!pmem_cfg.discard_writes)
-            .custom_flags(custom_flags)
-            .open(&pmem_cfg.file)
-            .map_err(DeviceManagerError::PmemFileOpen)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(!pmem_cfg.discard_writes)
+                    .custom_flags(custom_flags)
+                    .open(path)
+                    .map_err(DeviceManagerError::PmemFileOpen)?;
+                (file, set_len)
+            }
+            (None, Some(fd)) => {
+                // Dup so the device owns its own File; the caller-supplied
+                // fd is kept alive across reboot via VmConfig::preserved_fds
+                // and closed when the device is removed. The fd is never
+                // reopened or resized, so with discard_writes, which maps it
+                // privately, a read-only descriptor is enough.
+                // SAFETY: FFI call to dup. Trivially safe.
+                let dup_fd = unsafe { libc::dup(fd) };
+                if dup_fd < 0 {
+                    return Err(DeviceManagerError::PmemDupFd(io::Error::last_os_error()));
+                }
+                // SAFETY: dup_fd is a freshly-duplicated fd owned by this File.
+                (unsafe { File::from_raw_fd(dup_fd) }, false)
+            }
+            (None, None) | (Some(_), Some(_)) => {
+                unreachable!("PmemConfig::validate enforces exactly one of file and fd")
+            }
+        };
 
         let size = if let Some(size) = pmem_cfg.size {
             if set_len {
@@ -3655,6 +3681,15 @@ impl DeviceManager {
         });
         node.migratable = Some(Arc::clone(&virtio_pmem_device) as Arc<Mutex<dyn Migratable>>);
         self.device_tree.lock().unwrap().insert(id.clone(), node);
+
+        if let Some(fd) = pmem_cfg.fd {
+            // SAFETY: fd is a valid open file, it was dup'd successfully
+            // above; the device only holds the dup, so VmConfig can safely
+            // take ownership of the original.
+            unsafe {
+                self.config.lock().unwrap().add_preserved_fds(vec![fd]);
+            }
+        }
 
         Ok(MetaVirtioDevice {
             virtio_device: Arc::clone(&virtio_pmem_device)
@@ -5583,10 +5618,31 @@ impl DeviceManager {
                         }
                     }
                 }
-                VirtioDeviceType::Block
-                | VirtioDeviceType::Pmem
-                | VirtioDeviceType::Fs
-                | VirtioDeviceType::Vsock => {}
+                VirtioDeviceType::Pmem => {
+                    let mut config = self.config.lock().unwrap();
+                    if let Some(fd) = config
+                        .pmem
+                        .as_deref_mut()
+                        .and_then(|pmems| {
+                            pmems
+                                .iter_mut()
+                                .find(|pmem| pmem.pci_common.id.as_deref() == Some(id))
+                        })
+                        .and_then(|pmem_cfg| pmem_cfg.fd.take())
+                    {
+                        debug!("Closing preserved FD from virtio-pmem device: id={id}, fd={fd}");
+                        let fd_removed = config.preserved_fds.as_mut().unwrap().remove(&fd);
+                        assert!(
+                            fd_removed,
+                            "FD {fd} for device id={id} was not in preserved_fds"
+                        );
+                        // SAFETY: We are closing the only remaining instance of this FD.
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                }
+                VirtioDeviceType::Block | VirtioDeviceType::Fs | VirtioDeviceType::Vsock => {}
                 _ => return Err(DeviceManagerError::RemovalNotAllowed(device_type)),
             }
         } else if matches!(pci_device_handle, PciDeviceHandle::Vfio(_)) {

@@ -1076,6 +1076,7 @@ impl Cause {
             | DeviceManagerError::MmioInsert(_)
             | DeviceManagerError::PmemFileOpen(_)
             | DeviceManagerError::PmemFileSetLen(_)
+            | DeviceManagerError::PmemDupFd(_)
             | DeviceManagerError::VfioCreate(_)
             | DeviceManagerError::VfioDupFd(_)
             | DeviceManagerError::VfioPciCreate(_)
