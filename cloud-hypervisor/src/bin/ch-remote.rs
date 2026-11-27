@@ -447,14 +447,14 @@ fn rest_api_do_command(matches: &ArgMatches, socket: &mut UnixStream) -> ApiResu
             .map_err(Error::HttpApiClient)
         }
         Some("add-pmem") => {
-            let pmem_config = add_pmem_config(
+            let (pmem_config, fds) = add_pmem_config(
                 matches
                     .subcommand_matches("add-pmem")
                     .unwrap()
                     .get_one::<String>("pmem_config")
                     .unwrap(),
             )?;
-            simple_api_command(socket, "PUT", "add-pmem", Some(&pmem_config))
+            simple_api_command_with_fds(socket, "PUT", "add-pmem", Some(&pmem_config), &fds)
                 .map_err(Error::HttpApiClient)
         }
         Some("add-net") => {
@@ -679,7 +679,7 @@ fn dbus_api_do_command(matches: &ArgMatches, proxy: &DBusApi1ProxyBlocking<'_>) 
             proxy.api_vm_add_generic_vhost_user(&generic_vhost_user_config)
         }
         Some("add-pmem") => {
-            let pmem_config = add_pmem_config(
+            let (pmem_config, _fds) = add_pmem_config(
                 matches
                     .subcommand_matches("add-pmem")
                     .unwrap()
@@ -908,11 +908,16 @@ fn add_generic_vhost_user_config(config: &str) -> Result<String, Error> {
     Ok(generic_vhost_user_config)
 }
 
-fn add_pmem_config(config: &str) -> Result<String, Error> {
-    let pmem_config = PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
+fn add_pmem_config(config: &str) -> Result<(String, Vec<i32>), Error> {
+    let mut pmem_config = PmemConfig::parse(config).map_err(Error::AddPmemConfig)?;
+
+    // PmemConfig is modified on purpose here by taking the file descriptor
+    // out. It is passed to the server side process via SCM_RIGHTS, where
+    // it may be represented with a different value.
+    let fds = pmem_config.fd.take().into_iter().collect();
     let pmem_config = serde_json::to_string(&pmem_config).unwrap();
 
-    Ok(pmem_config)
+    Ok((pmem_config, fds))
 }
 
 fn add_net_config(config: &str) -> Result<(String, Vec<i32>), Error> {
@@ -955,8 +960,8 @@ fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
     let mut restore_config = RestoreConfig::parse(config).map_err(Error::Restore)?;
     // RestoreConfig is modified on purpose to take out the file descriptors.
     // These fds are passed to the server side process via SCM_RIGHTS, in the
-    // order net_fds, then vfio_fds, then the iommufd FD, matching the
-    // server's split.
+    // order net_fds, then vfio_fds, then the iommufd FD, then pmem_fds,
+    // matching the server's split.
     let mut fds: Vec<i32> = match &mut restore_config.net_fds {
         Some(net_fds) => net_fds
             .iter_mut()
@@ -969,6 +974,9 @@ fn restore_config(config: &str) -> Result<(String, Vec<i32>), Error> {
     }
     if let Some(iommufd_fd) = restore_config.iommufd_fd.take() {
         fds.push(iommufd_fd);
+    }
+    if let Some(pmem_fds) = restore_config.pmem_fds.as_mut() {
+        fds.extend(pmem_fds.iter_mut().filter_map(|p| p.fd.take()));
     }
     let restore_config = serde_json::to_string(&restore_config).unwrap();
 
@@ -1379,5 +1387,31 @@ mod tests {
             lines[4],
             r#"Destination is not a directory: "/tmp/ch.dump""#
         );
+    }
+
+    #[test]
+    fn test_add_pmem_config_sends_the_fd_out_of_band() {
+        let (body, fds) = add_pmem_config("fd=5,discard_writes=on,id=pmem0").unwrap();
+        assert_eq!(fds, vec![5]);
+        let config: PmemConfig = serde_json::from_str(&body).unwrap();
+        assert_eq!(config.fd, None);
+        assert_eq!(config.file, None);
+
+        let (_, fds) = add_pmem_config("file=/tmp/pmem").unwrap();
+        assert!(fds.is_empty());
+    }
+
+    #[test]
+    fn test_restore_config_orders_fds_like_the_server() {
+        let (body, fds) = restore_config(
+            "source_url=file:///snap,net_fds=[net0@[3,4]],vfio_fds=[vfio0@5],iommufd_fd=6,\
+             pmem_fds=[pmem0@7,pmem1@8]",
+        )
+        .unwrap();
+        assert_eq!(fds, vec![3, 4, 5, 6, 7, 8]);
+        let config: RestoreConfig = serde_json::from_str(&body).unwrap();
+        let pmem_fds = config.pmem_fds.unwrap();
+        assert_eq!(pmem_fds.len(), 2);
+        assert!(pmem_fds.iter().all(|p| p.fd.is_none()));
     }
 }
