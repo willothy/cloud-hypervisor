@@ -49,12 +49,13 @@ use crate::api::VmCoredump;
 use crate::api::http::http_endpoint::fds_helper::{attach_fds_to_cfg, attach_fds_to_cfgs};
 use crate::api::http::{EndpointHandler, HttpError, error_response};
 use crate::api::{
-    AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, VmAddDevice, VmAddFs,
-    VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBoot,
-    VmCancelMigration, VmCaptureDirtyMemory, VmConfig, VmCounters, VmDelete, VmDirtyPageCount,
-    VmLiveCheckpoint, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmReceiveMigrationData, VmReleaseVcpus, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone,
-    VmRestore, VmResume, VmSendMigration, VmSettleMemory, VmShutdown, VmSnapshot,
+    AddDisk, ApiAction, ApiError, ApiRequest, DeviceConfig, NetConfig, PmemConfig, VmAddDevice,
+    VmAddFs, VmAddGenericVhostUser, VmAddNet, VmAddPmem, VmAddUserDevice, VmAddVdpa, VmAddVsock,
+    VmBoot, VmCancelMigration, VmCaptureDirtyMemory, VmConfig, VmCounters, VmDelete,
+    VmDirtyPageCount, VmLiveCheckpoint, VmNmi, VmPause, VmPowerButton, VmReboot,
+    VmReceiveMigration, VmReceiveMigrationData, VmReleaseVcpus, VmRemoveDevice, VmResize,
+    VmResizeDisk, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmSettleMemory, VmShutdown,
+    VmSnapshot,
 };
 use crate::config::RestoreConfig;
 use crate::cpu::Error as CpuError;
@@ -125,7 +126,7 @@ mod fds_helper {
 
         use super::{ConfigWithFDs, ConfigWithVariableFDs};
         use crate::config::{RestoredNetConfig, RestoredVfioConfig};
-        use crate::vm_config::{DeviceConfig, NetConfig};
+        use crate::vm_config::{DeviceConfig, NetConfig, PmemConfig};
 
         impl ConfigWithFDs for NetConfig {
             fn id(&self) -> Option<&str> {
@@ -153,6 +154,24 @@ mod fds_helper {
 
             fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
                 // The VmAddDevice PutHandler enforces `fds.len() <= 1`
+                // before calling into this trait, so `pop()` yields the
+                // single FD when present.
+                self.fd = fds.and_then(|mut v| v.pop());
+            }
+        }
+
+        impl ConfigWithFDs for PmemConfig {
+            fn id(&self) -> Option<&str> {
+                self.pci_common.id.as_deref()
+            }
+
+            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+                // A PmemConfig carries at most one FD.
+                self.fd.as_ref().map(from_ref)
+            }
+
+            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+                // The VmAddPmem PutHandler enforces `fds.len() <= 1`
                 // before calling into this trait, so `pop()` yields the
                 // single FD when present.
                 self.fd = fds.and_then(|mut v| v.pop());
@@ -353,6 +372,19 @@ impl EndpointHandler for VmCreate {
                             }
                         }
 
+                        if let Some(ref mut pmems) = vm_config.pmem {
+                            // For the VmCreate call, we do not accept FDs from the socket currently.
+                            // This call sets all FDs to null while doing the same logging as
+                            // similar code paths.
+                            for cfg in pmems.iter_mut() {
+                                if let Err(e) =
+                                    attach_fds_to_cfg(vec![], cfg).map_err(error_response)
+                                {
+                                    return e;
+                                }
+                            }
+                        }
+
                         match api::VmCreate
                             .send(api_notifier, api_sender, vm_config)
                             .map_err(HttpError::ApiError)
@@ -482,7 +514,6 @@ vm_action_put_handler!(VmReleaseVcpus);
 vm_action_put_handler_body!(AddDisk);
 vm_action_put_handler_body!(VmAddFs);
 vm_action_put_handler_body!(VmAddGenericVhostUser);
-vm_action_put_handler_body!(VmAddPmem);
 vm_action_put_handler_body!(VmAddVdpa);
 vm_action_put_handler_body!(VmAddVsock);
 vm_action_put_handler_body!(VmAddUserDevice);
@@ -548,6 +579,54 @@ impl PutHandler for VmAddNet {
 }
 
 impl GetHandler for VmAddNet {}
+
+// Special handling for virtio-pmem devices backed by an externally-opened
+// file FD. See module description for more info.
+impl VmAddPmem {
+    /// The pmem configuration a request carries, with the request's file
+    /// descriptor, if any, attached as the backing file.
+    ///
+    /// A pmem device is backed by at most one FD, and only one passed via
+    /// SCM_RIGHTS is valid, so a request with several FDs, or with an fd in
+    /// its body, is refused rather than silently corrected.
+    fn request_config(
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> result::Result<PmemConfig, HttpError> {
+        let body = body.as_ref().ok_or(HttpError::BadRequest)?;
+        if files.len() > 1 {
+            error!(
+                "Expected at most 1 FD in VmAddPmem request, received {}",
+                files.len()
+            );
+            return Err(HttpError::BadRequest);
+        }
+        let mut pmem_cfg: PmemConfig = serde_json::from_slice(body.raw())?;
+        if pmem_cfg.fd.is_some() {
+            error!("VmAddPmem request carries an fd in its body; pass it via SCM_RIGHTS instead");
+            return Err(HttpError::BadRequest);
+        }
+        attach_fds_to_cfg(files, &mut pmem_cfg)?;
+
+        Ok(pmem_cfg)
+    }
+}
+
+impl PutHandler for VmAddPmem {
+    fn handle_request(
+        &'static self,
+        api_notifier: EventFd,
+        api_sender: Sender<ApiRequest>,
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> result::Result<Option<Body>, HttpError> {
+        let pmem_cfg = Self::request_config(body, files)?;
+        self.send(api_notifier, api_sender, pmem_cfg)
+            .map_err(HttpError::ApiError)
+    }
+}
+
+impl GetHandler for VmAddPmem {}
 
 impl PutHandler for VmResize {
     fn handle_request(
@@ -953,5 +1032,51 @@ mod external_fds_tests {
         assert_eq!(config2.http_fds.unwrap().len(), 1);
         assert!(config3.http_fds.is_none());
         assert_eq!(config4.http_fds.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_add_pmem_takes_the_passed_fd() {
+        use std::os::fd::FromRawFd;
+
+        let body = Some(Body::new(r#"{"discard_writes":true,"id":"pmem0"}"#));
+        let file = File::open("/dev/null").unwrap();
+        let config = VmAddPmem::request_config(&body, vec![file]).unwrap();
+        let fd = config.fd.expect("the passed FD is attached");
+        assert!(fd > 2);
+        assert_eq!(config.file, None);
+        // SAFETY: request_config handed ownership of the FD to the config,
+        // and nothing else uses it.
+        drop(unsafe { File::from_raw_fd(fd) });
+    }
+
+    #[test]
+    fn test_add_pmem_without_fds_keeps_the_file() {
+        let body = Some(Body::new(r#"{"file":"/tmp/pmem"}"#));
+        let config = VmAddPmem::request_config(&body, vec![]).unwrap();
+        assert_eq!(config.fd, None);
+        assert_eq!(config.file, Some("/tmp/pmem".into()));
+    }
+
+    #[test]
+    fn test_add_pmem_rejects_more_than_one_fd() {
+        let body = Some(Body::new(r#"{"discard_writes":true}"#));
+        let files = vec![
+            File::open("/dev/null").unwrap(),
+            File::open("/dev/null").unwrap(),
+        ];
+        assert!(matches!(
+            VmAddPmem::request_config(&body, files),
+            Err(HttpError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn test_add_pmem_rejects_an_fd_in_the_body() {
+        let body = Some(Body::new(r#"{"fd":7,"discard_writes":true}"#));
+        let file = File::open("/dev/null").unwrap();
+        assert!(matches!(
+            VmAddPmem::request_config(&body, vec![file]),
+            Err(HttpError::BadRequest)
+        ));
     }
 }
