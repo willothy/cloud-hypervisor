@@ -433,6 +433,12 @@ pub enum ValidationError {
     /// A device saved with an FD has no replacement FD for the restore
     #[error("VFIO device '{0}' was FD backed and needs a new fd in 'vfio_fds'")]
     RestoreMissingVfioFd(String),
+    /// pmem_fds entry does not match any PmemConfig.id in the snapshot
+    #[error("pmem device id '{0}' in 'pmem_fds' does not match any pmem device in the snapshot")]
+    RestoreUnknownPmemId(String),
+    /// A pmem device saved with an FD has no replacement FD for the restore
+    #[error("pmem device '{0}' was FD backed and needs a new fd in 'pmem_fds'")]
+    RestoreMissingPmemFd(String),
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
@@ -3052,6 +3058,16 @@ pub struct RestoredVfioConfig {
     pub fd: Option<i32>,
 }
 
+/// A replacement backing file descriptor for a pmem device being restored.
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct RestoredPmemConfig {
+    pub id: String,
+    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
+    #[serde(default, deserialize_with = "deserialize_restored_fd")]
+    pub fd: Option<i32>,
+}
+
 pub(crate) fn deserialize_restored_fd<'de, D>(d: D) -> result::Result<Option<i32>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -3099,13 +3115,19 @@ pub struct RestoreConfig {
     /// KVM alone decides. Only used on x86_64.
     #[serde(default)]
     pub tsc_tolerance_ppm: Option<u32>,
+    /// Replacement backing file descriptors for pmem devices, one per
+    /// device. Every pmem device saved with an fd needs one; a file-backed
+    /// device listed here is switched to its new descriptor.
+    #[serde(default)]
+    pub pmem_fds: Option<Vec<RestoredPmemConfig>>,
 }
 
 impl RestoreConfig {
     pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
         \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
         memory_fault_socket=<path>,net_fds=<list_of_net_ids_with_their_associated_fds>,\
-        vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
+        vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,\
+        pmem_fds=<list_of_pmem_ids_with_their_associated_fd>,resume=true|false,\
         clock_restore_mode=advance|hold,zone_updates=<list_of_updates>,tsc_tolerance_ppm=<ppm>\"
         \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
         \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
@@ -3118,6 +3140,9 @@ impl RestoreConfig {
         sysfs path or host. Requires `iommufd_fd`.\
         \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
         The one saved in the snapshot does not survive serialization.\
+        \n`pmem_fds` is a list of pmem device ids each paired with a new backing file descriptor, \
+        e.g. pmem_fds=[pmem0@5]. Every pmem device backed by an FD needs one; a file-backed \
+        pmem device listed here is switched to the new FD.\
         \n `resume` controls whether the VM will be directly resumed after restore \
         \n`clock_restore_mode=advance` advances the guest clock by the wall time elapsed since the snapshot (the default), and `clock_restore_mode=hold` resumes it where the snapshot left it, as if no time had passed \
         \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node` \
@@ -3133,6 +3158,7 @@ impl RestoreConfig {
             .add("net_fds")
             .add("vfio_fds")
             .add("iommufd_fd")
+            .add("pmem_fds")
             .add("resume")
             .add("clock_restore_mode")
             .add("zone_updates")
@@ -3179,6 +3205,17 @@ impl RestoreConfig {
         let iommufd_fd = parser
             .convert::<i32>("iommufd_fd")
             .map_err(Error::ParseRestore)?;
+        let pmem_fds = parser
+            .convert::<TupleList<String, u64>>("pmem_fds")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                v.0.iter()
+                    .map(|Tuple(id, fd)| RestoredPmemConfig {
+                        id: id.clone(),
+                        fd: Some(*fd as i32),
+                    })
+                    .collect()
+            });
         let resume = parser
             .convert::<Toggle>("resume")
             .map_err(Error::ParseRestore)?
@@ -3217,6 +3254,7 @@ impl RestoreConfig {
             clock_restore_mode,
             zone_updates,
             tsc_tolerance_ppm,
+            pmem_fds,
         })
     }
 
@@ -3337,6 +3375,42 @@ impl RestoreConfig {
             {
                 return Err(ValidationError::RestoreMissingVfioFd(
                     d.pci_common.id.clone().unwrap_or_default(),
+                ));
+            }
+        }
+
+        // Every pmem_fds entry must name a pmem device in the snapshot, once.
+        let pmem_fds = self.pmem_fds.as_deref().unwrap_or_default();
+        let mut substituted = HashSet::new();
+        for p in pmem_fds {
+            if !substituted.insert(p.id.as_str()) {
+                return Err(ValidationError::IdentifierNotUnique(p.id.clone()));
+            }
+        }
+        let known_ids: HashSet<&str> = vm_config
+            .pmem
+            .iter()
+            .flatten()
+            .filter_map(|p| p.pci_common.id.as_deref())
+            .collect();
+        for p in pmem_fds {
+            if !known_ids.contains(p.id.as_str()) {
+                return Err(ValidationError::RestoreUnknownPmemId(p.id.clone()));
+            }
+        }
+
+        // A pmem device saved with an FD cannot reuse it, the snapshot
+        // carries no live descriptor. Each one needs a replacement.
+        for p in vm_config.pmem.iter().flatten() {
+            if p.fd.is_some()
+                && !p
+                    .pci_common
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| substituted.contains(id))
+            {
+                return Err(ValidationError::RestoreMissingPmemFd(
+                    p.pci_common.id.clone().unwrap_or_default(),
                 ));
             }
         }
@@ -5700,6 +5774,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -5729,6 +5804,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -5745,6 +5821,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -5761,10 +5838,28 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: true,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![VmMemoryZoneUpdateData {
                     host_numa_node: 1,
                     id: "zone1".to_string(),
                 }],
+            }
+        );
+        assert_eq!(
+            RestoreConfig::parse("source_url=/path/to/snapshot,pmem_fds=[pmem0@5,pmem1@6]")?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                pmem_fds: Some(vec![
+                    RestoredPmemConfig {
+                        id: "pmem0".to_string(),
+                        fd: Some(5),
+                    },
+                    RestoredPmemConfig {
+                        id: "pmem1".to_string(),
+                        fd: Some(6),
+                    },
+                ]),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -5791,6 +5886,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -5818,6 +5914,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -5834,6 +5931,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Hold,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             }
         );
@@ -6047,6 +6145,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: vec![],
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
@@ -6118,6 +6217,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: vec![],
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
@@ -6146,6 +6246,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: vec![],
         };
         assert_eq!(
@@ -6192,6 +6293,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: vec![],
         };
         assert_eq!(
@@ -6212,6 +6314,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 resume: false,
                 clock_restore_mode: GuestClockRestoreMode::Advance,
                 tsc_tolerance_ppm: None,
+                pmem_fds: None,
                 zone_updates: vec![],
             };
             assert_eq!(
@@ -6278,6 +6381,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: Vec::new(),
         };
         let fault_socket = Some(PathBuf::from("/path/to/fault.sock"));
@@ -6368,6 +6472,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             resume: false,
             clock_restore_mode: GuestClockRestoreMode::Advance,
             tsc_tolerance_ppm: None,
+            pmem_fds: None,
             zone_updates: vec![],
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
@@ -6430,6 +6535,124 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             valid_config.validate(&snapshot_vm_config),
             Err(ValidationError::IommufdFdRequiresIommufd)
         );
+    }
+
+    #[test]
+    fn test_restore_config_pmem_fds_validation() {
+        // interested in only VmConfig.pmem, so set rest to default values
+        let mut snapshot_vm_config = VmConfig {
+            cpus: CpusConfig::default(),
+            memory: MemoryConfig::default(),
+            payload: None,
+            rate_limit_groups: None,
+            disks: None,
+            rng: RngConfig::default(),
+            generic_vhost_user: None,
+            balloon: None,
+            fs: None,
+            pmem: Some(vec![
+                PmemConfig {
+                    pci_common: PciDeviceCommonConfig {
+                        id: Some("pmem0".to_owned()),
+                        ..Default::default()
+                    },
+                    file: None,
+                    fd: Some(-1),
+                    discard_writes: true,
+                    ..pmem_fixture()
+                },
+                PmemConfig {
+                    pci_common: PciDeviceCommonConfig {
+                        id: Some("pmem1".to_owned()),
+                        ..Default::default()
+                    },
+                    ..pmem_fixture()
+                },
+            ]),
+            serial: SerialConfig::default(),
+            console: ConsoleConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            debug_console: DebugConsoleConfig::default(),
+            devices: None,
+            user_devices: None,
+            vdpa: None,
+            vsock: None,
+            #[cfg(feature = "pvmemcontrol")]
+            pvmemcontrol: None,
+            pvpanic: false,
+            iommu: false,
+            numa: None,
+            watchdog: false,
+            rtc: None,
+            #[cfg(feature = "guest_debug")]
+            gdb: false,
+            pci_segments: None,
+            platform: None,
+            tpm: None,
+            preserved_fds: None,
+            net: None,
+            landlock_enable: false,
+            landlock_rules: None,
+            #[cfg(feature = "ivshmem")]
+            ivshmem: None,
+        };
+
+        let pmem_fd = |id: &str, fd: i32| RestoredPmemConfig {
+            id: id.to_string(),
+            fd: Some(fd),
+        };
+        let valid_config = RestoreConfig {
+            source_url: PathBuf::from("/path/to/snapshot"),
+            pmem_fds: Some(vec![pmem_fd("pmem0", 5)]),
+            ..Default::default()
+        };
+        valid_config.validate(&snapshot_vm_config).unwrap();
+
+        // A file-backed pmem device may be switched to an FD as well.
+        let substitute_file = RestoreConfig {
+            pmem_fds: Some(vec![pmem_fd("pmem0", 5), pmem_fd("pmem1", 6)]),
+            ..valid_config.clone()
+        };
+        substitute_file.validate(&snapshot_vm_config).unwrap();
+
+        // A device saved with an FD must get a replacement FD.
+        for pmem_fds in [None, Some(vec![]), Some(vec![pmem_fd("pmem1", 6)])] {
+            let missing = RestoreConfig {
+                pmem_fds,
+                ..valid_config.clone()
+            };
+            assert_eq!(
+                missing.validate(&snapshot_vm_config),
+                Err(ValidationError::RestoreMissingPmemFd("pmem0".to_string()))
+            );
+        }
+
+        let unknown_id = RestoreConfig {
+            pmem_fds: Some(vec![pmem_fd("pmem0", 5), pmem_fd("missing", 6)]),
+            ..valid_config.clone()
+        };
+        assert_eq!(
+            unknown_id.validate(&snapshot_vm_config),
+            Err(ValidationError::RestoreUnknownPmemId("missing".to_string()))
+        );
+
+        let duplicate_id = RestoreConfig {
+            pmem_fds: Some(vec![pmem_fd("pmem0", 5), pmem_fd("pmem0", 6)]),
+            ..valid_config.clone()
+        };
+        assert_eq!(
+            duplicate_id.validate(&snapshot_vm_config),
+            Err(ValidationError::IdentifierNotUnique("pmem0".to_string()))
+        );
+
+        // Without any FD-backed pmem device, no pmem_fds are needed.
+        snapshot_vm_config.pmem.as_mut().unwrap().remove(0);
+        RestoreConfig {
+            pmem_fds: None,
+            ..valid_config.clone()
+        }
+        .validate(&snapshot_vm_config)
+        .unwrap();
     }
 
     fn platform_fixture() -> PlatformConfig {

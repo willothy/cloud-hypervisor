@@ -2197,6 +2197,21 @@ impl Vmm {
                         .iommufd_fd = Some(iommufd_fd);
                 }
 
+                // Back each listed pmem device with the FD received with the
+                // restore request instead of its saved path or stale FD;
+                // validate() has confirmed every FD-backed one is listed.
+                if let Some(restored_pmems) = restore_cfg.pmem_fds {
+                    let mut config = vm_config.lock().unwrap();
+                    for p in restored_pmems.iter() {
+                        for pmem_config in config.pmem.iter_mut().flatten() {
+                            if pmem_config.pci_common.id.as_ref() == Some(&p.id) {
+                                pmem_config.file = None;
+                                pmem_config.fd = p.fd;
+                            }
+                        }
+                    }
+                }
+
                 update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
                     error!("VM Restore failed: {e:?}");
                     VmError::ApplyMemoryZoneUpdate(e)

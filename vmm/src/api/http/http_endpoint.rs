@@ -125,7 +125,7 @@ mod fds_helper {
         use std::slice::from_ref;
 
         use super::{ConfigWithFDs, ConfigWithVariableFDs};
-        use crate::config::{RestoredNetConfig, RestoredVfioConfig};
+        use crate::config::{RestoredNetConfig, RestoredPmemConfig, RestoredVfioConfig};
         use crate::vm_config::{DeviceConfig, NetConfig, PmemConfig};
 
         impl ConfigWithFDs for NetConfig {
@@ -213,6 +213,26 @@ mod fds_helper {
         }
 
         impl ConfigWithVariableFDs for RestoredVfioConfig {
+            fn expected_num_fds(&self) -> usize {
+                1
+            }
+        }
+
+        impl ConfigWithFDs for RestoredPmemConfig {
+            fn id(&self) -> Option<&str> {
+                Some(self.id.as_str())
+            }
+
+            fn fds_from_http_body(&self) -> Option<&[RawFd]> {
+                self.fd.as_ref().map(from_ref)
+            }
+
+            fn set_fds(&mut self, fds: Option<Vec<RawFd>>) {
+                self.fd = fds.and_then(|mut v| v.pop());
+            }
+        }
+
+        impl ConfigWithVariableFDs for RestoredPmemConfig {
             fn expected_num_fds(&self) -> usize {
                 1
             }
@@ -685,7 +705,8 @@ impl VmRestore {
             .sum();
         let vfio_total = restore_cfg.vfio_fds.as_ref().map_or(0, |c| c.len());
         let iommufd_total = usize::from(restore_cfg.vfio_fds.is_some());
-        let expected = net_total + vfio_total + iommufd_total;
+        let pmem_total = restore_cfg.pmem_fds.as_ref().map_or(0, |c| c.len());
+        let expected = net_total + vfio_total + iommufd_total + pmem_total;
         if files.len() != expected {
             error!(
                 "Expected {expected} FDs in VmRestore request, received {}",
@@ -694,7 +715,9 @@ impl VmRestore {
             return Err(invalid(RestoreSite::RequestFds)(HttpError::BadRequest));
         }
 
-        // Split in the order net_fds, then vfio_fds, then the iommufd FD.
+        // Split in the order net_fds, then vfio_fds, then the iommufd FD,
+        // then pmem_fds. pmem_fds come last so the layout every earlier
+        // kind of FD had stays the same.
         let mut files = files;
         if let Some(cfgs) = restore_cfg.net_fds.as_mut() {
             let net_files: Vec<File> = files.drain(..net_total).collect();
@@ -710,6 +733,12 @@ impl VmRestore {
         }
         if restore_cfg.vfio_fds.is_some() {
             restore_cfg.iommufd_fd = Some(files.remove(0).into_raw_fd());
+        }
+        if let Some(cfgs) = restore_cfg.pmem_fds.as_mut() {
+            let pmem_files: Vec<File> = files.drain(..pmem_total).collect();
+            let mut cfgs = cfgs.iter_mut().collect::<Vec<&mut _>>();
+            attach_fds_to_cfgs(pmem_files, cfgs.as_mut_slice())
+                .map_err(invalid(RestoreSite::RequestFds))?;
         }
 
         Ok(restore_cfg)
@@ -1032,6 +1061,38 @@ mod external_fds_tests {
         assert_eq!(config2.http_fds.unwrap().len(), 1);
         assert!(config3.http_fds.is_none());
         assert_eq!(config4.http_fds.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_restore_splits_pmem_fds_after_the_iommufd_fd() {
+        use std::os::fd::AsRawFd;
+
+        let body = Some(Body::new(
+            r#"{"source_url":"file:///snap","vfio_fds":[{"id":"vfio0"}],"pmem_fds":[{"id":"pmem0"},{"id":"pmem1"}]}"#,
+        ));
+        let files: Vec<File> = (0..4).map(|_| File::open("/dev/null").unwrap()).collect();
+        let raw: Vec<i32> = files.iter().map(|f| f.as_raw_fd()).collect();
+
+        let config = VmRestore::request_config(&body, files).unwrap();
+        assert_eq!(config.vfio_fds.unwrap()[0].fd, Some(raw[0]));
+        assert_eq!(config.iommufd_fd, Some(raw[1]));
+        let pmem_fds = config.pmem_fds.unwrap();
+        assert_eq!(pmem_fds[0].fd, Some(raw[2]));
+        assert_eq!(pmem_fds[1].fd, Some(raw[3]));
+        for fd in raw {
+            // SAFETY: request_config handed ownership of every FD to the
+            // config, and nothing else uses them.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn test_restore_refuses_a_missing_pmem_fd() {
+        let body = Some(Body::new(
+            r#"{"source_url":"file:///snap","pmem_fds":[{"id":"pmem0"},{"id":"pmem1"}]}"#,
+        ));
+        let files = vec![File::open("/dev/null").unwrap()];
+        VmRestore::request_config(&body, files).unwrap_err();
     }
 
     #[test]
