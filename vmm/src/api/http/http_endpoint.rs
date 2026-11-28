@@ -344,6 +344,62 @@ mod fds_helper {
 // /api/v1/vm.create handler
 pub struct VmCreate {}
 
+impl VmCreate {
+    /// The VM configuration a request carries, with the request's file
+    /// descriptors attached.
+    ///
+    /// Only pmem devices take descriptors at create: each one whose body
+    /// names an `fd` takes the next passed descriptor, in the order the
+    /// devices are listed. The count must match exactly, so a missing
+    /// descriptor and one no pmem device asks for are both refused. FDs
+    /// named for nets and VFIO devices are not accepted and are cleared.
+    fn request_config(
+        body: &Option<Body>,
+        files: Vec<File>,
+    ) -> result::Result<Box<VmConfig>, HttpError> {
+        let body = body.as_ref().ok_or(HttpError::BadRequest)?;
+        let mut vm_config: Box<VmConfig> = serde_json::from_slice(body.raw())?;
+
+        if let Some(ref mut nets) = vm_config.net {
+            // For the VmCreate call, we do not accept FDs from the socket currently.
+            // This call sets all FDs to null while doing the same logging as
+            // similar code paths.
+            for cfg in nets.iter_mut() {
+                attach_fds_to_cfg(vec![], cfg)?;
+            }
+        }
+
+        if let Some(ref mut devices) = vm_config.devices {
+            // For the VmCreate call, we do not accept FDs from the socket currently.
+            // This call sets all FDs to null while doing the same logging as
+            // similar code paths.
+            for cfg in devices.iter_mut() {
+                attach_fds_to_cfg(vec![], cfg)?;
+            }
+        }
+
+        let mut pmems: Vec<&mut PmemConfig> = vm_config
+            .pmem
+            .iter_mut()
+            .flatten()
+            .filter(|p| p.fd.is_some())
+            .collect();
+        let wanted = pmems.len();
+        if files.len() != wanted {
+            error!(
+                "Expected {wanted} FDs in VmCreate request for the pmem devices naming an fd, received {}",
+                files.len()
+            );
+            return Err(HttpError::BadRequest);
+        }
+        for (pmem, file) in pmems.iter_mut().zip(files) {
+            pmem.fd = Some(file.into_raw_fd());
+        }
+
+        Ok(vm_config)
+    }
+}
+
 impl EndpointHandler for VmCreate {
     fn handle_request(
         &self,
@@ -353,68 +409,25 @@ impl EndpointHandler for VmCreate {
     ) -> Response {
         match req.method() {
             Method::Put => {
-                match &req.body {
-                    Some(body) => {
-                        // Deserialize into a VmConfig
-                        let mut vm_config: Box<VmConfig> = match serde_json::from_slice(body.raw())
-                            .map_err(HttpError::SerdeJsonDeserialize)
-                        {
-                            Ok(config) => config,
-                            Err(e) => return error_response(e),
-                        };
-
-                        if let Some(ref mut nets) = vm_config.net {
-                            let mut cfgs = nets.iter_mut().collect::<Vec<&mut _>>();
-                            let cfgs = cfgs.as_mut_slice();
-
-                            // For the VmCreate call, we do not accept FDs from the socket currently.
-                            // This call sets all FDs to null while doing the same logging as
-                            // similar code paths.
-                            for cfg in cfgs {
-                                if let Err(e) =
-                                    attach_fds_to_cfg(vec![], *cfg).map_err(error_response)
-                                {
-                                    return e;
-                                }
-                            }
-                        }
-
-                        if let Some(ref mut devices) = vm_config.devices {
-                            // For the VmCreate call, we do not accept FDs from the socket currently.
-                            // This call sets all FDs to null while doing the same logging as
-                            // similar code paths.
-                            for cfg in devices.iter_mut() {
-                                if let Err(e) =
-                                    attach_fds_to_cfg(vec![], cfg).map_err(error_response)
-                                {
-                                    return e;
-                                }
-                            }
-                        }
-
-                        if let Some(ref mut pmems) = vm_config.pmem {
-                            // For the VmCreate call, we do not accept FDs from the socket currently.
-                            // This call sets all FDs to null while doing the same logging as
-                            // similar code paths.
-                            for cfg in pmems.iter_mut() {
-                                if let Err(e) =
-                                    attach_fds_to_cfg(vec![], cfg).map_err(error_response)
-                                {
-                                    return e;
-                                }
-                            }
-                        }
-
-                        match api::VmCreate
-                            .send(api_notifier, api_sender, vm_config)
-                            .map_err(HttpError::ApiError)
-                        {
-                            Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
-                            Err(e) => error_response(e),
-                        }
+                // Duplicate the received descriptors so the config owns its
+                // own; the request's are closed with it.
+                let files = match req.files.iter().map(File::try_clone).collect() {
+                    Ok(files) => files,
+                    Err(e) => {
+                        error!("Failed to duplicate the FDs of a VmCreate request: {e}");
+                        return error_response(HttpError::InternalServerError);
                     }
-
-                    None => Response::new(Version::Http11, StatusCode::BadRequest),
+                };
+                let vm_config = match Self::request_config(&req.body, files) {
+                    Ok(vm_config) => vm_config,
+                    Err(e) => return error_response(e),
+                };
+                match api::VmCreate
+                    .send(api_notifier, api_sender, vm_config)
+                    .map_err(HttpError::ApiError)
+                {
+                    Ok(_) => Response::new(Version::Http11, StatusCode::NoContent),
+                    Err(e) => error_response(e),
                 }
             }
 
@@ -1093,6 +1106,70 @@ mod external_fds_tests {
         ));
         let files = vec![File::open("/dev/null").unwrap()];
         VmRestore::request_config(&body, files).unwrap_err();
+    }
+
+    const CREATE_WITH_PMEM_FDS: &str = r#"{"payload":{"kernel":"/k"},"pmem":[
+        {"fd":0,"discard_writes":true,"id":"pmem0"},
+        {"file":"/tmp/pmem","id":"pmem1"},
+        {"fd":0,"discard_writes":true,"id":"pmem2"}]}"#;
+
+    #[test]
+    fn test_create_gives_each_pmem_naming_an_fd_the_next_one() {
+        use std::os::fd::AsRawFd;
+
+        let body = Some(Body::new(CREATE_WITH_PMEM_FDS));
+        let files: Vec<File> = (0..2).map(|_| File::open("/dev/null").unwrap()).collect();
+        let raw: Vec<i32> = files.iter().map(|f| f.as_raw_fd()).collect();
+
+        let config = VmCreate::request_config(&body, files).unwrap();
+        let pmem = config.pmem.as_ref().unwrap();
+        assert_eq!(pmem[0].fd, Some(raw[0]));
+        assert_eq!(pmem[1].fd, None);
+        assert_eq!(pmem[1].file, Some("/tmp/pmem".into()));
+        assert_eq!(pmem[2].fd, Some(raw[1]));
+        for fd in raw {
+            // SAFETY: request_config handed ownership of every FD to the
+            // config, and nothing else uses them.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn test_create_refuses_a_missing_pmem_fd() {
+        let body = Some(Body::new(CREATE_WITH_PMEM_FDS));
+        let files = vec![File::open("/dev/null").unwrap()];
+        assert!(matches!(
+            VmCreate::request_config(&body, files),
+            Err(HttpError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn test_create_refuses_an_fd_no_pmem_asks_for() {
+        let body = Some(Body::new(
+            r#"{"payload":{"kernel":"/k"},"pmem":[{"file":"/tmp/pmem"}]}"#,
+        ));
+        let files = vec![File::open("/dev/null").unwrap()];
+        assert!(matches!(
+            VmCreate::request_config(&body, files),
+            Err(HttpError::BadRequest)
+        ));
+
+        let body = Some(Body::new(r#"{"payload":{"kernel":"/k"}}"#));
+        let files = vec![File::open("/dev/null").unwrap()];
+        assert!(matches!(
+            VmCreate::request_config(&body, files),
+            Err(HttpError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn test_create_without_fds_is_unchanged() {
+        let body = Some(Body::new(
+            r#"{"payload":{"kernel":"/k"},"pmem":[{"file":"/tmp/pmem"}]}"#,
+        ));
+        let config = VmCreate::request_config(&body, vec![]).unwrap();
+        assert_eq!(config.pmem.as_ref().unwrap()[0].fd, None);
     }
 
     #[test]

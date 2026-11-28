@@ -1525,6 +1525,13 @@ components:
             externally-opened backing file FD must be supplied; an FD is
             passed out of band via SCM_RIGHTS on the UNIX domain socket,
             never in this body.
+        fd:
+          type: integer
+          description: |
+            Only meaningful in vm.create: a pmem device that names `fd`,
+            with any value, takes the next FD passed with the request, in
+            the order the devices are listed. The value itself is ignored.
+            vm.add-pmem refuses a body that names `fd`.
         size:
           type: integer
           format: int64
