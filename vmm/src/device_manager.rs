@@ -21,6 +21,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
@@ -3559,14 +3560,16 @@ impl DeviceManager {
                 // fd is kept alive across reboot via VmConfig::preserved_fds
                 // and closed when the device is removed. The fd is never
                 // reopened or resized, so with discard_writes, which maps it
-                // privately, a read-only descriptor is enough.
-                // SAFETY: FFI call to dup. Trivially safe.
-                let dup_fd = unsafe { libc::dup(fd) };
-                if dup_fd < 0 {
-                    return Err(DeviceManagerError::PmemDupFd(io::Error::last_os_error()));
-                }
-                // SAFETY: dup_fd is a freshly-duplicated fd owned by this File.
-                (unsafe { File::from_raw_fd(dup_fd) }, false)
+                // privately, a read-only descriptor is enough. The copy is
+                // made close-on-exec so it never leaks into a child process.
+                // SAFETY: fd is the open descriptor the caller passed in;
+                // VmConfig keeps it open for as long as the device exists,
+                // and it is only borrowed here to duplicate it.
+                let file = unsafe { BorrowedFd::borrow_raw(fd) }
+                    .try_clone_to_owned()
+                    .map(File::from)
+                    .map_err(DeviceManagerError::PmemDupFd)?;
+                (file, false)
             }
             (None, None) | (Some(_), Some(_)) => {
                 unreachable!("PmemConfig::validate enforces exactly one of file and fd")
