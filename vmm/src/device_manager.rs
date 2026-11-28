@@ -3536,8 +3536,9 @@ impl DeviceManager {
             None
         };
 
-        let (mut file, set_len) = match (&pmem_cfg.file, pmem_cfg.fd) {
-            (Some(path), None) => {
+        let backing = match (pmem_cfg.empty, &pmem_cfg.file, pmem_cfg.fd) {
+            (true, None, None) => None,
+            (false, Some(path), None) => {
                 let (custom_flags, set_len) = if path.is_dir() {
                     if pmem_cfg.size.is_none() {
                         return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
@@ -3553,9 +3554,9 @@ impl DeviceManager {
                     .custom_flags(custom_flags)
                     .open(path)
                     .map_err(DeviceManagerError::PmemFileOpen)?;
-                (file, set_len)
+                Some((file, set_len))
             }
-            (None, Some(fd)) => {
+            (false, None, Some(fd)) => {
                 // Dup so the device owns its own File; the caller-supplied
                 // fd is kept alive across reboot via VmConfig::preserved_fds
                 // and closed when the device is removed. The fd is never
@@ -3569,22 +3570,37 @@ impl DeviceManager {
                     .try_clone_to_owned()
                     .map(File::from)
                     .map_err(DeviceManagerError::PmemDupFd)?;
-                (file, false)
+                Some((file, false))
             }
-            (None, None) | (Some(_), Some(_)) => {
-                unreachable!("PmemConfig::validate enforces exactly one of file and fd")
-            }
+            _ => unreachable!("PmemConfig::validate enforces exactly one of file, fd and empty"),
         };
 
-        let size = if let Some(size) = pmem_cfg.size {
-            if set_len {
-                file.set_len(size)
-                    .map_err(DeviceManagerError::PmemFileSetLen)?;
+        // The size the backing maps: `size` if given, else the backing's
+        // whole length.
+        let backing = match backing {
+            Some((mut file, set_len)) => {
+                let size = if let Some(size) = pmem_cfg.size {
+                    if set_len {
+                        file.set_len(size)
+                            .map_err(DeviceManagerError::PmemFileSetLen)?;
+                    }
+                    size
+                } else {
+                    file.seek(SeekFrom::End(0))
+                        .map_err(DeviceManagerError::PmemFileSetLen)?
+                };
+                Some((file, size))
             }
-            size
-        } else {
-            file.seek(SeekFrom::End(0))
-                .map_err(DeviceManagerError::PmemFileSetLen)?
+            None => None,
+        };
+
+        // A backed device's window is its backing's size; an empty
+        // placeholder reserves the window its config asks for.
+        let size = match &backing {
+            Some((_, size)) => *size,
+            None => pmem_cfg
+                .size
+                .expect("PmemConfig::validate enforces a window size for an empty pmem"),
         };
 
         if size % 0x20_0000 != 0 {
@@ -3619,53 +3635,60 @@ impl DeviceManager {
             (base.raw_value(), size)
         };
 
-        let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
-        let mmap_region = MmapRegion::build(
-            Some(FileOffset::new(cloned_file, 0)),
-            region_size as usize,
-            PROT_READ | PROT_WRITE,
-            MAP_NORESERVE
-                | if pmem_cfg.discard_writes {
-                    MAP_PRIVATE
-                } else {
-                    MAP_SHARED
-                },
-        )
-        .map_err(DeviceManagerError::NewMmapRegion)?;
-        let host_addr = mmap_region.as_ptr();
-
-        // SAFETY: host_addr points to region_size bytes of mmap-allocated memory.
-        let mem_slot = unsafe {
-            let region_size = region_size.try_into().unwrap();
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .create_userspace_mapping(
-                    region_base,
-                    region_size,
-                    host_addr,
-                    false,
-                    false,
-                    false,
-                    hypervisor::MemoryVisibility::Shared,
+        // An empty placeholder maps nothing and adds no memory slot; only
+        // its window is reserved.
+        let backing = match backing {
+            Some((file, _)) => {
+                let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
+                let mmap_region = MmapRegion::build(
+                    Some(FileOffset::new(cloned_file, 0)),
+                    region_size as usize,
+                    PROT_READ | PROT_WRITE,
+                    MAP_NORESERVE
+                        | if pmem_cfg.discard_writes {
+                            MAP_PRIVATE
+                        } else {
+                            MAP_SHARED
+                        },
                 )
-                .map_err(DeviceManagerError::MemoryManager)
-        }?;
+                .map_err(DeviceManagerError::NewMmapRegion)?;
+                let host_addr = mmap_region.as_ptr();
 
-        let mapping = UserspaceMapping {
-            mem_slot,
-            addr: GuestAddress(region_base),
-            mapping: Arc::new(mmap_region),
-            mergeable: false,
+                // SAFETY: host_addr points to region_size bytes of mmap-allocated memory.
+                let mem_slot = unsafe {
+                    let region_size = region_size.try_into().unwrap();
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .create_userspace_mapping(
+                            region_base,
+                            region_size,
+                            host_addr,
+                            false,
+                            false,
+                            false,
+                            hypervisor::MemoryVisibility::Shared,
+                        )
+                        .map_err(DeviceManagerError::MemoryManager)
+                }?;
+
+                Some(virtio_devices::PmemBacking {
+                    disk: file,
+                    mapping: UserspaceMapping {
+                        mem_slot,
+                        addr: GuestAddress(region_base),
+                        mapping: Arc::new(mmap_region),
+                        mergeable: false,
+                    },
+                })
+            }
+            None => None,
         };
 
         let virtio_pmem_device = Arc::new(Mutex::new(
             virtio_devices::Pmem::new(
                 id.clone(),
-                Some(virtio_devices::PmemBacking {
-                    disk: file,
-                    mapping,
-                }),
+                backing,
                 GuestAddress(region_base),
                 self.force_access_platform | pmem_cfg.pci_common.iommu.attached(),
                 self.seccomp_action.clone(),

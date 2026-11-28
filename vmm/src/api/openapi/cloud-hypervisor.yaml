@@ -1533,6 +1533,14 @@ components:
         discard_writes:
           type: boolean
           default: false
+        empty:
+          type: boolean
+          default: false
+          description: |
+            An empty placeholder with neither `file` nor a backing FD. It
+            reserves `size` bytes of guest address space and shows the
+            guest size 0 until a restore passes it a backing FD. It cannot
+            be hot-plugged.
         pci_segment:
           type: integer
           format: int16

@@ -73,7 +73,7 @@ pub enum Error {
     #[error("Error parsing --generic-vhost-user: queue size missing")]
     ParseGenericVhostUserQueueSizeMissing,
     /// Missing persistent memory file parameter.
-    #[error("Error parsing --pmem: file or fd missing")]
+    #[error("Error parsing --pmem: file, fd or empty missing")]
     ParsePmemFileOrFdMissing,
     /// Missing vsock socket path parameter.
     #[error("Error parsing --vsock: socket missing")]
@@ -350,6 +350,15 @@ pub enum ValidationError {
     /// A PmemConfig's backing FD is a reserved (stdio) or invalid number.
     #[error("Reserved or invalid pmem fd number (<= 2): {0}")]
     PmemReservedFd(i32),
+    /// An empty pmem placeholder also names a backing.
+    #[error("Empty pmem device config cannot also specify `file=` or `fd=`")]
+    PmemEmptyWithBacking,
+    /// An empty pmem placeholder has no window size.
+    #[error("Empty pmem device config must specify a non-zero `size=` for its window")]
+    PmemEmptyWithoutSize,
+    /// An empty pmem placeholder was offered for hot-plug.
+    #[error("Empty pmem device cannot be hot-plugged; it only exists from boot")]
+    PmemEmptyHotplug,
     /// FD-based VFIO requires an externally-supplied iommufd FD so the
     /// cdev's bind state can survive across an in-process VM reboot.
     #[error("VFIO device `fd=` requires platform `iommufd_fd=<fd>`")]
@@ -2432,7 +2441,7 @@ impl FwCfgItem {
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
     \"file=<backing_file_path>,fd=<backing_file_fd>,size=<persistent_memory_size>,iommu=off|virtio,\
-    discard_writes=on|off,id=<device_id>,\
+    discard_writes=on|off,empty=on|off,id=<device_id>,\
     pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(pmem: &str) -> Result<Self> {
@@ -2442,6 +2451,7 @@ impl PmemConfig {
             .add("file")
             .add("fd")
             .add("discard_writes")
+            .add("empty")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(pmem).map_err(Error::ParsePersistentMemory)?;
 
@@ -2450,7 +2460,12 @@ impl PmemConfig {
         let fd = parser
             .convert::<i32>("fd")
             .map_err(Error::ParsePersistentMemory)?;
-        if file.is_none() && fd.is_none() {
+        let empty = parser
+            .convert::<Toggle>("empty")
+            .map_err(Error::ParsePersistentMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        if file.is_none() && fd.is_none() && !empty {
             return Err(Error::ParsePmemFileOrFdMissing);
         }
         let size = parser
@@ -2469,11 +2484,22 @@ impl PmemConfig {
             fd,
             size,
             discard_writes,
+            empty,
         })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         self.pci_common.validate(vm_config, true)?;
+
+        if self.empty {
+            if self.file.is_some() || self.fd.is_some() {
+                return Err(ValidationError::PmemEmptyWithBacking);
+            }
+            if !self.size.is_some_and(|size| size > 0) {
+                return Err(ValidationError::PmemEmptyWithoutSize);
+            }
+            return Ok(());
+        }
 
         match (&self.file, self.fd) {
             (None, None) => Err(ValidationError::PmemNeitherFileNorFd),
@@ -5327,6 +5353,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             fd: None,
             size: Some(128 << 20),
             discard_writes: false,
+            empty: false,
         }
     }
 
@@ -5382,6 +5409,22 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
         // Non-integer fd fails at parse time.
         PmemConfig::parse("fd=seven").unwrap_err();
+
+        // An empty placeholder names neither a file nor an fd.
+        assert_eq!(
+            PmemConfig::parse("empty=on,size=64G,id=pmem0")?,
+            PmemConfig {
+                pci_common: PciDeviceCommonConfig {
+                    id: Some("pmem0".to_owned()),
+                    ..Default::default()
+                },
+                file: None,
+                size: Some(64 << 30),
+                empty: true,
+                ..pmem_fixture()
+            }
+        );
+        PmemConfig::parse("empty=off,size=64G").unwrap_err();
 
         Ok(())
     }
@@ -7880,6 +7923,46 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pmem_stale_fd.validate(),
             Err(ValidationError::PmemReservedFd(-1)),
         );
+
+        // An empty placeholder has a window size and no backing.
+        let placeholder = PmemConfig {
+            file: None,
+            empty: true,
+            size: Some(64 << 30),
+            ..pmem_fixture()
+        };
+        let mut pmem_placeholder = valid_config.clone();
+        pmem_placeholder.pmem = Some(vec![placeholder.clone()]);
+        pmem_placeholder.validate().unwrap();
+
+        for invalid in [
+            PmemConfig {
+                file: Some(PathBuf::from("/tmp/pmem")),
+                ..placeholder.clone()
+            },
+            PmemConfig {
+                fd: Some(7),
+                ..placeholder.clone()
+            },
+        ] {
+            let mut config = valid_config.clone();
+            config.pmem = Some(vec![invalid]);
+            assert_eq!(
+                config.validate(),
+                Err(ValidationError::PmemEmptyWithBacking),
+            );
+        }
+        for size in [None, Some(0)] {
+            let mut config = valid_config.clone();
+            config.pmem = Some(vec![PmemConfig {
+                size,
+                ..placeholder.clone()
+            }]);
+            assert_eq!(
+                config.validate(),
+                Err(ValidationError::PmemEmptyWithoutSize),
+            );
+        }
         #[cfg(feature = "sev_snp")]
         {
             let mut sev_snp_config = valid_config.clone();

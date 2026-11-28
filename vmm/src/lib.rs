@@ -3387,6 +3387,14 @@ impl RequestHandler for Vmm {
     fn vm_add_pmem(&mut self, pmem_cfg: PmemConfig) -> result::Result<Option<Vec<u8>>, VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
 
+        // A placeholder's backing only ever comes from a restore, so one
+        // added after boot could never be given one.
+        if pmem_cfg.empty {
+            return Err(VmError::ConfigValidation(
+                config::ValidationError::PmemEmptyHotplug,
+            ));
+        }
+
         {
             // Validate the configuration change in a cloned configuration
             let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
@@ -4257,6 +4265,29 @@ mod tests {
                 .clone()
                 .unwrap()[0],
             pmem_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_add_pmem_refuses_a_placeholder() {
+        let mut vmm = create_dummy_vmm();
+        let _ = vmm.vm_create(create_dummy_vm_config());
+        let placeholder = PmemConfig::parse("empty=on,size=64M,id=pmem0").unwrap();
+
+        assert!(matches!(
+            vmm.vm_add_pmem(placeholder),
+            Err(VmError::ConfigValidation(
+                config::ValidationError::PmemEmptyHotplug
+            ))
+        ));
+        assert!(
+            vmm.vm_config
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .pmem
+                .is_none()
         );
     }
 

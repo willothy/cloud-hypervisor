@@ -698,7 +698,8 @@ pub struct PmemConfig {
     #[serde(flatten)]
     pub pci_common: PciDeviceCommonConfig,
     /// Path of the backing file, or of a directory in which an anonymous
-    /// backing file is created. Exactly one of `file` and `fd` is set.
+    /// backing file is created. Exactly one of `file`, `fd` and `empty`
+    /// is set.
     #[serde(default)]
     pub file: Option<PathBuf>,
     /// Externally-opened backing file descriptor, passed via SCM_RIGHTS.
@@ -710,6 +711,11 @@ pub struct PmemConfig {
     pub size: Option<u64>,
     #[serde(default)]
     pub discard_writes: bool,
+    /// An empty placeholder with no backing: `size` bytes of guest address
+    /// space are reserved for it, and the guest sees it with size 0 until a
+    /// restore gives it a backing descriptor.
+    #[serde(default)]
+    pub empty: bool,
 }
 
 fn deserialize_pmemconfig_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
