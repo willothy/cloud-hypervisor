@@ -556,6 +556,15 @@ impl VirtioDevice for Pmem {
             mut queues,
             device_status,
         } = context;
+        // Refuse a placeholder before any activation state is set up: an
+        // activated device must have a worker to acknowledge a pause.
+        if self.disk.is_none() {
+            error!(
+                "virtio-pmem {} is an empty placeholder with no backing to serve",
+                self.id
+            );
+            return Err(ActivateError::BadActivate);
+        }
         self.common.activate(&queues, Arc::clone(&interrupt_cb))?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
         if let Some(disk) = self.disk.as_ref() {
@@ -593,10 +602,6 @@ impl VirtioDevice for Pmem {
             event!("virtio-device", "activated", "id", &self.id);
             return Ok(());
         }
-        error!(
-            "virtio-pmem {} is an empty placeholder with no backing to serve",
-            self.id
-        );
         Err(ActivateError::BadActivate)
     }
 
