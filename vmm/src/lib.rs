@@ -2199,12 +2199,18 @@ impl Vmm {
 
                 // Back each listed pmem device with the FD received with the
                 // restore request instead of its saved path or stale FD;
-                // validate() has confirmed every FD-backed one is listed.
+                // validate() has confirmed every FD-backed or empty one is
+                // listed. An empty placeholder becomes an FD-backed device
+                // sized by its FD; its saved window still bounds it.
                 if let Some(restored_pmems) = restore_cfg.pmem_fds {
                     let mut config = vm_config.lock().unwrap();
                     for p in restored_pmems.iter() {
                         for pmem_config in config.pmem.iter_mut().flatten() {
                             if pmem_config.pci_common.id.as_ref() == Some(&p.id) {
+                                if pmem_config.empty {
+                                    pmem_config.empty = false;
+                                    pmem_config.size = None;
+                                }
                                 pmem_config.file = None;
                                 pmem_config.fd = p.fd;
                             }

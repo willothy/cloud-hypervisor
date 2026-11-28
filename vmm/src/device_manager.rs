@@ -364,6 +364,22 @@ pub enum DeviceManagerError {
     #[error("Failed to duplicate persistent memory FD")]
     PmemDupFd(#[source] io::Error),
 
+    /// A restored virtio-pmem device has no saved state
+    #[error("Missing saved state for a restored virtio-pmem device")]
+    MissingVirtioPmemState,
+
+    /// A restored virtio-pmem device's saved state is unusable
+    #[error("Invalid saved virtio-pmem state")]
+    PmemSavedState(#[source] virtio_devices::PmemStateError),
+
+    /// A restored virtio-pmem device's backing doesn't fit what was saved
+    #[error("Cannot give the restored virtio-pmem device its backing")]
+    PmemRestoreBind(#[source] virtio_devices::PmemBindError),
+
+    /// A restored virtio-pmem device the guest saw backed has no backing
+    #[error("Restored virtio-pmem device was saved with a backing but has none")]
+    PmemRestoreWithoutBacking,
+
     /// Cannot find a memory range for persistent memory
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
@@ -3594,20 +3610,32 @@ impl DeviceManager {
             None => None,
         };
 
-        // A backed device's window is its backing's size; an empty
-        // placeholder reserves the window its config asks for.
-        let size = match &backing {
-            Some((_, size)) => *size,
-            None => pmem_cfg
-                .size
-                .expect("PmemConfig::validate enforces a window size for an empty pmem"),
-        };
+        let state: Option<virtio_devices::PmemState> =
+            state_from_id(snapshot, id.as_str()).map_err(DeviceManagerError::RestoreGetState)?;
 
-        if size % 0x20_0000 != 0 {
-            return Err(DeviceManagerError::PmemSizeNotAligned);
-        }
+        // `mapping_size` is how much of the window the backing maps, and
+        // none of it for an empty placeholder.
+        let (region_base, region_size, mapping_size) = if let Some((base, size)) = region_range {
+            // A restored device keeps its saved window, and its backing
+            // must fit what the guest saw of it: a placeholder takes the
+            // backing's size, a device the guest already saw keeps its own.
+            let saved = state
+                .as_ref()
+                .ok_or(DeviceManagerError::MissingVirtioPmemState)?
+                .geometry()
+                .map_err(DeviceManagerError::PmemSavedState)?;
+            let mapping_size = match (saved, &backing) {
+                (saved, Some((_, backing_size))) => Some(
+                    saved
+                        .bind(base, size, *backing_size)
+                        .map_err(DeviceManagerError::PmemRestoreBind)?,
+                ),
+                (virtio_devices::PmemSavedGeometry::Placeholder { .. }, None) => None,
+                (virtio_devices::PmemSavedGeometry::Backed { .. }, None) => {
+                    return Err(DeviceManagerError::PmemRestoreWithoutBacking);
+                }
+            };
 
-        let (region_base, region_size) = if let Some((base, size)) = region_range {
             // The memory needs to be 2MiB aligned in order to support
             // hugepages.
             self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
@@ -3621,8 +3649,21 @@ impl DeviceManager {
                 )
                 .ok_or(DeviceManagerError::PmemRangeAllocation)?;
 
-            (base, size)
+            (base, size, mapping_size)
         } else {
+            // A backed device's window is its backing's size; an empty
+            // placeholder reserves the window its config asks for.
+            let size = match &backing {
+                Some((_, size)) => *size,
+                None => pmem_cfg
+                    .size
+                    .expect("PmemConfig::validate enforces a window size for an empty pmem"),
+            };
+
+            if size % 0x20_0000 != 0 {
+                return Err(DeviceManagerError::PmemSizeNotAligned);
+            }
+
             // The memory needs to be 2MiB aligned in order to support
             // hugepages.
             let base = self.pci_segments[pmem_cfg.pci_common.pci_segment as usize]
@@ -3632,17 +3673,17 @@ impl DeviceManager {
                 .allocate(None, size as GuestUsize, Some(0x0020_0000))
                 .ok_or(DeviceManagerError::PmemRangeAllocation)?;
 
-            (base.raw_value(), size)
+            (base.raw_value(), size, backing.is_some().then_some(size))
         };
 
         // An empty placeholder maps nothing and adds no memory slot; only
         // its window is reserved.
-        let backing = match backing {
-            Some((file, _)) => {
+        let backing = match backing.zip(mapping_size) {
+            Some(((file, _), mapping_size)) => {
                 let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
                 let mmap_region = MmapRegion::build(
                     Some(FileOffset::new(cloned_file, 0)),
-                    region_size as usize,
+                    mapping_size as usize,
                     PROT_READ | PROT_WRITE,
                     MAP_NORESERVE
                         | if pmem_cfg.discard_writes {
@@ -3654,15 +3695,15 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::NewMmapRegion)?;
                 let host_addr = mmap_region.as_ptr();
 
-                // SAFETY: host_addr points to region_size bytes of mmap-allocated memory.
+                // SAFETY: host_addr points to mapping_size bytes of mmap-allocated memory.
                 let mem_slot = unsafe {
-                    let region_size = region_size.try_into().unwrap();
+                    let mapping_size = mapping_size.try_into().unwrap();
                     self.memory_manager
                         .lock()
                         .unwrap()
                         .create_userspace_mapping(
                             region_base,
-                            region_size,
+                            mapping_size,
                             host_addr,
                             false,
                             false,
@@ -3695,8 +3736,7 @@ impl DeviceManager {
                 self.exit_evt
                     .try_clone()
                     .map_err(DeviceManagerError::EventFd)?,
-                state_from_id(snapshot, id.as_str())
-                    .map_err(DeviceManagerError::RestoreGetState)?,
+                state,
             )
             .map_err(DeviceManagerError::CreateVirtioPmem)?,
         ));

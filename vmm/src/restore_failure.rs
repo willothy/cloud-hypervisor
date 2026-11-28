@@ -1006,7 +1006,9 @@ impl Cause {
 
     fn of_device_manager_error(error: &DeviceManagerError) -> Self {
         match error {
-            DeviceManagerError::RestoreGetState(_) => Cause::at(RestoreSite::DeviceState),
+            DeviceManagerError::RestoreGetState(_)
+            | DeviceManagerError::MissingVirtioPmemState
+            | DeviceManagerError::PmemSavedState(_) => Cause::at(RestoreSite::DeviceState),
             DeviceManagerError::MemoryManager(error) => Cause::of_memory_manager_error(error),
             DeviceManagerError::CreateInterruptController(_) => {
                 Cause::chain(RestoreSite::InterruptController, error)
@@ -1036,6 +1038,8 @@ impl Cause {
             | DeviceManagerError::NoDiskPath
             | DeviceManagerError::PmemWithDirectorySizeMissing
             | DeviceManagerError::PmemSizeNotAligned
+            | DeviceManagerError::PmemRestoreBind(_)
+            | DeviceManagerError::PmemRestoreWithoutBacking
             | DeviceManagerError::MissingVirtioBalloon
             | DeviceManagerError::MissingVirtualIommu
             | DeviceManagerError::InvalidIommuHotplug

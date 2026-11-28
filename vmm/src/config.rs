@@ -445,8 +445,9 @@ pub enum ValidationError {
     /// pmem_fds entry does not match any PmemConfig.id in the snapshot
     #[error("pmem device id '{0}' in 'pmem_fds' does not match any pmem device in the snapshot")]
     RestoreUnknownPmemId(String),
-    /// A pmem device saved with an FD has no replacement FD for the restore
-    #[error("pmem device '{0}' was FD backed and needs a new fd in 'pmem_fds'")]
+    /// A pmem device saved with an FD, or as an empty placeholder, has no
+    /// FD for the restore
+    #[error("pmem device '{0}' was FD backed or empty and needs a new fd in 'pmem_fds'")]
     RestoreMissingPmemFd(String),
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
@@ -3426,9 +3427,10 @@ impl RestoreConfig {
         }
 
         // A pmem device saved with an FD cannot reuse it, the snapshot
-        // carries no live descriptor. Each one needs a replacement.
+        // carries no live descriptor, and an empty placeholder gets its
+        // backing only here. Each one needs an FD.
         for p in vm_config.pmem.iter().flatten() {
-            if p.fd.is_some()
+            if (p.fd.is_some() || p.empty)
                 && !p
                     .pci_common
                     .id
@@ -6687,6 +6689,30 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             duplicate_id.validate(&snapshot_vm_config),
             Err(ValidationError::IdentifierNotUnique("pmem0".to_string()))
         );
+
+        // An empty placeholder gets its backing only from pmem_fds, so it
+        // needs an entry too.
+        let mut with_placeholder = snapshot_vm_config.clone();
+        with_placeholder.pmem.as_mut().unwrap().push(PmemConfig {
+            pci_common: PciDeviceCommonConfig {
+                id: Some("pmem2".to_owned()),
+                ..Default::default()
+            },
+            file: None,
+            empty: true,
+            size: Some(64 << 30),
+            ..pmem_fixture()
+        });
+        assert_eq!(
+            valid_config.validate(&with_placeholder),
+            Err(ValidationError::RestoreMissingPmemFd("pmem2".to_string()))
+        );
+        RestoreConfig {
+            pmem_fds: Some(vec![pmem_fd("pmem0", 5), pmem_fd("pmem2", 6)]),
+            ..valid_config.clone()
+        }
+        .validate(&with_placeholder)
+        .unwrap();
 
         // Without any FD-backed pmem device, no pmem_fds are needed.
         snapshot_vm_config.pmem.as_mut().unwrap().remove(0);
