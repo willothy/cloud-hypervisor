@@ -427,7 +427,6 @@ impl Pmem {
     /// sees it with size 0, it has no mapping, and its saved state is marked
     /// as a placeholder. Restoring a saved placeholder with a backing binds
     /// it, so the guest sees the backing's mapping size from then on.
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
         backing: Option<PmemBacking>,
