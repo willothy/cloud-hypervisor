@@ -3662,9 +3662,11 @@ impl DeviceManager {
         let virtio_pmem_device = Arc::new(Mutex::new(
             virtio_devices::Pmem::new(
                 id.clone(),
-                file,
+                Some(virtio_devices::PmemBacking {
+                    disk: file,
+                    mapping,
+                }),
                 GuestAddress(region_base),
-                mapping,
                 self.force_access_platform | pmem_cfg.pci_common.iommu.attached(),
                 self.seccomp_action.clone(),
                 self.exit_evt

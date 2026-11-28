@@ -48,6 +48,13 @@ const VIRTIO_PMEM_RESP_TYPE_EIO: u32 = 1;
 // New descriptors are pending on the virtio queue.
 const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
 
+/// Layout of the empty-placeholder record this VMM writes into a saved
+/// [`PmemState`]. A restore refuses a placeholder recorded in any other.
+const PMEM_PLACEHOLDER_LAYOUT: u32 = 1;
+
+/// The required alignment of a pmem device's size and window.
+const PMEM_ALIGNMENT: u64 = 0x20_0000;
+
 #[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
 #[repr(C)]
 struct VirtioPmemConfig {
@@ -264,14 +271,28 @@ impl EpollHelperHandler for PmemEpollHandler {
     }
 }
 
+/// The backing of a pmem device: the file and its mapping into the guest.
+pub struct PmemBacking {
+    pub disk: File,
+    pub mapping: UserspaceMapping,
+}
+
 pub struct Pmem {
     common: VirtioCommon,
     id: String,
     disk: Option<File>,
     config: VirtioPmemConfig,
-    mapping: UserspaceMapping,
+    mapping: Option<UserspaceMapping>,
+    placeholder: Option<PmemPlaceholder>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
+}
+
+/// The mark a saved empty placeholder carries, so that a saved size of 0
+/// is never mistaken for a placeholder by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PmemPlaceholder {
+    layout: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -279,40 +300,196 @@ pub struct PmemState {
     avail_features: u64,
     acked_features: u64,
     config: VirtioPmemConfig,
+    /// Set when the device was saved as an empty placeholder: a reserved
+    /// window with no backing, reported to the guest with size 0.
+    #[serde(default)]
+    placeholder: Option<PmemPlaceholder>,
+}
+
+/// Why a saved pmem device's state can't be restored.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum PmemStateError {
+    /// The saved size is 0 but the device isn't marked as a placeholder.
+    #[error("Saved virtio-pmem device has size 0 but is not marked as an empty placeholder")]
+    UnmarkedEmpty,
+    /// The placeholder mark is in a layout this VMM doesn't know.
+    #[error("Saved virtio-pmem placeholder uses unknown layout {0}")]
+    UnknownPlaceholderLayout(u32),
+    /// The device is marked as a placeholder but has a size.
+    #[error("Saved virtio-pmem placeholder has non-zero size {0:#x}")]
+    PlaceholderWithSize(u64),
+}
+
+/// What a saved pmem device showed the guest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PmemSavedGeometry {
+    /// An empty placeholder whose window starts at `start`; the guest saw
+    /// size 0.
+    Placeholder { start: u64 },
+    /// A backed device the guest saw at `start`, `size` bytes long.
+    Backed { start: u64, size: u64 },
+}
+
+/// Why a backing can't be given to a restored pmem device.
+#[derive(Error, Debug, PartialEq, Eq)]
+pub enum PmemBindError {
+    /// The saved device's start is not the base of its saved window.
+    #[error("Saved virtio-pmem start {start:#x} is not its window base {window_base:#x}")]
+    StartNotWindowBase { start: u64, window_base: u64 },
+    /// A placeholder was given an empty backing.
+    #[error("Backing for the virtio-pmem placeholder is empty")]
+    EmptyBacking,
+    /// A placeholder was given a backing whose size is not 2 MiB aligned.
+    #[error("Backing size {0:#x} for the virtio-pmem placeholder is not 2 MiB aligned")]
+    BackingNotAligned(u64),
+    /// A placeholder was given a backing larger than its window.
+    #[error("Backing size {size:#x} does not fit the virtio-pmem window of {window:#x}")]
+    BackingExceedsWindow { size: u64, window: u64 },
+    /// A device the guest already saw was given a backing of another size.
+    #[error("Backing size {backing:#x} differs from the saved virtio-pmem size {saved:#x}")]
+    SizeMismatch { saved: u64, backing: u64 },
+}
+
+impl PmemState {
+    /// What the saved device showed the guest, refusing a state that
+    /// records size 0 without the placeholder mark, or a mark this VMM
+    /// doesn't know.
+    pub fn geometry(&self) -> result::Result<PmemSavedGeometry, PmemStateError> {
+        let start = u64::from_le(self.config.start);
+        let size = u64::from_le(self.config.size);
+        match self.placeholder {
+            Some(PmemPlaceholder { layout }) if layout != PMEM_PLACEHOLDER_LAYOUT => {
+                Err(PmemStateError::UnknownPlaceholderLayout(layout))
+            }
+            Some(_) if size != 0 => Err(PmemStateError::PlaceholderWithSize(size)),
+            Some(_) => Ok(PmemSavedGeometry::Placeholder { start }),
+            None if size == 0 => Err(PmemStateError::UnmarkedEmpty),
+            None => Ok(PmemSavedGeometry::Backed { start, size }),
+        }
+    }
+}
+
+impl PmemSavedGeometry {
+    /// The size to map for a backing of `backing_size` bytes given to the
+    /// saved device, whose window is `window_size` bytes at `window_base`.
+    ///
+    /// A placeholder takes the backing's size, which must be non-zero, 2 MiB
+    /// aligned and fit the window. A device the guest already saw keeps its
+    /// saved size exactly, so the backing must be that size; its window is
+    /// never consulted.
+    pub fn bind(
+        self,
+        window_base: u64,
+        window_size: u64,
+        backing_size: u64,
+    ) -> result::Result<u64, PmemBindError> {
+        let start = match self {
+            PmemSavedGeometry::Placeholder { start } | PmemSavedGeometry::Backed { start, .. } => {
+                start
+            }
+        };
+        if start != window_base {
+            return Err(PmemBindError::StartNotWindowBase { start, window_base });
+        }
+        match self {
+            PmemSavedGeometry::Placeholder { .. } => {
+                if backing_size == 0 {
+                    return Err(PmemBindError::EmptyBacking);
+                }
+                if !backing_size.is_multiple_of(PMEM_ALIGNMENT) {
+                    return Err(PmemBindError::BackingNotAligned(backing_size));
+                }
+                if backing_size > window_size {
+                    return Err(PmemBindError::BackingExceedsWindow {
+                        size: backing_size,
+                        window: window_size,
+                    });
+                }
+                Ok(backing_size)
+            }
+            PmemSavedGeometry::Backed { size, .. } => {
+                if backing_size != size {
+                    return Err(PmemBindError::SizeMismatch {
+                        saved: size,
+                        backing: backing_size,
+                    });
+                }
+                Ok(size)
+            }
+        }
+    }
 }
 
 impl Pmem {
+    /// Creates a virtio-pmem device whose window starts at `addr`.
+    ///
+    /// Without a `backing` the device is an empty placeholder: the guest
+    /// sees it with size 0, it has no mapping, and its saved state is marked
+    /// as a placeholder. Restoring a saved placeholder with a backing binds
+    /// it, so the guest sees the backing's mapping size from then on.
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        disk: File,
+        backing: Option<PmemBacking>,
         addr: GuestAddress,
-        mapping: UserspaceMapping,
         access_platform_enabled: bool,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         state: Option<PmemState>,
     ) -> io::Result<Pmem> {
-        let (avail_features, acked_features, config, paused) = if let Some(state) = state {
+        let mapping_size = backing
+            .as_ref()
+            .map(|backing| backing.mapping.mapping.size() as u64);
+        let (avail_features, acked_features, config, placeholder, paused) = if let Some(state) =
+            state
+        {
             info!("Restoring virtio-pmem {id}");
+            let mut config = state.config;
+            let mut placeholder = state.placeholder;
+            match (placeholder, mapping_size) {
+                (Some(_), Some(size)) => {
+                    info!("Binding virtio-pmem placeholder {id} to a backing of {size:#x} bytes");
+                    config.size = size.to_le();
+                    placeholder = None;
+                }
+                (Some(_), None) => {}
+                (None, Some(size)) if size == u64::from_le(config.size) => {}
+                (None, mapping_size) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "saved virtio-pmem {id} has size {:#x} but its backing maps {mapping_size:#x?}",
+                            u64::from_le(config.size)
+                        ),
+                    ));
+                }
+            }
             (
                 state.avail_features,
                 state.acked_features,
-                state.config,
+                config,
+                placeholder,
                 true,
             )
         } else {
             let config = VirtioPmemConfig {
                 start: addr.raw_value().to_le(),
-                size: (mapping.mapping.size() as u64).to_le(),
+                size: mapping_size.unwrap_or(0).to_le(),
             };
+            let placeholder = backing.is_none().then_some(PmemPlaceholder {
+                layout: PMEM_PLACEHOLDER_LAYOUT,
+            });
 
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
             if access_platform_enabled {
                 avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
             }
-            (avail_features, 0, config, false)
+            (avail_features, 0, config, placeholder, false)
+        };
+        let (disk, mapping) = match backing {
+            Some(PmemBacking { disk, mapping }) => (Some(disk), Some(mapping)),
+            None => (None, None),
         };
 
         Ok(Pmem {
@@ -327,9 +504,10 @@ impl Pmem {
                 ..Default::default()
             },
             id,
-            disk: Some(disk),
+            disk,
             config,
             mapping,
+            placeholder,
             seccomp_action,
             exit_evt,
         })
@@ -340,6 +518,7 @@ impl Pmem {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
             config: self.config,
+            placeholder: self.placeholder,
         }
     }
 
@@ -414,6 +593,10 @@ impl VirtioDevice for Pmem {
             event!("virtio-device", "activated", "id", &self.id);
             return Ok(());
         }
+        error!(
+            "virtio-pmem {} is an empty placeholder with no backing to serve",
+            self.id
+        );
         Err(ActivateError::BadActivate)
     }
 
@@ -423,7 +606,7 @@ impl VirtioDevice for Pmem {
     }
 
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
-        vec![self.mapping.clone()]
+        self.mapping.iter().cloned().collect()
     }
 
     fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
@@ -457,3 +640,212 @@ impl Snapshottable for Pmem {
 
 impl Transportable for Pmem {}
 impl Migratable for Pmem {}
+
+#[cfg(test)]
+mod tests {
+    use vm_memory::MmapRegion;
+    use vm_memory::bitmap::AtomicBitmap;
+    use vmm_sys_util::eventfd::EFD_NONBLOCK;
+
+    use super::*;
+
+    const WINDOW_BASE: u64 = 0x1_0000_0000;
+    const MIB2: u64 = 0x20_0000;
+
+    fn backing(size: u64) -> PmemBacking {
+        PmemBacking {
+            disk: File::open("/dev/null").unwrap(),
+            mapping: UserspaceMapping {
+                mem_slot: 0,
+                addr: GuestAddress(WINDOW_BASE),
+                mapping: Arc::new(MmapRegion::<AtomicBitmap>::new(size as usize).unwrap()),
+                mergeable: false,
+            },
+        }
+    }
+
+    fn pmem(backing: Option<PmemBacking>, state: Option<PmemState>) -> io::Result<Pmem> {
+        Pmem::new(
+            "pmem0".to_owned(),
+            backing,
+            GuestAddress(WINDOW_BASE),
+            false,
+            SeccompAction::Allow,
+            EventFd::new(EFD_NONBLOCK).unwrap(),
+            state,
+        )
+    }
+
+    fn guest_config(pmem: &Pmem) -> (u64, u64) {
+        let mut data = [0u8; 16];
+        pmem.read_config(0, &mut data);
+        (
+            u64::from_le_bytes(data[..8].try_into().unwrap()),
+            u64::from_le_bytes(data[8..].try_into().unwrap()),
+        )
+    }
+
+    /// The state the device's snapshot carries, read back from it.
+    fn saved(pmem: &mut Pmem) -> PmemState {
+        pmem.snapshot().unwrap().to_state().unwrap()
+    }
+
+    #[test]
+    fn test_placeholder_has_no_mapping_and_reports_size_zero() {
+        let mut placeholder = pmem(None, None).unwrap();
+        assert_eq!(guest_config(&placeholder), (WINDOW_BASE, 0));
+        assert!(placeholder.userspace_mappings().is_empty());
+        assert_eq!(
+            saved(&mut placeholder).geometry(),
+            Ok(PmemSavedGeometry::Placeholder { start: WINDOW_BASE })
+        );
+    }
+
+    #[test]
+    fn test_restored_placeholder_stays_empty_without_a_backing() {
+        let state = saved(&mut pmem(None, None).unwrap());
+        let mut restored = pmem(None, Some(state)).unwrap();
+        assert_eq!(guest_config(&restored), (WINDOW_BASE, 0));
+        assert!(restored.userspace_mappings().is_empty());
+        assert_eq!(
+            saved(&mut restored).geometry(),
+            Ok(PmemSavedGeometry::Placeholder { start: WINDOW_BASE })
+        );
+    }
+
+    #[test]
+    fn test_restored_placeholder_takes_the_backing_size() {
+        let state = saved(&mut pmem(None, None).unwrap());
+        let mut restored = pmem(Some(backing(2 * MIB2)), Some(state)).unwrap();
+        assert_eq!(guest_config(&restored), (WINDOW_BASE, 2 * MIB2));
+        assert_eq!(restored.userspace_mappings().len(), 1);
+        assert_eq!(
+            saved(&mut restored).geometry(),
+            Ok(PmemSavedGeometry::Backed {
+                start: WINDOW_BASE,
+                size: 2 * MIB2
+            })
+        );
+    }
+
+    #[test]
+    fn test_restored_backed_device_keeps_its_geometry() {
+        let state = saved(&mut pmem(Some(backing(MIB2)), None).unwrap());
+        let restored = pmem(Some(backing(MIB2)), Some(state)).unwrap();
+        assert_eq!(guest_config(&restored), (WINDOW_BASE, MIB2));
+
+        // A backed device can't be restored with a mapping of another size,
+        // nor without one.
+        let state = saved(&mut pmem(Some(backing(MIB2)), None).unwrap());
+        assert!(pmem(Some(backing(2 * MIB2)), Some(state)).is_err());
+        let state = saved(&mut pmem(Some(backing(MIB2)), None).unwrap());
+        assert!(pmem(None, Some(state)).is_err());
+    }
+
+    #[test]
+    fn test_saved_state_geometry_refusals() {
+        let state = |size: u64, placeholder: Option<u32>| PmemState {
+            avail_features: 0,
+            acked_features: 0,
+            config: VirtioPmemConfig {
+                start: WINDOW_BASE.to_le(),
+                size: size.to_le(),
+            },
+            placeholder: placeholder.map(|layout| PmemPlaceholder { layout }),
+        };
+        assert_eq!(
+            state(0, None).geometry(),
+            Err(PmemStateError::UnmarkedEmpty)
+        );
+        assert_eq!(
+            state(0, Some(2)).geometry(),
+            Err(PmemStateError::UnknownPlaceholderLayout(2))
+        );
+        assert_eq!(
+            state(MIB2, Some(PMEM_PLACEHOLDER_LAYOUT)).geometry(),
+            Err(PmemStateError::PlaceholderWithSize(MIB2))
+        );
+
+        // A state saved before placeholders existed has no mark and is a
+        // backed device.
+        #[derive(Serialize)]
+        struct OldPmemState {
+            avail_features: u64,
+            acked_features: u64,
+            config: VirtioPmemConfig,
+        }
+        let old: PmemState = Snapshot::new_from_state(&OldPmemState {
+            avail_features: 0,
+            acked_features: 0,
+            config: VirtioPmemConfig {
+                start: WINDOW_BASE.to_le(),
+                size: MIB2.to_le(),
+            },
+        })
+        .unwrap()
+        .to_state()
+        .unwrap();
+        assert_eq!(
+            old.geometry(),
+            Ok(PmemSavedGeometry::Backed {
+                start: WINDOW_BASE,
+                size: MIB2
+            })
+        );
+    }
+
+    #[test]
+    fn test_bind_placeholder() {
+        let placeholder = PmemSavedGeometry::Placeholder { start: WINDOW_BASE };
+        let window = 4 * MIB2;
+        assert_eq!(placeholder.bind(WINDOW_BASE, window, MIB2), Ok(MIB2));
+        assert_eq!(placeholder.bind(WINDOW_BASE, window, window), Ok(window));
+        assert_eq!(
+            placeholder.bind(WINDOW_BASE, window, 0),
+            Err(PmemBindError::EmptyBacking)
+        );
+        assert_eq!(
+            placeholder.bind(WINDOW_BASE, window, MIB2 + 4096),
+            Err(PmemBindError::BackingNotAligned(MIB2 + 4096))
+        );
+        assert_eq!(
+            placeholder.bind(WINDOW_BASE, window, window + MIB2),
+            Err(PmemBindError::BackingExceedsWindow {
+                size: window + MIB2,
+                window
+            })
+        );
+        assert_eq!(
+            placeholder.bind(WINDOW_BASE + MIB2, window, MIB2),
+            Err(PmemBindError::StartNotWindowBase {
+                start: WINDOW_BASE,
+                window_base: WINDOW_BASE + MIB2
+            })
+        );
+    }
+
+    #[test]
+    fn test_bind_backed_requires_the_saved_size() {
+        let backed = PmemSavedGeometry::Backed {
+            start: WINDOW_BASE,
+            size: 3 * MIB2,
+        };
+        assert_eq!(backed.bind(WINDOW_BASE, 3 * MIB2, 3 * MIB2), Ok(3 * MIB2));
+        assert_eq!(
+            backed.bind(WINDOW_BASE, 3 * MIB2, 2 * MIB2),
+            Err(PmemBindError::SizeMismatch {
+                saved: 3 * MIB2,
+                backing: 2 * MIB2
+            })
+        );
+        // The window bound is never applied to a device the guest saw.
+        assert_eq!(backed.bind(WINDOW_BASE, MIB2, 3 * MIB2), Ok(3 * MIB2));
+        assert_eq!(
+            backed.bind(WINDOW_BASE + MIB2, 3 * MIB2, 3 * MIB2),
+            Err(PmemBindError::StartNotWindowBase {
+                start: WINDOW_BASE,
+                window_base: WINDOW_BASE + MIB2
+            })
+        );
+    }
+}

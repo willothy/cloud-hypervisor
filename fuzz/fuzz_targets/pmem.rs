@@ -13,7 +13,7 @@ use std::{ffi, io};
 use libc::{MAP_NORESERVE, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
-use virtio_devices::{Pmem, VirtioDevice, VirtioInterrupt, VirtioInterruptType};
+use virtio_devices::{Pmem, PmemBacking, VirtioDevice, VirtioInterrupt, VirtioInterruptType};
 use virtio_queue::{Queue, QueueT};
 use vm_device::UserspaceMapping;
 use vm_memory::bitmap::AtomicBitmap;
@@ -207,9 +207,11 @@ fn run_restore_case(cursor: &mut FuzzCursor<'_>) -> bool {
 
     let mut restored = match Pmem::new(
         "restored".to_owned(),
-        file,
+        Some(PmemBacking {
+            disk: file,
+            mapping,
+        }),
         guest_addr,
-        mapping,
         true,
         SeccompAction::Allow,
         exit_evt,
@@ -563,9 +565,11 @@ fn create_dummy_pmem(access_platform_enabled: bool, fail_flush: bool) -> io::Res
 
     Pmem::new(
         "tmp".to_owned(),
-        disk,
+        Some(PmemBacking {
+            disk,
+            mapping: dummy_user_mapping,
+        }),
         guest_addr,
-        dummy_user_mapping,
         access_platform_enabled,
         SeccompAction::Allow,
         EventFd::new(EFD_NONBLOCK)?,
